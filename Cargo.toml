@@ -1,0 +1,9 @@
+[package]
+name = "catan"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+[dev-dependencies]
+eframe = "0.36.2"
