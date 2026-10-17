@@ -301,3 +301,6 @@ fn parallel<A: Send, B: Send>(a: &mut [A], b: &mut [B], work: impl Fn(&mut [A], 
         }
     });
 }
+
+#[cfg(test)]
+mod tests;
