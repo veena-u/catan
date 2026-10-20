@@ -16,3 +16,15 @@ conda create -n catan python=3.12 numpy maturin -c conda-forge
 conda activate catan
 cd python && maturin develop --release
 ```
+
+## train
+
+```sh
+python -m train.evaluate    # sanity check the win-rate harness: random vs random should be ~50%
+python -m train.quiz        # can each network learn legal moves and dice production, given the answers?
+```
+
+- `features.py` turns the 211 observation bytes into network inputs (one flat vector, or 146 tokens)
+- `model.py` has the two networks: `Flat` (an MLP baseline) and `Tokens` (a transformer over hexes, corners, edges and one global token)
+- `agents.py` has the random players and a wrapper that lets a network play
+- `evaluate.py` plays two agents against each other and reports the win rate

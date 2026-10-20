@@ -1,2 +1,9 @@
 /target/
 .DS_Store
+.vscode/
+__pycache__/
+*.py[cod]
+*.so
+*.log
+*.pt
+.ipynb_checkpoints/

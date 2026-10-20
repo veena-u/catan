@@ -1,7 +1,9 @@
 use catan::buffer::{self, CHECKPOINT_EVERY, Config, Ending, Finish};
+use catan::ids::{Edge, Hex};
 use catan::observation::OBSERVATION_BYTES;
 use catan::player::Player;
 use catan::state::ACTIONS;
+use catan::topology::topology as board_topology;
 use numpy::{AllowTypeChange, PyArray1, PyArray2, PyArrayLike1, PyArrayMethods};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -113,6 +115,17 @@ fn masks<'py>(py: Python<'py>, words: &[[u64; 5]]) -> Bound<'py, PyArray2<bool>>
     array
 }
 
+#[pyfunction]
+fn topology<'py>(py: Python<'py>) -> (Bound<'py, PyArray2<u8>>, Bound<'py, PyArray2<u8>>) {
+    let t = board_topology();
+    let hex_corners: Vec<Vec<u8>> = Hex::all().map(|h| t.corners(h).map(|v| v.index() as u8).to_vec()).collect();
+    let edge_ends: Vec<Vec<u8>> = Edge::all().map(|e| t.ends(e).map(|v| v.index() as u8).to_vec()).collect();
+    (
+        PyArray2::from_vec2(py, &hex_corners).expect("rows of 6"),
+        PyArray2::from_vec2(py, &edge_ends).expect("rows of 2"),
+    )
+}
+
 fn player_codes<'py>(py: Python<'py>, players: &[Player]) -> Bound<'py, PyArray1<u8>> {
     PyArray1::from_iter(py, players.iter().map(|p| p.index() as u8))
 }
@@ -121,6 +134,7 @@ fn player_codes<'py>(py: Python<'py>, players: &[Player]) -> Bound<'py, PyArray1
 #[pyo3(name = "catan")]
 fn catan_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Buffer>()?;
+    m.add_function(wrap_pyfunction!(topology, m)?)?;
     m.add("OBSERVATION_BYTES", OBSERVATION_BYTES)?;
     m.add("ACTIONS", ACTIONS)?;
     Ok(())
