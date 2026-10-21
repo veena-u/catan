@@ -98,3 +98,11 @@ def device():
     if torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
+
+
+def load(path, at):
+    checkpoint = torch.load(path, map_location=at)
+    args = checkpoint["args"]
+    model = Tokens(args["width"], args["depth"]).to(at)
+    model.load_state_dict(checkpoint["model"])
+    return model.eval()

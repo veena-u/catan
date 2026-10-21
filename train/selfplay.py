@@ -1,4 +1,5 @@
 import argparse
+import copy
 import json
 import time
 from pathlib import Path
@@ -10,6 +11,7 @@ from torch import nn
 import catan
 
 from .agents import KIND_COUNT, KINDS, Network, Random
+from .bot import Bot
 from .evaluate import play
 from .model import Tokens, device
 
@@ -101,7 +103,7 @@ def advantages(values, players, done, ends, last_values, last_players, lam):
     return result
 
 
-def update(model, optimizer, batch, adv, returns, args, autocast):
+def update(model, optimizer, batch, adv, returns, args, autocast, magnet_weight):
     flat = {k: v.flatten(0, 1) for k, v in batch.items()}
     adv, returns = adv.flatten(), returns.flatten()
     total = len(adv)
@@ -120,7 +122,7 @@ def update(model, optimizer, batch, adv, returns, args, autocast):
             policy_loss = -torch.min(ratio * a, ratio.clamp(1 - args.clip, 1 + args.clip) * a).mean()
             value_loss = nn.functional.mse_loss(values.float(), returns[pick])
             magnet = kl_to_magnet(log_probs, masks).mean()
-            loss = policy_loss + args.value_coef * value_loss + args.magnet * magnet
+            loss = policy_loss + args.value_coef * value_loss + magnet_weight * magnet
             optimizer.zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
@@ -149,6 +151,9 @@ def main():
     parser.add_argument("--lam", type=float, default=0.95)
     parser.add_argument("--value-coef", type=float, default=1.0)
     parser.add_argument("--magnet", type=float, default=0.01, help="weight of the pull toward random-by-kind play")
+    parser.add_argument("--anneal-power", type=float, default=0.0,
+                        help="shrink the learning rate and magnet weight as (1 + iteration / anneal-steps) ** -power; 0 is off")
+    parser.add_argument("--anneal-steps", type=float, default=20.0)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--max-decisions", type=int, default=1000)
     parser.add_argument("--eval-every", type=int, default=10)
@@ -168,32 +173,51 @@ def main():
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     buffer = catan.Buffer(args.games, history=64, max_decisions=args.max_decisions, seed=args.seed)
     rollout = Rollout(model, buffer, at, autocast)
-    print(f"{sum(p.numel() for p in model.parameters()) / 1e6:.2f}M parameters on {at}; "
-          f"{args.games} games × {args.rounds} decisions = {args.games * args.rounds} per update")
+    log = open(out / "log.txt", "a")
+
+    def say(line):
+        print(line, flush=True)
+        log.write(line + "\n")
+        log.flush()
+
+    say(f"{sum(p.numel() for p in model.parameters()) / 1e6:.2f}M parameters on {at}; "
+        f"{args.games} games × {args.rounds} decisions = {args.games * args.rounds} per update")
 
     decisions = 0
+    previous = None
     start = time.time()
     for iteration in range(1, args.iterations + 1):
         model.eval()
         batch, scoring, stats = rollout.collect(args.rounds)
         adv = advantages(batch["values"], *scoring, args.lam)
         returns = adv + batch["values"]
+        scale = (1 + (iteration - 1) / args.anneal_steps) ** -args.anneal_power
+        for group in optimizer.param_groups:
+            group["lr"] = args.lr * scale
         model.train()
-        logs = update(model, optimizer, batch, adv, returns, args, autocast)
+        logs = update(model, optimizer, batch, adv, returns, args, autocast, args.magnet * scale)
         decisions += args.games * args.rounds
 
         finished = stats["won"] + stats["truncated"]
         line = (f"iter {iteration:4d}  {decisions / 1e6:6.2f}M decisions  {time.time() - start:6.0f}s  "
                 f"games {finished:5d} ({stats['truncated']} cut)  first wins {stats['first_won'] / max(stats['won'], 1):.2f}  "
                 f"value {logs['value']:.3f}  kl→magnet {logs['kl_magnet']:.3f}  approx_kl {logs['approx_kl']:.4f}  "
-                f"clipped {logs['clipped']:.2f}")
+                f"clipped {logs['clipped']:.2f}  lr {args.lr * scale:.1e}")
         if iteration % args.eval_every == 0 or iteration == args.iterations:
             model.eval()
-            result = play(Network(model, at, seed=iteration), Random(iteration), games=args.eval_games,
-                          parallel=min(args.eval_games, 512), seed=10_000 + iteration)
-            line += f"  vs random {result['win_rate']:.3f} ± {result['stderr']:.3f}"
-            torch.save({"model": model.state_dict(), "args": vars(args), "iteration": iteration}, out / "latest.pt")
-        print(line, flush=True)
+            player = Network(model, at, seed=iteration)
+            opponents = {"random": Random(iteration), "bot": Bot()}
+            if previous is not None:
+                opponents["previous"] = Network(previous, at, seed=-iteration)
+            for name, opponent in opponents.items():
+                result = play(player, opponent, games=args.eval_games, parallel=min(args.eval_games, 512),
+                              seed=10_000 + iteration)
+                line += f"  vs {name} {result['win_rate']:.3f}"
+            checkpoint = {"model": model.state_dict(), "args": vars(args), "iteration": iteration}
+            torch.save(checkpoint, out / f"iter_{iteration:05d}.pt")
+            torch.save(checkpoint, out / "latest.pt")
+            previous = copy.deepcopy(model).eval()
+        say(line)
 
 
 if __name__ == "__main__":

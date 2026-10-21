@@ -22,7 +22,8 @@ cd python && maturin develop --release
 ```sh
 python -m train.evaluate    # sanity check the win-rate harness: random vs random should be ~50%
 python -m train.quiz        # can each network learn legal moves and dice production, given the answers?
-python -m train.selfplay    # self-play PPO with a win/loss reward; logs the win rate against random
+python -m train.selfplay    # self-play PPO with a win/loss reward; logs win rates vs random, the bot, and itself
+python -m train.ladder runs/selfplay   # round-robin of saved checkpoints, the bot and random, rated by Elo
 ```
 
 - `features.py` turns the 211 observation bytes into network inputs (one flat vector, or 146 tokens)
@@ -30,3 +31,5 @@ python -m train.selfplay    # self-play PPO with a win/loss reward; logs the win
 - `agents.py` has the random players and a wrapper that lets a network play
 - `evaluate.py` plays two agents against each other and reports the win rate
 - `selfplay.py` is the self-play training loop: PPO, win/loss reward only, a pull toward random-by-kind play to keep exploring
+- `bot.py` is a hand-written opponent: builds the most valuable thing it can afford, trades only to afford something, robs the opponent's best hex 
+- `ladder.py` plays saved checkpoints, the bot and random against each other and fits Elo ratings
