@@ -5,6 +5,7 @@ if ! command -v cargo >/dev/null; then
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
 fi
 source "$HOME/.cargo/env"
+if [ -f /venv/main/bin/activate ]; then source /venv/main/bin/activate; fi
 
 python -m pip install --quiet --upgrade pip
 python -m pip install --quiet numpy
