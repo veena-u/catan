@@ -18,10 +18,12 @@ def play(a, b, games=4096, parallel=512, seed=0, max_decisions=1000):
         obs, masks, players = buffer.observe()
         a_turn = players == seat_a
         actions = np.zeros(parallel, np.int64)
-        if a_turn.any():
-            actions[a_turn] = a(obs[a_turn], masks[a_turn])
-        if (~a_turn).any():
-            actions[~a_turn] = b(obs[~a_turn], masks[~a_turn])
+        for agent, turn in ((a, a_turn), (b, ~a_turn)):
+            if turn.any():
+                if getattr(agent, "searches", False):
+                    actions[turn] = agent(obs[turn], masks[turn], buffer, np.flatnonzero(turn), players[turn])
+                else:
+                    actions[turn] = agent(obs[turn], masks[turn])
         for game, winner, _ in buffer.step(actions):
             if finished[game] >= per_slot:
                 continue

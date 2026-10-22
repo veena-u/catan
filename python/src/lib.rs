@@ -6,6 +6,7 @@ use catan::player::Player;
 use catan::rng::Rng;
 use catan::state::{ACTIONS, Actor, State};
 use catan::topology::topology as board_topology;
+use catan::worlds;
 use numpy::{AllowTypeChange, PyArray1, PyArray2, PyArrayLike1, PyArrayMethods};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -43,6 +44,27 @@ impl Buffer {
 
     fn __len__(&self) -> usize {
         self.inner.len()
+    }
+
+    #[pyo3(signature = (games, actions, samples, seed = 0))]
+    fn worlds(
+        &self,
+        py: Python<'_>,
+        games: PyArrayLike1<'_, u64, AllowTypeChange>,
+        actions: PyArrayLike1<'_, u16, AllowTypeChange>,
+        samples: usize,
+        seed: u64,
+    ) -> PyResult<Worlds> {
+        let games: Vec<usize> = games.as_slice()?.iter().map(|&g| g as usize).collect();
+        let actions = actions.as_slice()?;
+        if games.len() != actions.len() || games.iter().any(|&g| g >= self.inner.len()) {
+            return Err(PyValueError::new_err("one action per game, and only games that exist"));
+        }
+        let inner = &self.inner;
+        let worlds = py
+            .detach(|| worlds::Worlds::new(inner, &games, actions, samples, seed))
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(Worlds { inner: worlds })
     }
 
     fn track_dice(&mut self, on: bool) {
@@ -140,6 +162,45 @@ impl Buffer {
         };
         result.map_err(|e| PyValueError::new_err(e.to_string()))?;
         Ok((observations, masks(py, &words), player_codes(py, &players)))
+    }
+}
+
+#[pyclass(module = "catan")]
+struct Worlds {
+    inner: worlds::Worlds,
+}
+
+#[pymethods]
+impl Worlds {
+    fn __len__(&self) -> usize {
+        self.inner.len()
+    }
+
+    fn observe<'py>(&self, py: Python<'py>) -> (Bound<'py, PyArray2<u8>>, Bound<'py, PyArray2<bool>>, Bound<'py, PyArray1<i8>>) {
+        let n = self.inner.len();
+        let observations = PyArray2::zeros(py, [n, OBSERVATION_BYTES], false);
+        let (mut words, mut players) = (vec![[0; 5]; n], vec![None; n]);
+        {
+            let mut view = observations.readwrite();
+            let out = view.as_slice_mut().expect("a new array is contiguous").as_chunks_mut().0;
+            self.inner.observe(out, &mut words, &mut players);
+        }
+        let codes = players.iter().map(|p| p.map_or(-1, |p: Player| p.index() as i8));
+        (observations, masks(py, &words), PyArray1::from_iter(py, codes))
+    }
+
+    fn step(&mut self, py: Python<'_>, actions: PyArrayLike1<'_, u16, AllowTypeChange>) -> PyResult<()> {
+        let actions = actions.as_slice()?;
+        if actions.len() != self.inner.len() {
+            return Err(PyValueError::new_err(format!("{} actions for {} worlds", actions.len(), self.inner.len())));
+        }
+        let inner = &mut self.inner;
+        py.detach(|| inner.step(actions)).map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+
+    fn winners<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<i8>> {
+        let codes = (0..self.inner.len()).map(|w| self.inner.state(w).winner().map_or(-1, |p| p.index() as i8));
+        PyArray1::from_iter(py, codes)
     }
 }
 

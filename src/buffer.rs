@@ -318,7 +318,7 @@ fn expand(state: &State, into: &mut Vec<(u8, State)>) {
     }
 }
 
-fn parallel<A: Send, B: Send>(a: &mut [A], b: &mut [B], work: impl Fn(&mut [A], &mut [B], usize) + Sync) {
+pub(crate) fn parallel<A: Send, B: Send>(a: &mut [A], b: &mut [B], work: impl Fn(&mut [A], &mut [B], usize) + Sync) {
     let threads = thread::available_parallelism().map_or(1, NonZeroUsize::get);
     let chunk = a.len().div_ceil(threads).max(256);
     if chunk >= a.len() {

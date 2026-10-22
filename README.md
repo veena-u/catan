@@ -27,6 +27,7 @@ python -m train.ladder runs/selfplay   # round-robin of saved checkpoints, the b
 python -m train.watch runs/selfplay/latest.pt --opponent bot   # play one game; paste the printed line into the viewer
 python -m train.compare runs/anneal/latest.pt runs/dice/latest.pt   # challengers vs a baseline, head to head
 python -m train.habits runs/anneal/latest.pt    # what it does per game vs the bot: builds, trades, cards, harbors
+python -m train.search runs/anneal/latest.pt --bot   # does search (imagine hidden cards, play each candidate forward) beat the plain network?
 ```
 
 on a rented GPU, `bash overnight.sh` runs the whole experiment queue (dice averaging, informative moves, a bigger network, combined, long), comparing each against `runs/anneal` as it goes and packing everything into `results-overnight.tar.gz`
@@ -42,3 +43,4 @@ useful `selfplay` flags: `--anneal-power 0.5` shrinks the learning rate and magn
 - `ladder.py` plays saved checkpoints, the bot and random against each other and fits Elo ratings
 - `watch.py` plays one game with a saved network and prints it in the viewer's `seed;codes` format
 - `habits.py` plays a saved network against the bot and reports what it does per game: builds, trades by rate, cards, harbor use
+- `search.py` thinks before moving: the network's top moves are each played forward in several random deals of the hidden cards, and the move with the best mix of prior and outcome is chosen
