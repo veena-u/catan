@@ -36,9 +36,11 @@ def kl_to_magnet(log_probs, masks):
 
 
 class Rollout:
-    def __init__(self, model, buffer, at, autocast):
+    def __init__(self, model, buffer, at, autocast, average_dice=False):
         self.model, self.buffer, self.at, self.autocast = model, buffer, at, autocast
         self.games = len(buffer)
+        self.average_dice = average_dice
+        buffer.track_dice(average_dice)
 
     @torch.no_grad()
     def evaluate(self, obs, masks):
@@ -46,6 +48,22 @@ class Rollout:
             logits, values, _ = self.model(obs)
         dist, _ = policy(logits, masks)
         return dist, values.float()
+
+    @torch.no_grad()
+    def value(self, obs):
+        with torch.autocast(self.at.type, dtype=torch.bfloat16, enabled=self.autocast):
+            _, values, _ = self.model(obs)
+        return values.float()
+
+    def expected_after_roll(self, players):
+        has, obs, actors, weights = self.buffer.dice()
+        games = np.flatnonzero(has)
+        if len(games) == 0:
+            return games, None
+        values = self.value(torch.from_numpy(obs[games].reshape(-1, obs.shape[-1])).to(self.at)).view(len(games), -1)
+        same = torch.from_numpy(actors[games] == players[games, None]).to(self.at)
+        weights = torch.from_numpy(weights[games]).to(self.at)
+        return games, (weights * torch.where(same, values, -values)).sum(1)
 
     def collect(self, rounds):
         n, at = self.games, self.at
@@ -55,6 +73,7 @@ class Rollout:
         log_probs, values = torch.zeros(rounds, n, device=at), torch.zeros(rounds, n, device=at)
         players = torch.zeros(rounds, n, dtype=torch.long, device=at)
         done, ends = torch.zeros(rounds, n, dtype=torch.bool, device=at), torch.zeros(rounds, n, device=at)
+        rolled, expected = torch.zeros(rounds, n, dtype=torch.bool, device=at), torch.zeros(rounds, n, device=at)
         stats = {"won": 0, "truncated": 0, "first_won": 0}
 
         for t in range(rounds):
@@ -65,6 +84,10 @@ class Rollout:
             a = dist.sample()
             actions[t], log_probs[t], values[t] = a, dist.log_prob(a), v
             endings = self.buffer.step(a.cpu().numpy())
+            if self.average_dice:
+                games, value = self.expected_after_roll(p)
+                if value is not None:
+                    rolled[t, games], expected[t, games] = True, value
             truncated = []
             for game, winner, time_ in endings:
                 done[t, game] = True
@@ -86,10 +109,17 @@ class Rollout:
         _, last_values = self.evaluate(torch.from_numpy(o).to(at), torch.from_numpy(m).to(at))
         last_players = torch.from_numpy(p.astype(np.int64)).to(at)
         batch = dict(obs=obs, masks=masks, actions=actions, log_probs=log_probs, values=values)
-        return batch, (players, done, ends, last_values, last_players), stats
+        return batch, (players, done, ends, rolled, expected, last_values, last_players), stats
 
 
-def advantages(values, players, done, ends, last_values, last_players, lam):
+def sync(at):
+    if at.type == "cuda":
+        torch.cuda.synchronize()
+    elif at.type == "mps":
+        torch.mps.synchronize()
+
+
+def advantages(values, players, done, ends, rolled, expected, last_values, last_players, lam):
     rounds = values.shape[0]
     result = torch.zeros_like(values)
     following = torch.zeros_like(last_values)
@@ -97,7 +127,8 @@ def advantages(values, players, done, ends, last_values, last_players, lam):
         next_values = last_values if t == rounds - 1 else values[t + 1]
         next_players = last_players if t == rounds - 1 else players[t + 1]
         sign = torch.where(players[t] == next_players, 1.0, -1.0)
-        delta = torch.where(done[t], ends[t] - values[t], sign * next_values - values[t])
+        target = torch.where(rolled[t], expected[t], sign * next_values)
+        delta = torch.where(done[t], ends[t] - values[t], target - values[t])
         following = torch.where(done[t], delta, delta + lam * sign * following)
         result[t] = following
     return result
@@ -107,7 +138,10 @@ def update(model, optimizer, batch, adv, returns, args, autocast, magnet_weight)
     flat = {k: v.flatten(0, 1) for k, v in batch.items()}
     adv, returns = adv.flatten(), returns.flatten()
     total = len(adv)
-    logs = {"policy": 0.0, "value": 0.0, "kl_magnet": 0.0, "approx_kl": 0.0, "clipped": 0.0}
+    threshold = adv.abs().float().quantile(1 - args.keep) if args.keep < 1 else -1.0
+    informative = adv.abs() >= threshold
+    logs = {"policy": 0.0, "value": 0.0, "kl_magnet": 0.0, "approx_kl": 0.0, "clipped": 0.0,
+            "kept": informative.float().mean().item()}
     steps = 0
     for _ in range(args.epochs):
         for pick in torch.randperm(total, device=adv.device).split(args.minibatch):
@@ -117,7 +151,8 @@ def update(model, optimizer, batch, adv, returns, args, autocast, magnet_weight)
             dist, log_probs = policy(logits, masks)
             new = dist.log_prob(flat["actions"][pick])
             ratio = (new - flat["log_probs"][pick]).exp()
-            a = adv[pick]
+            kept = informative[pick]
+            ratio, a = ratio[kept], adv[pick][kept]
             a = (a - a.mean()) / (a.std() + 1e-8)
             policy_loss = -torch.min(ratio * a, ratio.clamp(1 - args.clip, 1 + args.clip) * a).mean()
             value_loss = nn.functional.mse_loss(values.float(), returns[pick])
@@ -134,7 +169,8 @@ def update(model, optimizer, batch, adv, returns, args, autocast, magnet_weight)
                 logs["approx_kl"] += ((ratio - 1) - ratio.log()).mean().item()
                 logs["clipped"] += ((ratio - 1).abs() > args.clip).float().mean().item()
             steps += 1
-    return {k: v / steps for k, v in logs.items()}
+    kept = logs.pop("kept")
+    return {**{k: v / steps for k, v in logs.items()}, "kept": kept}
 
 
 def main():
@@ -154,6 +190,10 @@ def main():
     parser.add_argument("--anneal-power", type=float, default=0.0,
                         help="shrink the learning rate and magnet weight as (1 + iteration / anneal-steps) ** -power; 0 is off")
     parser.add_argument("--anneal-steps", type=float, default=20.0)
+    parser.add_argument("--keep", type=float, default=1.0,
+                        help="train the policy only on this fraction of moves, those with the largest advantage magnitude")
+    parser.add_argument("--average-dice", action="store_true",
+                        help="score a move followed by a roll against the average over all 11 rolls, not the one rolled")
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--max-decisions", type=int, default=1000)
     parser.add_argument("--eval-every", type=int, default=10)
@@ -172,7 +212,7 @@ def main():
     model = Tokens(args.width, args.depth).to(at)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     buffer = catan.Buffer(args.games, history=64, max_decisions=args.max_decisions, seed=args.seed)
-    rollout = Rollout(model, buffer, at, autocast)
+    rollout = Rollout(model, buffer, at, autocast, args.average_dice)
     log = open(out / "log.txt", "a")
 
     def say(line):
@@ -188,7 +228,10 @@ def main():
     start = time.time()
     for iteration in range(1, args.iterations + 1):
         model.eval()
+        clock = time.time()
         batch, scoring, stats = rollout.collect(args.rounds)
+        sync(at)
+        collect_time, clock = time.time() - clock, time.time()
         adv = advantages(batch["values"], *scoring, args.lam)
         returns = adv + batch["values"]
         scale = (1 + (iteration - 1) / args.anneal_steps) ** -args.anneal_power
@@ -196,15 +239,19 @@ def main():
             group["lr"] = args.lr * scale
         model.train()
         logs = update(model, optimizer, batch, adv, returns, args, autocast, args.magnet * scale)
+        sync(at)
+        update_time = time.time() - clock
         decisions += args.games * args.rounds
 
         finished = stats["won"] + stats["truncated"]
         line = (f"iter {iteration:4d}  {decisions / 1e6:6.2f}M decisions  {time.time() - start:6.0f}s  "
                 f"games {finished:5d} ({stats['truncated']} cut)  first wins {stats['first_won'] / max(stats['won'], 1):.2f}  "
                 f"value {logs['value']:.3f}  kl→magnet {logs['kl_magnet']:.3f}  approx_kl {logs['approx_kl']:.4f}  "
-                f"clipped {logs['clipped']:.2f}  lr {args.lr * scale:.1e}")
+                f"clipped {logs['clipped']:.2f}  kept {logs['kept']:.2f}  lr {args.lr * scale:.1e}  "
+                f"play {collect_time:.1f}s learn {update_time:.1f}s")
         if iteration % args.eval_every == 0 or iteration == args.iterations:
             model.eval()
+            clock = time.time()
             player = Network(model, at, seed=iteration)
             opponents = {"random": Random(iteration), "bot": Bot()}
             if previous is not None:
@@ -217,6 +264,7 @@ def main():
             torch.save(checkpoint, out / f"iter_{iteration:05d}.pt")
             torch.save(checkpoint, out / "latest.pt")
             previous = copy.deepcopy(model).eval()
+            line += f"  (eval {time.time() - clock:.0f}s)"
         say(line)
 
 
