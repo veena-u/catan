@@ -1,12 +1,23 @@
+use catan::board::Board;
 use catan::buffer::{self, CHECKPOINT_EVERY, Config, Ending, Finish};
 use catan::ids::{Edge, Hex};
-use catan::observation::OBSERVATION_BYTES;
+use catan::observation::{OBSERVATION_BYTES, observe};
 use catan::player::Player;
-use catan::state::ACTIONS;
+use catan::rng::Rng;
+use catan::state::{ACTIONS, Actor, State};
 use catan::topology::topology as board_topology;
 use numpy::{AllowTypeChange, PyArray1, PyArray2, PyArrayLike1, PyArrayMethods};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+
+const OUTCOMES: usize = 11;
+
+type Dice<'py> = (
+    Bound<'py, PyArray1<bool>>,
+    Bound<'py, numpy::PyArrayDyn<u8>>,
+    Bound<'py, numpy::PyArrayDyn<u8>>,
+    Bound<'py, numpy::PyArrayDyn<f32>>,
+);
 
 type Batch<'py> = (Bound<'py, PyArray2<u8>>, Bound<'py, PyArray2<bool>>, Bound<'py, PyArray1<u8>>);
 
@@ -32,6 +43,37 @@ impl Buffer {
 
     fn __len__(&self) -> usize {
         self.inner.len()
+    }
+
+    fn track_dice(&mut self, on: bool) {
+        self.inner.track_dice(on);
+    }
+
+    fn dice<'py>(&self, py: Python<'py>) -> Dice<'py> {
+        let n = self.inner.len();
+        let (mut has, mut weights) = (vec![false; n], vec![0f32; n * OUTCOMES]);
+        let (mut players, mut bytes) = (vec![0u8; n * OUTCOMES], vec![0u8; n * OUTCOMES * OBSERVATION_BYTES]);
+        for game in 0..n {
+            let children = self.inner.dice(game);
+            has[game] = !children.is_empty();
+            let total: f32 = children.iter().map(|&(w, _)| f32::from(w)).sum();
+            for (k, (weight, child)) in children.iter().enumerate() {
+                let Some(Actor::Player(player)) = child.actor() else { continue };
+                let at = game * OUTCOMES + k;
+                weights[at] = f32::from(*weight) / total;
+                players[at] = player.index() as u8;
+                let out: &mut [u8; OBSERVATION_BYTES] =
+                    (&mut bytes[at * OBSERVATION_BYTES..(at + 1) * OBSERVATION_BYTES]).try_into().expect("one observation");
+                observe(child, player, out);
+            }
+        }
+        let shape = |v: Vec<u8>, dims: &[usize]| PyArray1::from_vec(py, v).reshape(dims.to_vec()).expect("sizes match");
+        (
+            PyArray1::from_vec(py, has),
+            shape(bytes, &[n, OUTCOMES, OBSERVATION_BYTES]),
+            shape(players, &[n, OUTCOMES]),
+            PyArray1::from_vec(py, weights).reshape(vec![n, OUTCOMES]).expect("sizes match"),
+        )
     }
 
     fn times<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<u64>> {
@@ -101,6 +143,68 @@ impl Buffer {
     }
 }
 
+#[pyclass(module = "catan")]
+struct Game {
+    seed: u64,
+    state: State,
+    rng: Rng,
+    codes: Vec<u16>,
+}
+
+#[pymethods]
+impl Game {
+    #[new]
+    #[pyo3(signature = (seed = 0))]
+    fn new(seed: u64) -> Self {
+        let state = State::new(Board::random(&mut Rng::new(seed)));
+        Game { seed, state, rng: Rng::new(seed ^ 0x9E37_79B9_7F4A_7C15), codes: Vec::new() }
+    }
+
+    fn to_act(&self) -> Option<u8> {
+        match self.state.actor() {
+            Some(Actor::Player(p)) => Some(p.index() as u8),
+            _ => None,
+        }
+    }
+
+    fn winner(&self) -> Option<u8> {
+        self.state.winner().map(|p| p.index() as u8)
+    }
+
+    fn steps(&self) -> usize {
+        self.codes.len()
+    }
+
+    fn observe<'py>(&self, py: Python<'py>) -> PyResult<(Bound<'py, PyArray1<u8>>, Bound<'py, PyArray1<bool>>)> {
+        let Some(Actor::Player(player)) = self.state.actor() else {
+            return Err(PyValueError::new_err("no player is to act"));
+        };
+        let mut bytes = [0; OBSERVATION_BYTES];
+        observe(&self.state, player, &mut bytes);
+        let words = self.state.legal_actions().words();
+        let legal = (0..ACTIONS).map(|i| words[i / 64] >> (i % 64) & 1 == 1);
+        Ok((PyArray1::from_slice(py, &bytes), PyArray1::from_iter(py, legal)))
+    }
+
+    fn step(&mut self, code: u16) -> PyResult<()> {
+        self.state.step(code).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        self.codes.push(code);
+        Ok(())
+    }
+
+    fn settle(&mut self) {
+        while let Some(Actor::Chance) = self.state.actor() {
+            let code = self.state.sample_outcome(&mut self.rng).index();
+            self.step(code).expect("a sampled outcome can happen");
+        }
+    }
+
+    fn record(&self) -> String {
+        let codes: Vec<String> = self.codes.iter().map(u16::to_string).collect();
+        format!("{};{}", self.seed, codes.join(","))
+    }
+}
+
 fn masks<'py>(py: Python<'py>, words: &[[u64; 5]]) -> Bound<'py, PyArray2<bool>> {
     let array = PyArray2::zeros(py, [words.len(), ACTIONS], false);
     {
@@ -134,6 +238,7 @@ fn player_codes<'py>(py: Python<'py>, players: &[Player]) -> Bound<'py, PyArray1
 #[pyo3(name = "catan")]
 fn catan_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Buffer>()?;
+    m.add_class::<Game>()?;
     m.add_function(wrap_pyfunction!(topology, m)?)?;
     m.add("OBSERVATION_BYTES", OBSERVATION_BYTES)?;
     m.add("ACTIONS", ACTIONS)?;
