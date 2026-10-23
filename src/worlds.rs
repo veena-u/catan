@@ -7,28 +7,52 @@ use crate::state::{Action, Actor, Invalid, State};
 pub struct Worlds {
     states: Vec<State>,
     rngs: Vec<Rng>,
+    redealt: usize,
 }
 
 impl Worlds {
     pub fn new(buffer: &Buffer, games: &[usize], actions: &[u16], samples: usize, seed: u64) -> Result<Worlds, Invalid> {
+        Worlds::dealt(buffer, games, actions, samples, None, seed)
+    }
+
+    pub fn dealt(
+        buffer: &Buffer,
+        games: &[usize],
+        actions: &[u16],
+        samples: usize,
+        deals: Option<&[[[u8; 10]; 3]]>,
+        seed: u64,
+    ) -> Result<Worlds, Invalid> {
         let mut seeds = Rng::new(seed);
-        let (mut states, mut rngs) = (Vec::new(), Vec::new());
-        for (&game, &action) in games.iter().zip(actions) {
+        let (mut states, mut rngs, mut redealt) = (Vec::new(), Vec::new(), 0);
+        for (pair, (&game, &action)) in games.iter().zip(actions).enumerate() {
             let root = buffer.state(game);
             let Some(Actor::Player(observer)) = root.actor() else { return Err(Invalid { code: action }) };
             if !Action::from_index(action).is_some_and(|a| root.legal_actions().contains(a)) {
                 return Err(Invalid { code: action });
             }
-            for _ in 0..samples {
+            let others = root.players() - 1;
+            for sample in 0..samples {
                 let mut rng = seeds.fork();
-                let mut world = root.sample_hidden(observer, &mut rng);
+                let guess = deals.map(|d| &d[pair * samples + sample][..others]);
+                let mut world = match guess.map(|g| root.deal_hidden(observer, g, &mut rng)) {
+                    Some(Ok(world)) => world,
+                    other => {
+                        redealt += usize::from(other.is_some());
+                        root.sample_hidden(observer, &mut rng)
+                    }
+                };
                 world.step(action).expect("an action legal before re-dealing hidden cards is legal after");
                 settle(&mut world, &mut rng);
                 states.push(world);
                 rngs.push(rng);
             }
         }
-        Ok(Worlds { states, rngs })
+        Ok(Worlds { states, rngs, redealt })
+    }
+
+    pub fn redealt(&self) -> usize {
+        self.redealt
     }
 
     pub fn len(&self) -> usize {
@@ -133,5 +157,25 @@ mod tests {
             }
         }
         assert!(Worlds::new(&buffer, &[0], &[u16::MAX], 1, 0).is_err(), "an illegal action is refused");
+        let truth: Vec<[[u8; 10]; 3]> = games
+            .iter()
+            .map(|&g| {
+                let root = buffer.state(g);
+                let Some(Actor::Player(me)) = root.actor() else { unreachable!() };
+                let mut deal = [[0; 10]; 3];
+                for (k, other) in root.others(me).enumerate() {
+                    for r in 0..5 {
+                        deal[k][r] = root.hand(other)[r] + root.set_aside(other)[r];
+                        deal[k][5 + r] = root.dev_cards(other, crate::dev_card::DevCard::ALL[r]);
+                    }
+                }
+                deal
+            })
+            .collect();
+        let dealt = Worlds::dealt(&buffer, &games, &actions, 1, Some(&truth), 3).unwrap();
+        assert_eq!(dealt.redealt(), 0, "the true deal is always a possible one");
+        let nonsense = vec![[[19; 10]; 3]; games.len()];
+        let fallback = Worlds::dealt(&buffer, &games, &actions, 1, Some(&nonsense), 3).unwrap();
+        assert_eq!(fallback.redealt(), games.len(), "an impossible deal falls back to a random one");
     }
 }

@@ -51,7 +51,7 @@ impl Buffer {
         self.inner.len()
     }
 
-    #[pyo3(signature = (games, actions, samples, seed = 0))]
+    #[pyo3(signature = (games, actions, samples, seed = 0, deals = None))]
     fn worlds(
         &self,
         py: Python<'_>,
@@ -59,15 +59,26 @@ impl Buffer {
         actions: PyArrayLike1<'_, u16, AllowTypeChange>,
         samples: usize,
         seed: u64,
+        deals: Option<PyArrayLike1<'_, u8, AllowTypeChange>>,
     ) -> PyResult<Worlds> {
         let games: Vec<usize> = games.as_slice()?.iter().map(|&g| g as usize).collect();
         let actions = actions.as_slice()?;
         if games.len() != actions.len() || games.iter().any(|&g| g >= self.inner.len()) {
             return Err(PyValueError::new_err("one action per game, and only games that exist"));
         }
+        let deals: Option<Vec<[[u8; 10]; 3]>> = match &deals {
+            None => None,
+            Some(flat) => {
+                let flat = flat.as_slice()?;
+                if flat.len() != games.len() * samples * 30 {
+                    return Err(PyValueError::new_err("deals hold 3 seats of 10 counts for every world"));
+                }
+                Some(flat.chunks(30).map(|w| std::array::from_fn(|k| std::array::from_fn(|i| w[k * 10 + i]))).collect())
+            }
+        };
         let inner = &self.inner;
         let worlds = py
-            .detach(|| worlds::Worlds::new(inner, &games, actions, samples, seed))
+            .detach(|| worlds::Worlds::dealt(inner, &games, actions, samples, deals.as_deref(), seed))
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
         Ok(Worlds { inner: worlds })
     }
@@ -230,6 +241,10 @@ impl Worlds {
         }
         let inner = &mut self.inner;
         py.detach(|| inner.step(actions)).map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+
+    fn redealt(&self) -> usize {
+        self.inner.redealt()
     }
 
     fn winners<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<i8>> {

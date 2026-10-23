@@ -5,6 +5,7 @@ import numpy as np
 import torch
 
 from .agents import Network
+from .belief import load_belief
 from .bot import Bot
 from .evaluate import play, report
 from .model import device, load, masked
@@ -13,8 +14,8 @@ from .model import device, load, masked
 class Search:
     searches = True
 
-    def __init__(self, model, at, candidates=8, samples=8, depth=16, eta=10.0, chunk=8192, seed=0):
-        self.model, self.at = model, at
+    def __init__(self, model, at, candidates=8, samples=8, depth=16, eta=10.0, chunk=8192, seed=0, belief=None):
+        self.model, self.at, self.belief = model, at, belief
         self.candidates, self.samples, self.depth, self.eta, self.chunk = candidates, samples, depth, eta, chunk
         self.autocast = at.type == "cuda"
         self.generator = torch.Generator(device="cpu").manual_seed(seed)
@@ -37,7 +38,8 @@ class Search:
         logits, _ = self.evaluate(obs, masks)
         return torch.multinomial(logits.softmax(1), 1, generator=self.generator).squeeze(1).numpy()
 
-    def __call__(self, obs, masks, buffer, games, players):
+    def improve(self, obs, masks, buffer, games, players):
+        """The network's top moves at each position, and how much better search finds each one: (choices, prior, q)."""
         logits, _ = self.evaluate(obs, masks)
         prior = logits.log_softmax(1)
         k = min(self.candidates, prior.shape[1])
@@ -48,7 +50,10 @@ class Search:
         pair_actions = choices[rows, ranks].numpy()
 
         self.seed += 1
-        worlds = buffer.worlds(pair_games, pair_actions, self.samples, self.seed)
+        deals = None
+        if self.belief is not None:
+            deals = self.belief.deals(np.repeat(obs[rows.numpy()], self.samples, axis=0), self.generator).reshape(-1)
+        worlds = buffer.worlds(pair_games, pair_actions, self.samples, self.seed, deals)
         for _ in range(self.depth):
             o, m, p = worlds.observe()
             live = p >= 0
@@ -72,6 +77,10 @@ class Search:
 
         q = torch.full((len(obs), k), float("-inf"))
         q[rows, ranks] = torch.from_numpy(value.reshape(-1, self.samples).mean(1))
+        return choices, top, q
+
+    def __call__(self, obs, masks, buffer, games, players):
+        choices, top, q = self.improve(obs, masks, buffer, games, players)
         best = (top + self.eta * q).argmax(1)
         return choices[torch.arange(len(obs)), best].numpy()
 
@@ -84,22 +93,29 @@ def main():
     parser.add_argument("--samples", type=int, default=8, help="random deals of the hidden cards per candidate")
     parser.add_argument("--depth", type=int, default=16, help="decisions played forward in each imagined world")
     parser.add_argument("--eta", type=float, default=10.0, help="how far the search may move away from the network's choice")
+    parser.add_argument("--belief", help="deal the hidden cards from this belief network instead of uniformly")
     parser.add_argument("--bot", action="store_true", help="also play search against the bot")
     parser.add_argument("--players", type=int, default=4)
     args = parser.parse_args()
 
     at = device()
     model = load(args.checkpoint, at)
-    search = Search(model, at, args.candidates, args.samples, args.depth, args.eta)
+    settings = (args.candidates, args.samples, args.depth, args.eta)
+    search = Search(model, at, *settings)
     parallel = min(args.games, 256)
-    start = time.time()
-    report("search vs network", play(search, Network(model, at, seed=1), games=args.games, parallel=parallel, seed=7,
-                                           players=args.players))
-    print(f"  ({time.time() - start:.0f}s)")
-    if args.bot:
+
+    def match(name, a, b, seed):
         start = time.time()
-        report("search vs bot", play(search, Bot(), games=args.games, parallel=parallel, seed=8, players=args.players))
-        print(f"  ({time.time() - start:.0f}s)")
+        report(name, play(a, b, games=args.games, parallel=parallel, seed=seed, players=args.players))
+        print(f"  ({time.time() - start:.0f}s)", flush=True)
+
+    match("search vs network", search, Network(model, at, seed=1), 7)
+    if args.belief:
+        guided = Search(model, at, *settings, seed=1, belief=load_belief(args.belief, at))
+        match("belief search vs network", guided, Network(model, at, seed=1), 7)
+        match("belief search vs search", guided, search, 9)
+    if args.bot:
+        match("search vs bot", search, Bot(), 8)
 
 
 if __name__ == "__main__":

@@ -15,6 +15,7 @@ from .bot import Bot
 from .evaluate import play
 from .features import SEATS, SYMMETRIES
 from .model import Tokens, device
+from .search import Search
 
 HIDDEN = (SEATS - 1) * 10
 DICE_SUMS = 11
@@ -76,11 +77,26 @@ class Critics(nn.Module):
 
 
 class Rollout:
-    def __init__(self, model, critics, buffer, at, autocast, players, average_dice=False, privileged=False):
+    def __init__(self, model, critics, buffer, at, autocast, players, average_dice=False, privileged=False,
+                 search=None, expert_games=0, expert_every=1, seed=0):
         self.model, self.critics, self.buffer, self.at, self.autocast = model, critics, buffer, at, autocast
         self.games, self.players = len(buffer), players
         self.average_dice, self.privileged = average_dice, privileged
+        self.search, self.expert_games, self.expert_every = search, expert_games, expert_every
+        self.rng = np.random.default_rng(seed)
         buffer.track_dice(average_dice)
+
+    def expert(self, o, m, p):
+        """Search a few positions with a real choice; the targets are the moves search prefers, as probabilities."""
+        choosing = np.flatnonzero(m.sum(1) > 1)
+        games = self.rng.choice(choosing, min(self.expert_games, len(choosing)), replace=False)
+        if len(games) == 0:
+            return None
+        choices, top, q = self.search.improve(o[games], m[games], self.buffer, games, p[games])
+        improved = (top + self.search.eta * q).softmax(1).nan_to_num(0.0)
+        target = torch.zeros(len(games), catan.ACTIONS).scatter_(1, choices, improved)
+        changed = (improved.argmax(1) != 0).float().sum().item()
+        return self.tensor(o[games]), self.tensor(m[games]), target.to(self.at), changed
 
     @torch.no_grad()
     def evaluate(self, obs, masks, hidden=None):
@@ -122,11 +138,18 @@ class Rollout:
         rolls = torch.zeros(rounds, n, DICE_SUMS, device=at)
         done, ends = torch.zeros(rounds, n, dtype=torch.bool, device=at), torch.zeros(rounds, n, SEATS, device=at)
         rolled, expected = torch.zeros(rounds, n, dtype=torch.bool, device=at), torch.zeros(rounds, n, SEATS, device=at)
-        stats = {"won": 0, "truncated": 0, "first_won": 0}
+        stats = {"won": 0, "truncated": 0, "first_won": 0, "searched": 0, "changed": 0}
+        expert = []
 
         for t in range(rounds):
             o, m, p = self.buffer.observe()
             obs[t], masks[t], actors[t] = self.tensor(o), self.tensor(m), self.tensor(p, np.int64)
+            if self.search is not None and t % self.expert_every == 0:
+                found = self.expert(o, m, p)
+                if found is not None:
+                    expert.append(found[:3])
+                    stats["searched"] += len(found[0])
+                    stats["changed"] += found[3]
             hidden[t] = self.tensor(self.buffer.hidden())
             dist, v = self.evaluate(obs[t], masks[t], hidden[t] if self.privileged else None)
             a = dist.sample()
@@ -160,6 +183,8 @@ class Rollout:
             last = self.value(self.tensor(o), self.tensor(p, np.int64))
         future = upcoming(rolls, done)
         batch = dict(obs=obs, masks=masks, actions=actions, log_probs=log_probs, actors=actors, hidden=hidden, future=future)
+        if expert:
+            batch["expert"] = tuple(torch.cat(part) for part in zip(*expert))
         return batch, values, (done, ends, rolled, expected, last), stats
 
 
@@ -193,7 +218,8 @@ def advantages(values, done, ends, rolled, expected, last, lam):
 
 
 def update(model, critics, optimizer, batch, adv, returns, players, args, autocast, magnet_weight):
-    flat = {k: v.flatten(0, 1) for k, v in batch.items()}
+    flat = {k: v.flatten(0, 1) for k, v in batch.items() if k != "expert"}
+    expert = batch.get("expert")
     actors = flat["actors"]
     own = adv.flatten(0, 1).gather(1, actors[:, None]).squeeze(1)
     targets = to_relative(returns.flatten(0, 1), actors, players)
@@ -201,7 +227,7 @@ def update(model, critics, optimizer, batch, adv, returns, players, args, autoca
     seats = slice(0, players)
     threshold = own.abs().float().quantile(1 - args.keep) if args.keep < 1 else -1.0
     informative = own.abs() >= threshold
-    logs = {"policy": 0.0, "value": 0.0, "kl_magnet": 0.0, "approx_kl": 0.0, "clipped": 0.0,
+    logs = {"policy": 0.0, "value": 0.0, "kl_magnet": 0.0, "approx_kl": 0.0, "clipped": 0.0, "expert": 0.0,
             "kept": informative.float().mean().item()}
     steps = 0
     for _ in range(args.epochs):
@@ -228,6 +254,16 @@ def update(model, critics, optimizer, batch, adv, returns, players, args, autoca
             policy_loss = -torch.min(ratio * a, ratio.clamp(1 - args.clip, 1 + args.clip) * a).mean()
             magnet = kl_to_magnet(log_probs, masks).mean()
             loss = policy_loss + args.value_coef * value_loss + magnet_weight * magnet
+            if expert is not None:
+                e_obs, e_masks, e_target = expert
+                chosen = torch.randint(len(e_obs), (max(len(pick) // 4, 1),), device=e_obs.device)
+                e_symmetry = torch.randint(SYMMETRIES, (len(chosen),), device=e_obs.device) if args.symmetry else None
+                with torch.autocast(e_obs.device.type, dtype=torch.bfloat16, enabled=autocast):
+                    e_logits, _, _ = model(e_obs[chosen], e_symmetry)
+                _, e_log_probs = policy(e_logits, e_masks[chosen])
+                expert_loss = -(e_target[chosen] * e_log_probs).sum(-1).mean()
+                loss = loss + args.expert_weight * expert_loss
+                logs["expert"] += expert_loss.item()
             optimizer.zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_([*model.parameters(), *critics.parameters()], args.max_grad_norm)
@@ -270,6 +306,15 @@ def main():
                         help="score moves with a critic that also sees every hidden card (training only)")
     parser.add_argument("--future-dice", action="store_true",
                         help="score moves against a baseline that also knows the dice rolled next (ICLR 2019)")
+    parser.add_argument("--expert", action="store_true",
+                        help="expert iteration: search a few positions each round and also train the policy toward what search prefers")
+    parser.add_argument("--expert-games", type=int, default=256, help="positions searched each time")
+    parser.add_argument("--expert-every", type=int, default=4, help="search every this many rounds")
+    parser.add_argument("--expert-weight", type=float, default=1.0)
+    parser.add_argument("--expert-candidates", type=int, default=8)
+    parser.add_argument("--expert-samples", type=int, default=4)
+    parser.add_argument("--expert-depth", type=int, default=8)
+    parser.add_argument("--expert-eta", type=float, default=10.0)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--max-decisions", type=int, default=5000)
     parser.add_argument("--eval-every", type=int, default=10)
@@ -289,7 +334,12 @@ def main():
     critics = Critics(args.width).to(at)
     optimizer = torch.optim.AdamW([*model.parameters(), *critics.parameters()], lr=args.lr)
     buffer = catan.Buffer(args.games, history=64, max_decisions=args.max_decisions, seed=args.seed, players=args.players)
-    rollout = Rollout(model, critics, buffer, at, autocast, args.players, args.average_dice, args.privileged)
+    search = None
+    if args.expert:
+        search = Search(model, at, args.expert_candidates, args.expert_samples, args.expert_depth, args.expert_eta,
+                        seed=args.seed)
+    rollout = Rollout(model, critics, buffer, at, autocast, args.players, args.average_dice, args.privileged,
+                      search, args.expert_games, args.expert_every, args.seed)
     log = open(out / "log.txt", "a")
 
     def say(line):
@@ -326,6 +376,9 @@ def main():
                 f"value {logs['value']:.3f}  kl→magnet {logs['kl_magnet']:.3f}  approx_kl {logs['approx_kl']:.4f}  "
                 f"clipped {logs['clipped']:.2f}  kept {logs['kept']:.2f}  lr {args.lr * scale:.1e}  "
                 f"play {collect_time:.1f}s learn {update_time:.1f}s")
+        if stats["searched"]:
+            line += (f"  searched {stats['searched']} (search changed the top move {stats['changed'] / stats['searched']:.2f}, "
+                     f"expert loss {logs['expert']:.3f})")
         if iteration % args.eval_every == 0 or iteration == args.iterations:
             model.eval()
             clock = time.time()

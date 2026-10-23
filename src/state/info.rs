@@ -106,24 +106,24 @@ impl State {
             let mut hidden = self.hidden_from(observer);
             let mut cards = unseen_cards;
             for &p in &others {
-                let dealt = deal(cards, self.dev_card_count(p), rng);
+                let dealt = deal_from(cards, self.dev_card_count(p), rng);
                 (0..5).for_each(|c| cards[c] -= dealt[c]);
                 hidden.dev_cards[p.index()] = dealt;
             }
             hidden.deck = cards;
             if self.current != observer {
-                hidden.bought = deal(hidden.dev_cards[self.current.index()], bought, rng);
+                hidden.bought = deal_from(hidden.dev_cards[self.current.index()], bought, rng);
             }
             let mut pool = unknown_pool;
             for &p in &others {
                 let o = p.index();
                 let size: u8 = before(p).iter().sum();
                 let known = self.known[me][o];
-                let unknown = deal(pool, size - known.iter().sum::<u8>(), rng);
+                let unknown = deal_from(pool, size - known.iter().sum::<u8>(), rng);
                 (0..5).for_each(|r| pool[r] -= unknown[r]);
                 let whole: [u8; 5] = std::array::from_fn(|r| known[r] + unknown[r]);
                 let aside = if self.discards_hidden_from(observer, p) {
-                    deal(whole, self.set_aside[o].iter().sum(), rng)
+                    deal_from(whole, self.set_aside[o].iter().sum(), rng)
                 } else {
                     self.set_aside[o]
                 };
@@ -136,12 +136,57 @@ impl State {
         }
     }
 
+    pub fn deal_hidden(&self, observer: Player, deal: &[[u8; 10]], rng: &mut Rng) -> Result<State, Violation> {
+        let refused = |why: &str| Err(Violation(format!("the deal {why}")));
+        let mut hidden = self.hidden_from(observer);
+        let others: Vec<Player> = self.others(observer).collect();
+        if deal.len() != others.len() {
+            return refused("names the wrong number of players");
+        }
+        let mut deck: [i32; 5] =
+            std::array::from_fn(|c| i32::from(self.deck[c]) + others.iter().map(|p| i32::from(self.dev_cards[p.index()][c])).sum::<i32>());
+        for (k, &other) in others.iter().enumerate() {
+            let o = other.index();
+            let whole: [u8; 5] = std::array::from_fn(|r| deal[k][r]);
+            let cards: [u8; 5] = std::array::from_fn(|c| deal[k][5 + c]);
+            (0..5).for_each(|c| deck[c] -= i32::from(cards[c]));
+            hidden.dev_cards[o] = cards;
+            let aside_count: u8 = self.set_aside[o].iter().sum();
+            let aside = if self.discards_hidden_from(observer, other) {
+                if whole.iter().sum::<u8>() < aside_count {
+                    return refused("holds fewer cards than were set aside");
+                }
+                deal_from(whole, aside_count, rng)
+            } else {
+                self.set_aside[o]
+            };
+            if (0..5).any(|r| aside[r] > whole[r]) {
+                return refused("sets aside cards the hand does not hold");
+            }
+            hidden.set_aside[o] = aside;
+            hidden.hands[o] = std::array::from_fn(|r| whole[r] - aside[r]);
+        }
+        if deck.iter().any(|&n| n < 0) {
+            return refused("uses more development cards than are unseen");
+        }
+        hidden.deck = deck.map(|n| n as u8);
+        if self.current != observer {
+            let bought: u8 = self.bought.iter().sum();
+            let held = hidden.dev_cards[self.current.index()];
+            if held.iter().sum::<u8>() < bought {
+                return refused("leaves too few cards for those bought this turn");
+            }
+            hidden.bought = deal_from(held, bought, rng);
+        }
+        self.with_hidden(observer, hidden)
+    }
+
     pub(super) fn discards_hidden_from(&self, observer: Player, player: Player) -> bool {
         matches!(self.phase, Phase::Discard { .. }) && player != observer
     }
 }
 
-fn deal(mut counts: [u8; 5], n: u8, rng: &mut Rng) -> [u8; 5] {
+fn deal_from(mut counts: [u8; 5], n: u8, rng: &mut Rng) -> [u8; 5] {
     let mut dealt = [0; 5];
     for _ in 0..n {
         let k = rng.weighted(&counts);
