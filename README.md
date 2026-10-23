@@ -29,9 +29,11 @@ python -m train.compare runs/anneal/latest.pt runs/dice/latest.pt   # challenger
 python -m train.habits runs/anneal/latest.pt    # what it does per game vs the bot: builds, trades, cards, harbors
 python -m train.search runs/anneal/latest.pt --bot   # does search (imagine hidden cards, play each candidate forward) beat the plain network?
 python -m train.belief runs/base/latest.pt   # learn to guess other players' hidden cards; then search --belief runs/belief/belief.pt
+python -m train.search runs/base/latest.pt --deep   # deep search: a tree over the player's own moves, vs the network and vs plain search
+cargo run --release --example viewer -- --play runs/base/latest.pt --seat 0   # play against the network in the viewer
 ```
 
-every command takes `--players` (default 4). on a rented GPU, `bash overnight.sh` trains a 4-player baseline, then a belief network and search on top of it, then an expert-iteration run, then one run per idea (symmetry, future-dice baseline, privileged critic, dice averaging) and all of them together for twice as long, comparing each against `runs/base` as it goes and packing everything into `results-overnight.tar.gz`
+every command takes `--players` (default 4). after the overnight queue, `FLAGS="--symmetry ..." bash final.sh` trains the winning ideas for 1500 iterations (seed 0, then seed 1) and tests the result: against base and the bot, with search and deep search, an Elo curve over its checkpoints, and habits. on a rented GPU, `bash overnight.sh` trains a 4-player baseline, then a belief network and search on top of it, then an expert-iteration run, then one run per idea (symmetry, future-dice baseline, privileged critic, dice averaging) and all of them together for twice as long, comparing each against `runs/base` as it goes and packing everything into `results-overnight.tar.gz`
 
 useful `selfplay` flags: `--symmetry` turns each training sample by a random one of the board's 12 rotations/reflections; `--future-dice` scores each move against a baseline that also knows the dice rolled next (input-dependent baseline, ICLR 2019); `--privileged` scores moves with a critic that also sees every hidden hand and card (training only; the playing network never sees them); evaluations are paired: each group of games deals the same board and dice with seats rotated, so luck cancels; `--expert` (expert iteration, as in AlphaZero) searches a few positions every few rounds and also trains the policy toward the moves search prefers.
 
@@ -47,6 +49,7 @@ more flags: `--anneal-power 0.5` shrinks the learning rate and magnet weight ove
 - `watch.py` plays one game with a saved network and prints it in the viewer's `players;seed;codes` format
 - `habits.py` plays a saved network against the bot and reports what it does per game: builds, trades by rate, cards, harbor use
 - `search.py` thinks before moving: the network's top moves are each played forward in several random deals of the hidden cards, and the move with the best mix of prior and outcome is chosen; with `--belief` the hidden cards are dealt from the belief network
+- `serve.py` lets the viewer play against a network: one line in per move (the network's view and legal moves), one move out. In play mode the viewer hides other players' cards, moves and private chance results unless you tick peek
 - `belief.py` trains a network to guess, from one player's view, the hand and development cards of every other player; it reports how surprised it is per unseen card next to a baseline that only counts which cards are left
 
 ## rules

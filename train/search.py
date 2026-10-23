@@ -85,6 +85,84 @@ class Search:
         return choices[torch.arange(len(obs)), best].numpy()
 
 
+class Node:
+    def __init__(self, prior, value):
+        self.prior, self.value = prior, value
+        self.visits, self.total = np.zeros(len(prior)), np.zeros(len(prior))
+
+    def select(self, legal, c):
+        q = np.where(self.visits > 0, self.total / np.maximum(self.visits, 1), self.value)
+        score = q + c * self.prior * np.sqrt(self.visits.sum() + 1) / (1 + self.visits)
+        action = int(np.where(legal, score, -np.inf).argmax())
+        self.visits[action] += 1
+        return action
+
+
+class Deep(Search):
+    """Search over the searching player's own moves several decisions deep: a tree whose branches are only that
+    player's choices, so it never plans on cards it cannot see. Every simulation re-deals the hidden cards;
+    the other players move as the network would."""
+
+    def __init__(self, model, at, simulations=32, wave=16, steps=48, c=1.5, chunk=8192, seed=0):
+        super().__init__(model, at, chunk=chunk, seed=seed)
+        self.simulations, self.wave, self.steps, self.c = simulations, wave, steps, c
+
+    def __call__(self, obs, masks, buffer, games, players):
+        n, seats = len(obs), int(obs[0, 221])
+        logits, values = self.evaluate(obs, masks)
+        trees = [{(): Node(logits[i].softmax(0).numpy(), values[i, 0].item())} for i in range(n)]
+        for _ in range(max(self.simulations // self.wave, 1)):
+            owner = np.repeat(np.arange(n), self.wave)
+            paths = [[((), trees[i][()].select(masks[i], self.c))] for i in owner]
+            self.seed += 1
+            worlds = buffer.worlds(games[owner], np.array([path[0][1] for path in paths]), 1, self.seed)
+            root = players[owner]
+            result = np.full(len(owner), np.nan)
+            for _ in range(self.steps):
+                o, m, p = worlds.observe()
+                over = np.isnan(result) & (p < 0)
+                if over.any():
+                    winners = worlds.winners()
+                    result[over] = np.where(winners[over] == root[over], 1.0, -1.0 / (seats - 1))
+                open_ = np.isnan(result) & (p >= 0)
+                if not open_.any():
+                    break
+                actions = m.argmax(1).astype(np.int64)
+                rows = np.flatnonzero(open_)
+                l, v = self.evaluate(o[rows], m[rows])
+                probs = l.softmax(1)
+                drawn = torch.multinomial(probs, 1, generator=self.generator).squeeze(1).numpy()
+                for k, w in enumerate(rows):
+                    if p[w] != root[w] or m[w].sum() == 1:
+                        actions[w] = drawn[k]
+                        continue
+                    key = tuple(a for _, a in paths[w])
+                    tree = trees[owner[w]]
+                    if key not in tree:
+                        tree[key] = Node(probs[k].numpy(), v[k, 0].item())
+                        result[w] = v[k, 0].item()
+                        continue
+                    actions[w] = tree[key].select(m[w], self.c)
+                    paths[w].append((key, int(actions[w])))
+                worlds.step(actions)
+            o, m, p = worlds.observe()
+            left = np.flatnonzero(np.isnan(result))
+            if len(left):
+                live = left[p[left] >= 0]
+                if len(live):
+                    _, v = self.evaluate(o[live])
+                    result[live] = v.numpy()[np.arange(len(live)), (root[live] - p[live]) % seats]
+                done = left[p[left] < 0]
+                if len(done):
+                    winners = worlds.winners()
+                    result[done] = np.where(winners[done] == root[done], 1.0, -1.0 / (seats - 1))
+            for w, path in enumerate(paths):
+                tree = trees[owner[w]]
+                for key, action in path:
+                    tree[key].total[action] += result[w]
+        return np.array([np.where(masks[i], trees[i][()].visits, -1).argmax() for i in range(n)])
+
+
 def main():
     parser = argparse.ArgumentParser(description="Does search improve a saved network? Plays it with search against itself without.")
     parser.add_argument("checkpoint")
@@ -95,6 +173,11 @@ def main():
     parser.add_argument("--eta", type=float, default=10.0, help="how far the search may move away from the network's choice")
     parser.add_argument("--belief", help="deal the hidden cards from this belief network instead of uniformly")
     parser.add_argument("--bot", action="store_true", help="also play search against the bot")
+    parser.add_argument("--belief-only", action="store_true", help="skip the match without the belief network")
+    parser.add_argument("--deep", action="store_true",
+                        help="instead: search a tree of the player's own moves, several decisions deep, against the network and against plain search")
+    parser.add_argument("--simulations", type=int, default=32, help="deep search: imagined games per move")
+    parser.add_argument("--steps", type=int, default=48, help="deep search: decisions played forward in each imagined game")
     parser.add_argument("--players", type=int, default=4)
     args = parser.parse_args()
 
@@ -109,7 +192,13 @@ def main():
         report(name, play(a, b, games=args.games, parallel=parallel, seed=seed, players=args.players))
         print(f"  ({time.time() - start:.0f}s)", flush=True)
 
-    match("search vs network", search, Network(model, at, seed=1), 7)
+    if args.deep:
+        deep = Deep(model, at, args.simulations, steps=args.steps, seed=2)
+        match("deep search vs network", deep, Network(model, at, seed=1), 7)
+        match("deep search vs search", deep, search, 9)
+        return
+    if not args.belief_only:
+        match("search vs network", search, Network(model, at, seed=1), 7)
     if args.belief:
         guided = Search(model, at, *settings, seed=1, belief=load_belief(args.belief, at))
         match("belief search vs network", guided, Network(model, at, seed=1), 7)

@@ -74,7 +74,7 @@ def draw(logits, pool, counts, generator):
     return dealt
 
 
-def positions(model, at, count, games, seed, warmup=200, keep=0.25):
+def positions(model, at, count, games, seed, warmup=200, keep=0.02):
     """Positions from the network playing itself, with every hidden card written down."""
     buffer = catan.Buffer(games, seed=seed, players=4)
     agent, rng = Network(model, at, seed=seed), np.random.default_rng(seed)
@@ -127,10 +127,12 @@ def load_belief(path, at):
 def main():
     parser = argparse.ArgumentParser(description="Train a network to guess the cards other players hold, from one player's view.")
     parser.add_argument("checkpoint", help="the policy whose games to learn from; its trunk is the starting point")
-    parser.add_argument("--positions", type=int, default=1_000_000)
-    parser.add_argument("--test-positions", type=int, default=100_000)
+    parser.add_argument("--positions", type=int, default=500_000)
+    parser.add_argument("--test-positions", type=int, default=50_000)
     parser.add_argument("--games", type=int, default=2048)
+    parser.add_argument("--keep", type=float, default=0.02, help="share of decisions kept, so the positions come from many games")
     parser.add_argument("--steps", type=int, default=20_000)
+    parser.add_argument("--weight-decay", type=float, default=0.1)
     parser.add_argument("--batch", type=int, default=1024)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--out", default="runs/belief/belief.pt")
@@ -140,16 +142,17 @@ def main():
     torch.manual_seed(0)
     policy = load(args.checkpoint, at)
     start = time.time()
-    data = positions(policy, at, args.positions, args.games, seed=1)
-    test = positions(policy, at, args.test_positions, args.games, seed=2)
+    data = positions(policy, at, args.positions, args.games, seed=1, keep=args.keep)
+    test = positions(policy, at, args.test_positions, args.games, seed=2, keep=args.keep)
     print(f"{len(data[0])} training and {len(test[0])} held-out positions ({time.time() - start:.0f}s)", flush=True)
 
     belief = Belief(policy.width, len(policy.blocks)).to(at)
     belief.trunk.load_state_dict(policy.state_dict())
-    optimizer = torch.optim.AdamW(belief.parameters(), lr=args.lr)
+    optimizer = torch.optim.AdamW(belief.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     schedule = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.steps)
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     obs, hidden = data
+    best = float("inf")
     for step in range(1, args.steps + 1):
         pick = torch.randint(len(obs), (args.batch,))
         out, h, d = losses(belief, obs[pick].to(at), hidden[pick].to(at))
@@ -163,10 +166,15 @@ def main():
             belief.eval()
             result = score(belief, *test, at)
             belief.train()
+            surprise = result["network hands"] + result["network devs"]
+            kept = surprise < best
             print(f"step {step:6d}  {time.time() - start:5.0f}s  nats per unseen card: "
                   f"hands {result['network hands']:.3f} (baseline {result['baseline hands']:.3f})  "
-                  f"dev cards {result['network devs']:.3f} (baseline {result['baseline devs']:.3f})", flush=True)
-            torch.save({"belief": belief.state_dict(), "width": belief.width, "depth": belief.depth}, args.out)
+                  f"dev cards {result['network devs']:.3f} (baseline {result['baseline devs']:.3f})"
+                  f"{'  saved' if kept else ''}", flush=True)
+            if kept:
+                best = surprise
+                torch.save({"belief": belief.state_dict(), "width": belief.width, "depth": belief.depth}, args.out)
 
 
 if __name__ == "__main__":

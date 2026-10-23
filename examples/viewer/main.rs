@@ -1,3 +1,7 @@
+use std::io::{BufRead, BufReader, Write};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::time::{Duration, Instant};
+
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, RichText, Sense, Shape, Stroke, Vec2};
 
 use catan::board::{Board, Harbor, Terrain};
@@ -13,6 +17,7 @@ use catan::topology::topology;
 type View = [u8; OBSERVATION_BYTES];
 
 const LEAK_SAMPLES: usize = 16;
+const PAUSE: Duration = Duration::from_millis(400);
 const PLAYERS: [Color32; MAX_PLAYERS] = [
     Color32::from_rgb(37, 99, 235),
     Color32::from_rgb(234, 88, 12),
@@ -40,11 +45,75 @@ const BLOCKS: [(&str, u16, u16); 9] = [
 ];
 
 fn main() -> eframe::Result {
+    let args: Vec<String> = std::env::args().collect();
+    let flag = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
+    let number = |name: &str, default: usize| flag(name).and_then(|v| v.parse().ok()).unwrap_or(default);
+    let players = number("--players", 4).clamp(2, MAX_PLAYERS);
+    let mut viewer = Viewer::new(number("--seed", 1) as u64, players);
+    if let Some(checkpoint) = flag("--play") {
+        let python = flag("--python").unwrap_or_else(|| "python".into());
+        let human = Player::new(number("--seat", 0).min(players - 1));
+        match Play::spawn(&python, &checkpoint, human, args.iter().any(|a| a == "--greedy")) {
+            Ok(play) => viewer.play = Some(play),
+            Err(e) => {
+                eprintln!("could not start the network: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1500.0, 1000.0]),
         ..Default::default()
     };
-    eframe::run_native("Catan rules viewer", options, Box::new(|_| Ok(Box::new(Viewer::new(1, 4)))))
+    eframe::run_native("Catan rules viewer", options, Box::new(|_| Ok(Box::new(viewer))))
+}
+
+struct Play {
+    child: Child,
+    input: ChildStdin,
+    output: BufReader<ChildStdout>,
+    human: Player,
+    peek: bool,
+    last: Instant,
+}
+
+impl Play {
+    fn spawn(python: &str, checkpoint: &str, human: Player, greedy: bool) -> Result<Play, String> {
+        let mut child = Command::new(python)
+            .args(["-u", "-m", "train.serve", checkpoint])
+            .args(greedy.then_some("--greedy"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("{python}: {e}"))?;
+        let input = child.stdin.take().expect("piped");
+        let mut output = BufReader::new(child.stdout.take().expect("piped"));
+        let mut line = String::new();
+        output.read_line(&mut line).map_err(|e| e.to_string())?;
+        if line.trim() != "ready" {
+            return Err("train.serve did not start; is the checkpoint path right?".into());
+        }
+        Ok(Play { child, input, output, human, peek: false, last: Instant::now() })
+    }
+
+    fn ask(&mut self, seen: &View, legal: &[u16]) -> Option<u16> {
+        let join = |values: Vec<String>| values.join(",");
+        let line = format!(
+            "{};{}\n",
+            join(seen.iter().map(u8::to_string).collect()),
+            join(legal.iter().map(u16::to_string).collect())
+        );
+        self.input.write_all(line.as_bytes()).ok()?;
+        let mut answer = String::new();
+        self.output.read_line(&mut answer).ok()?;
+        answer.trim().parse().ok()
+    }
+}
+
+impl Drop for Play {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -69,6 +138,8 @@ struct Viewer {
     violation: Option<(usize, String)>,
     leak_free: Vec<Option<bool>>,
     message: Option<String>,
+    play: Option<Play>,
+    draft: [[u8; 5]; 2],
 }
 
 impl Viewer {
@@ -88,6 +159,8 @@ impl Viewer {
             violation: None,
             leak_free: Vec::new(),
             message: None,
+            play: None,
+            draft: [[0; 5]; 2],
         };
         viewer.refresh();
         viewer
@@ -103,9 +176,12 @@ impl Viewer {
     }
 
     fn load(&mut self, seed: u64, players: usize, codes: &[u16]) {
-        let (show_ids, tab) = (self.show_ids, self.tab);
+        let (show_ids, tab, mut play) = (self.show_ids, self.tab, self.play.take());
+        if let Some(play) = play.as_mut() {
+            play.human = Player::new(play.human.index().min(players - 1));
+        }
         *self = Viewer::new(seed, players);
-        (self.show_ids, self.tab) = (show_ids, tab);
+        (self.show_ids, self.tab, self.play) = (show_ids, tab, play);
         for (i, &code) in codes.iter().enumerate() {
             if !self.push(code) {
                 self.message = Some(format!("step {i} (code {code}) is not legal there; stopped before it"));
@@ -167,6 +243,49 @@ impl Viewer {
         self.refresh();
     }
 
+    fn hiding(&self) -> Option<Player> {
+        self.play.as_ref().filter(|p| !p.peek).map(|p| p.human)
+    }
+
+    fn may_move(&self) -> bool {
+        self.play.as_ref().is_none_or(|p| self.state().actor() == Some(Actor::Player(p.human)))
+    }
+
+    fn advance(&mut self, ctx: &egui::Context) {
+        if self.play.is_none() || self.at != self.steps.len() {
+            return;
+        }
+        let state = self.state();
+        let human = self.play.as_ref().expect("playing").human;
+        let code = match state.actor() {
+            Some(Actor::Chance) => state.sample_outcome(&mut self.rng).index(),
+            Some(Actor::Player(p)) if p != human => {
+                let play = self.play.as_mut().expect("playing");
+                let waited = play.last.elapsed();
+                if waited < PAUSE {
+                    ctx.request_repaint_after(PAUSE - waited);
+                    return;
+                }
+                let legal: Vec<u16> = state.legal_actions().iter().map(Action::index).collect();
+                match play.ask(&view(&state, p), &legal) {
+                    Some(code) if legal.contains(&code) => code,
+                    _ => {
+                        let code = legal[self.rng.below(legal.len())];
+                        self.take(code);
+                        self.message = Some("the network did not answer with a legal move; played a random one".into());
+                        return;
+                    }
+                }
+            }
+            _ => return,
+        };
+        self.take(code);
+        if let Some(play) = self.play.as_mut() {
+            play.last = Instant::now();
+        }
+        ctx.request_repaint();
+    }
+
     fn refresh(&mut self) {
         self.violation = self.states.iter().enumerate().find_map(|(i, s)| s.validate().err().map(|v| (i, v.0)));
         let state = self.state();
@@ -203,10 +322,15 @@ impl Viewer {
             }
             ui.monospace(format!("step {} / {}", self.at, self.steps.len()));
             ui.separator();
-            ui.label("random");
-            for (label, count) in [("1", 1), ("10", 10), ("100", 100), ("to end", 100_000)] {
-                if ui.button(label).clicked() {
-                    self.random(count);
+            if let Some(play) = self.play.as_mut() {
+                ui.colored_label(PLAYERS[play.human.index()], format!("you are {:?}", play.human));
+                ui.checkbox(&mut play.peek, "peek");
+            } else {
+                ui.label("random");
+                for (label, count) in [("1", 1), ("10", 10), ("100", 100), ("to end", 100_000)] {
+                    if ui.button(label).clicked() {
+                        self.random(count);
+                    }
                 }
             }
             ui.separator();
@@ -243,7 +367,7 @@ impl Viewer {
         heading(ui, "Now");
         egui::Grid::new("now").num_columns(2).show(ui, |ui| {
             ui.label("phase");
-            ui.label(phase_label(state.phase()));
+            ui.label(phase_label(&state));
             ui.end_row();
             ui.label("to act");
             ui.colored_label(actor_color(state.actor()), actor_name(state.actor()));
@@ -261,16 +385,87 @@ impl Viewer {
         if let Some(message) = &self.message {
             ui.colored_label(BAD, message);
         }
-        if let Some(code) = moves(ui, &state) {
-            self.take(code);
+        let thinking = self.play.as_ref().filter(|_| !self.may_move() && state.actor().is_some()).map(|_| state.actor());
+        match thinking {
+            Some(actor) => {
+                heading(ui, "Moves");
+                ui.colored_label(actor_color(actor), format!("{} is thinking…", actor_name(actor)));
+            }
+            None if fresh_offer(&state) => self.offer_builder(ui),
+            None => {
+                if let Some(code) = moves(ui, &state) {
+                    self.take(code);
+                }
+            }
         }
-        players(ui, &state);
+        players(ui, &state, self.hiding());
         if let Some(at) = self.history(ui) {
             self.seek(at);
         }
     }
 
+    fn offer_builder(&mut self, ui: &mut egui::Ui) {
+        heading(ui, "Build your offer");
+        egui::Grid::new("offer").num_columns(3).show(ui, |ui| {
+            ui.label("");
+            ui.strong("you give");
+            ui.strong("you want");
+            ui.end_row();
+            for resource in Resource::ALL {
+                let r = resource.index();
+                ui.colored_label(resource_color(resource), resource_name(resource));
+                for side in 0..2 {
+                    ui.horizontal(|ui| {
+                        if ui.small_button("−").clicked() {
+                            self.draft[side][r] = self.draft[side][r].saturating_sub(1);
+                        }
+                        ui.monospace(self.draft[side][r].to_string());
+                        if ui.small_button("+").clicked() {
+                            self.draft[side][r] += 1;
+                        }
+                    });
+                }
+                ui.end_row();
+            }
+        });
+        let [give, get] = self.draft;
+        let ready = give.iter().sum::<u8>() > 0 && get.iter().sum::<u8>() > 0;
+        ui.horizontal(|ui| {
+            if ui.add_enabled(ready, egui::Button::new("Propose")).clicked() {
+                let mut codes: Vec<u16> = Vec::new();
+                for (side, action) in [(give, Action::Give as fn(Resource) -> Action), (get, Action::Want)] {
+                    for resource in Resource::ALL {
+                        codes.extend(std::iter::repeat_n(action(resource).index(), usize::from(side[resource.index()])));
+                    }
+                }
+                codes.push(Action::Propose.index());
+                let mut trial = self.state();
+                if codes.iter().all(|&c| trial.step(c).is_ok()) {
+                    self.branch();
+                    codes.iter().for_each(|&c| {
+                        self.push(c);
+                    });
+                    self.at = self.steps.len();
+                    self.draft = [[0; 5]; 2];
+                    self.refresh();
+                } else {
+                    self.message = Some("that offer is not allowed; see the rules below".into());
+                }
+            }
+            if ui.button("Cancel").clicked() {
+                self.draft = [[0; 5]; 2];
+                self.take(Action::Cancel.index());
+            }
+        });
+        ui.weak(
+            "At most 4 cards on each side; you must hold what you give; you cannot want what you give; \
+             no one can be asked for more cards than the largest other hand holds, \
+             or for more of a resource than the other players hold between them.",
+        );
+    }
+
     fn history(&self, ui: &mut egui::Ui) -> Option<usize> {
+        let hiding = self.hiding();
         heading(ui, "History");
         let mut chosen = None;
         let row = ui.text_style_height(&egui::TextStyle::Monospace) + 4.0;
@@ -285,7 +480,11 @@ impl Viewer {
                         _ => {
                             let (state, code) = (&self.states[i - 1], self.steps[i - 1]);
                             let actor = state.actor();
-                            (format!("{i:>4}  {:<7} {}  #{code}", actor_name(actor), step_label(state, code)), actor_color(actor))
+                            let label = match hiding {
+                                Some(human) if !public(state, human) => "chance (hidden)".to_string(),
+                                _ => step_label(state, code),
+                            };
+                            (format!("{i:>4}  {:<7} {label}  #{code}", actor_name(actor)), actor_color(actor))
                         }
                     };
                     let text = RichText::new(text).monospace().color(if i > self.at { color.gamma_multiply(0.4) } else { color });
@@ -378,7 +577,7 @@ impl Viewer {
             }
         }
 
-        let legal: Vec<Action> = state.legal_actions().iter().collect();
+        let legal: Vec<Action> = if self.may_move() { state.legal_actions().iter().collect() } else { Vec::new() };
         let highlight = Color32::from_rgba_unmultiplied(139, 92, 246, 70);
         for &action in &legal {
             match action {
@@ -421,6 +620,10 @@ impl Viewer {
     }
 
     fn tabs(&mut self, ui: &mut egui::Ui) {
+        if self.hiding().is_some() {
+            ui.weak("The views, action mask and hidden cards are hidden while you play; tick peek in the toolbar to see them.");
+            return;
+        }
         ui.horizontal(|ui| {
             ui.selectable_value(&mut self.tab, Tab::Views, "What each player sees");
             ui.selectable_value(&mut self.tab, Tab::Mask, "Action mask");
@@ -467,6 +670,7 @@ impl Viewer {
 
 impl eframe::App for Viewer {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.advance(ui.ctx());
         if !ui.ctx().egui_wants_keyboard_input() {
             if ui.input(|i| i.key_pressed(egui::Key::ArrowLeft)) {
                 self.seek(self.at.saturating_sub(1));
@@ -536,7 +740,20 @@ fn moves(ui: &mut egui::Ui, state: &State) -> Option<u16> {
     chosen
 }
 
-fn players(ui: &mut egui::Ui, state: &State) {
+fn fresh_offer(state: &State) -> bool {
+    matches!(state.phase(), Phase::Offer { give, get } if give == [0; 5] && get == [0; 5])
+}
+
+fn public(state: &State, human: Player) -> bool {
+    match state.phase() {
+        Phase::Steal { victim, .. } => state.current() == human || victim == human,
+        Phase::Draw => state.current() == human,
+        _ => true,
+    }
+}
+
+fn players(ui: &mut egui::Ui, state: &State, hiding: Option<Player>) {
+    let secret = |p: Player| hiding.is_some_and(|human| human != p);
     heading(ui, "Players");
     let resources = |ui: &mut egui::Ui, counts: [u8; 5]| {
         ui.horizontal(|ui| {
@@ -567,12 +784,28 @@ fn players(ui: &mut egui::Ui, state: &State) {
             ui.colored_label(PLAYERS[p.index()], RichText::new(format!("{p:?}")).strong());
         });
         row(ui, "points", &|ui, p| {
-            ui.label(format!("{} (public {})", state.victory_points(p), state.public_victory_points(p)));
+            ui.label(match secret(p) {
+                true => format!("{} public", state.public_victory_points(p)),
+                false => format!("{} (public {})", state.victory_points(p), state.public_victory_points(p)),
+            });
         });
-        row(ui, "hand", &|ui, p| resources(ui, state.hand(p)));
-        row(ui, "set aside", &|ui, p| resources(ui, state.set_aside(p)));
+        row(ui, "hand", &|ui, p| match secret(p) {
+            true => {
+                ui.label(format!("{} cards", state.hand(p).iter().sum::<u8>()));
+            }
+            false => resources(ui, state.hand(p)),
+        });
+        row(ui, "set aside", &|ui, p| match secret(p) {
+            true => {
+                ui.label(format!("{} cards", state.set_aside(p).iter().sum::<u8>()));
+            }
+            false => resources(ui, state.set_aside(p)),
+        });
         row(ui, "dev cards", &|ui, p| {
-            ui.label(cards(DevCard::ALL.map(|c| state.dev_cards(p, c))));
+            ui.label(match secret(p) {
+                true => format!("{} cards", state.dev_card_count(p)),
+                false => cards(DevCard::ALL.map(|c| state.dev_cards(p, c))),
+            });
         });
         row(ui, "knights played", &|ui, p| {
             ui.label(state.knights(p).to_string());
@@ -817,9 +1050,10 @@ fn step_label(state: &State, code: u16) -> String {
     }
 }
 
-fn phase_label(phase: Phase) -> String {
+fn phase_label(state: &State) -> String {
+    let proposer = state.current();
     let rolled = |r: bool| if r { "after the roll" } else { "before the roll" };
-    match phase {
+    match state.phase() {
         Phase::PlaceSettlement => "setup: place a settlement".into(),
         Phase::PlaceRoad { settlement } => format!("setup: place a road touching v{}", settlement.index()),
         Phase::Turn { rolled: r } => format!("turn, {}", rolled(r)),
@@ -833,9 +1067,17 @@ fn phase_label(phase: Phase) -> String {
         Phase::YearOfPlenty { picks, .. } => format!("year of plenty: {picks} left"),
         Phase::Monopoly { .. } => "monopoly: name a resource".into(),
         Phase::Over { winner } => format!("over: {winner:?} wins"),
-        Phase::Offer { give, get } => format!("building an offer: give {} for {}", bundle(give), bundle(get)),
-        Phase::Respond { give, get, responder, .. } => format!("{responder:?} answers: {} for {}", bundle(give), bundle(get)),
-        Phase::Confirm { give, get, .. } => format!("choose a partner: {} for {}", bundle(give), bundle(get)),
+        Phase::Offer { give, get } => format!("{proposer:?} is building an offer: gives {}, wants {}", bundle(give), bundle(get)),
+        Phase::Respond { give, get, responder, .. } => format!(
+            "{proposer:?} offers {} for {}: does {responder:?} accept (giving {} to get {})?",
+            bundle(give),
+            bundle(get),
+            bundle(get),
+            bundle(give)
+        ),
+        Phase::Confirm { give, get, .. } => {
+            format!("{proposer:?} chooses who to trade with: gives {}, gets {}", bundle(give), bundle(get))
+        }
     }
 }
 
