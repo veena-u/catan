@@ -19,6 +19,7 @@ from .search import Search
 
 HIDDEN = (SEATS - 1) * 10
 TRADED = np.isin(KINDS, (17, 18))
+EXPERT_VISITS = 50
 DICE_SUMS = 11
 
 KIND_MATRIX = torch.from_numpy(np.eye(KIND_COUNT, dtype=np.float32)[KINDS])
@@ -79,24 +80,27 @@ class Critics(nn.Module):
 
 class Rollout:
     def __init__(self, model, critics, buffer, at, autocast, players, average_dice=False, privileged=False,
-                 search=None, expert_games=0, expert_every=1, seed=0):
+                 search=None, expert_games=0, expert_every=1, expert_scale=0.1, seed=0):
         self.model, self.critics, self.buffer, self.at, self.autocast = model, critics, buffer, at, autocast
         self.games, self.players = len(buffer), players
         self.average_dice, self.privileged = average_dice, privileged
-        self.search, self.expert_games, self.expert_every = search, expert_games, expert_every
+        self.search, self.expert_games, self.expert_every, self.expert_scale = search, expert_games, expert_every, expert_scale
         self.rng = np.random.default_rng(seed)
         buffer.track_dice(average_dice)
 
     def expert(self, o, m, p):
-        """Search a few positions with a real choice; the targets are the moves search prefers, as probabilities."""
+        """Gumbel AlphaZero's policy improvement on a few positions with a real choice. Search a sample of moves; every
+        move keeps the network's preference, and each searched one moves up or down by how much better or worse search
+        found it than the network expected the position to be worth."""
         choosing = np.flatnonzero(m.sum(1) > 1)
         games = self.rng.choice(choosing, min(self.expert_games, len(choosing)), replace=False)
         if len(games) == 0:
             return None
-        choices, top, q = self.search.improve(o[games], m[games], self.buffer, games, p[games])
-        improved = (top + self.search.eta * q).softmax(1).nan_to_num(0.0)
-        target = torch.zeros(len(games), catan.ACTIONS).scatter_(1, choices, improved)
-        changed = (improved.argmax(1) != 0).float().sum().item()
+        choices, q, prior, value = self.search.improve(o[games], m[games], self.buffer, games, p[games], gumbel=True)
+        completed = value[:, None].expand_as(prior).clone()
+        completed.scatter_(1, choices, torch.where(torch.isfinite(q), q, value[:, None]))
+        target = (prior + self.expert_scale * (EXPERT_VISITS + self.search.samples) * completed).softmax(1)
+        changed = (target.argmax(1) != prior.argmax(1)).float().sum().item()
         return self.tensor(o[games]), self.tensor(m[games]), target.to(self.at), changed
 
     @torch.no_grad()
@@ -310,14 +314,15 @@ def main():
     parser.add_argument("--future-dice", action="store_true",
                         help="score moves against a baseline that also knows the dice rolled next (ICLR 2019)")
     parser.add_argument("--expert", action="store_true",
-                        help="expert iteration: search a few positions each round and also train the policy toward what search prefers")
-    parser.add_argument("--expert-games", type=int, default=256, help="positions searched each time")
-    parser.add_argument("--expert-every", type=int, default=4, help="search every this many rounds")
+                        help="expert iteration (Gumbel AlphaZero): search a few positions and also train the policy toward what search finds")
+    parser.add_argument("--expert-games", type=int, default=128, help="positions searched each time")
+    parser.add_argument("--expert-every", type=int, default=8, help="search every this many rounds")
     parser.add_argument("--expert-weight", type=float, default=1.0)
-    parser.add_argument("--expert-candidates", type=int, default=8)
-    parser.add_argument("--expert-samples", type=int, default=4)
-    parser.add_argument("--expert-depth", type=int, default=8)
-    parser.add_argument("--expert-eta", type=float, default=10.0)
+    parser.add_argument("--expert-candidates", type=int, default=8, help="moves searched at each position")
+    parser.add_argument("--expert-samples", type=int, default=8, help="deals of the hidden cards per move")
+    parser.add_argument("--expert-depth", type=int, default=16, help="decisions played forward")
+    parser.add_argument("--expert-scale", type=float, default=0.1, help="how far search may move the target from the network")
+    parser.add_argument("--save-every", type=int, default=250, help="keep a numbered checkpoint every this many iterations")
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--max-decisions", type=int, default=5000)
     parser.add_argument("--eval-every", type=int, default=10)
@@ -339,10 +344,9 @@ def main():
     buffer = catan.Buffer(args.games, history=64, max_decisions=args.max_decisions, seed=args.seed, players=args.players)
     search = None
     if args.expert:
-        search = Search(model, at, args.expert_candidates, args.expert_samples, args.expert_depth, args.expert_eta,
-                        seed=args.seed)
+        search = Search(model, at, args.expert_candidates, args.expert_samples, args.expert_depth, seed=args.seed)
     rollout = Rollout(model, critics, buffer, at, autocast, args.players, args.average_dice, args.privileged,
-                      search, args.expert_games, args.expert_every, args.seed)
+                      search, args.expert_games, args.expert_every, args.expert_scale, args.seed)
     log = open(out / "log.txt", "a")
 
     def say(line):
@@ -405,8 +409,9 @@ def main():
                 line += f"  vs {name} {result['win_rate']:.3f}"
             checkpoint = {"model": model.state_dict(), "critics": critics.state_dict(), "optimizer": optimizer.state_dict(),
                           "args": vars(args), "iteration": iteration}
-            torch.save(checkpoint, out / f"iter_{iteration:05d}.pt")
             torch.save(checkpoint, out / "latest.pt")
+            if iteration % args.save_every == 0 or iteration == args.iterations:
+                torch.save({k: v for k, v in checkpoint.items() if k != "optimizer"}, out / f"iter_{iteration:05d}.pt")
             previous = copy.deepcopy(model).eval()
             line += f"  (eval {time.time() - clock:.0f}s)"
         say(line)

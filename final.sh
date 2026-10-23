@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # One long run on the current rules, then tested every way we have: per-game habits, a strength curve over its
-# checkpoints, search and deep search against it, and the bot.
-# Start it inside tmux, e.g.:  NAME=long FLAGS="--privileged" bash final.sh
-# Two long runs play each other with:  python -m train.compare runs/long/latest.pt runs/long-critic/latest.pt
+# checkpoints, search and deep search against it, and the bot. The learning rate shrinks slowly enough for days of
+# training; stop whenever, and run the same command again to resume. To test a stopped run, rerun with ITERATIONS set
+# to the last numbered checkpoint (a multiple of 250).
+# Start it inside tmux, e.g.:  NAME=long FLAGS="--symmetry" bash final.sh
+# Two long runs play each other with:  python -m train.compare runs/long/latest.pt runs/long-expert/latest.pt
 set -uo pipefail
 if [ -f /venv/main/bin/activate ]; then source /venv/main/bin/activate; fi
 cd "$(dirname "$0")"
@@ -10,9 +12,10 @@ cd "$(dirname "$0")"
 PLAYERS=${PLAYERS:-4}
 NAME=${NAME:-long}
 FLAGS=${FLAGS:-""}
-ITERATIONS=${ITERATIONS:-1500}
+ITERATIONS=${ITERATIONS:-6000}
 SEED=${SEED:-0}
-BASE="--games 2048 --rounds 64 --eval-every 50 --anneal-power 0.5 --anneal-steps 20 --players $PLAYERS"
+SIZE=${SIZE:-"--width 192 --depth 6"}
+BASE="--games 2048 --rounds 64 --eval-every 50 --save-every 250 --anneal-power 0.5 --anneal-steps 200 --players $PLAYERS $SIZE"
 RUN=runs/$NAME
 
 once() {

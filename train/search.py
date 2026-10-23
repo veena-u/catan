@@ -38,12 +38,16 @@ class Search:
         logits, _ = self.evaluate(obs, masks)
         return torch.multinomial(logits.softmax(1), 1, generator=self.generator).squeeze(1).numpy()
 
-    def improve(self, obs, masks, buffer, games, players):
-        """The network's top moves at each position, and how much better search finds each one: (choices, prior, q)."""
-        logits, _ = self.evaluate(obs, masks)
+    def improve(self, obs, masks, buffer, games, players, gumbel=False):
+        """Search a few moves at each position: (choices, q, prior, value), where q is what search found each choice
+        worth, prior the network's log-probabilities for every move, and value its own estimate of the position.
+        The choices are the network's top moves, or with `gumbel` a sample of them without replacement."""
+        logits, values = self.evaluate(obs, masks)
         prior = logits.log_softmax(1)
         k = min(self.candidates, prior.shape[1])
-        top, choices = prior.topk(k, dim=1)
+        noise = -torch.empty_like(prior).exponential_(generator=self.generator).log() if gumbel else 0.0
+        _, choices = (prior + noise).topk(k, dim=1)
+        top = prior.gather(1, choices)
         valid = torch.isfinite(top)
         rows, ranks = valid.nonzero(as_tuple=True)
         pair_games = games[rows.numpy()]
@@ -77,11 +81,11 @@ class Search:
 
         q = torch.full((len(obs), k), float("-inf"))
         q[rows, ranks] = torch.from_numpy(value.reshape(-1, self.samples).mean(1))
-        return choices, top, q
+        return choices, q, prior, values[:, 0]
 
     def __call__(self, obs, masks, buffer, games, players):
-        choices, top, q = self.improve(obs, masks, buffer, games, players)
-        best = (top + self.eta * q).argmax(1)
+        choices, q, prior, _ = self.improve(obs, masks, buffer, games, players)
+        best = (prior.gather(1, choices) + self.eta * q).argmax(1)
         return choices[torch.arange(len(obs)), best].numpy()
 
 
