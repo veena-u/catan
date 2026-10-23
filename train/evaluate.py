@@ -8,20 +8,20 @@ import catan
 from .agents import Random
 
 
-def play(a, b, games=4096, parallel=512, seed=0, max_decisions=1000):
+def play(a, b, games=4096, parallel=512, seed=0, max_decisions=5000, players=4):
     per_slot = math.ceil(games / parallel)
-    buffer = catan.Buffer(parallel, max_decisions=max_decisions, seed=seed)
-    seat_a = np.arange(parallel) % 2
+    buffer = catan.Buffer(parallel, max_decisions=max_decisions, seed=seed, players=players)
+    seat_a = np.arange(parallel) % players
     finished = np.zeros(parallel, int)
     wins = losses = truncated = first_wins = decided = 0
     while (finished < per_slot).any():
-        obs, masks, players = buffer.observe()
-        a_turn = players == seat_a
+        obs, masks, actors = buffer.observe()
+        a_turn = actors == seat_a
         actions = np.zeros(parallel, np.int64)
         for agent, turn in ((a, a_turn), (b, ~a_turn)):
             if turn.any():
                 if getattr(agent, "searches", False):
-                    actions[turn] = agent(obs[turn], masks[turn], buffer, np.flatnonzero(turn), players[turn])
+                    actions[turn] = agent(obs[turn], masks[turn], buffer, np.flatnonzero(turn), actors[turn])
                 else:
                     actions[turn] = agent(obs[turn], masks[turn])
         for game, winner, _ in buffer.step(actions):
@@ -46,12 +46,13 @@ def play(a, b, games=4096, parallel=512, seed=0, max_decisions=1000):
         "win_rate": rate,
         "stderr": math.sqrt(rate * (1 - rate) / max(decided, 1)),
         "first_player_win_rate": first_wins / max(decided, 1),
+        "players": players,
     }
 
 
 def report(name, result):
     print(
-        f"{name:28s} win rate {result['win_rate']:.3f} ± {result['stderr']:.3f}  "
+        f"{name:28s} win rate {result['win_rate']:.3f} ± {result['stderr']:.3f} (fair share {1 / result['players']:.2f})  "
         f"({result['wins']}–{result['losses']}, {result['truncated']} truncated, "
         f"first player wins {result['first_player_win_rate']:.3f})"
     )
@@ -60,9 +61,10 @@ def report(name, result):
 def main():
     parser = argparse.ArgumentParser(description="Sanity checks for the evaluation harness.")
     parser.add_argument("--games", type=int, default=4096)
+    parser.add_argument("--players", type=int, default=4)
     args = parser.parse_args()
-    report("random vs random", play(Random(1), Random(2), args.games))
-    report("random-by-kind vs random", play(Random(1, kinds=True), Random(2), args.games))
+    report("random vs random", play(Random(1), Random(2), args.games, players=args.players))
+    report("random-by-kind vs random", play(Random(1, kinds=True), Random(2), args.games, players=args.players))
 
 
 if __name__ == "__main__":

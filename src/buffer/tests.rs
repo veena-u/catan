@@ -20,7 +20,7 @@ fn decisions(buffer: &mut Buffer, rounds: usize, rng: &mut Rng) -> Vec<Vec<(u64,
 #[test]
 fn recent_decisions_are_rebuilt_exactly_and_old_ones_refused() {
     let history = 256;
-    let mut buffer = Buffer::new(Config { games: 300, history, max_decisions: 5_000, seed: 7 });
+    let mut buffer = Buffer::new(Config { games: 300, history, max_decisions: 5_000, seed: 7, players: 4 });
     let seen = decisions(&mut buffer, 300, &mut Rng::new(1));
     let window = history as u64 - CHECKPOINT_EVERY;
     let (mut rebuilt, mut refused) = (0, 0);
@@ -48,7 +48,7 @@ fn recent_decisions_are_rebuilt_exactly_and_old_ones_refused() {
 
 #[test]
 fn a_roll_after_a_decision_is_expanded_into_its_eleven_outcomes() {
-    let mut buffer = Buffer::new(Config { games: 64, history: 64, max_decisions: 5_000, seed: 3 });
+    let mut buffer = Buffer::new(Config { games: 64, history: 64, max_decisions: 5_000, seed: 3, players: 3 });
     buffer.track_dice(true);
     let mut rng = Rng::new(9);
     let mut endings = vec![None; buffer.len()];

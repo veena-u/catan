@@ -19,6 +19,7 @@ pub struct Config {
     pub history: usize, // how many recent steps each game remembers
     pub max_decisions: u32, // max decisions before a game is truncated
     pub seed: u64,
+    pub players: usize, // players per game, 2 to 4
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -86,11 +87,12 @@ impl Buffer {
             "the history must be a positive multiple of {CHECKPOINT_EVERY}"
         );
         assert!(config.max_decisions > 0, "a game needs decisions");
+        assert!((2..=crate::player::MAX_PLAYERS).contains(&config.players), "2 to 4 players");
         let mut seeds = Rng::new(config.seed);
         let games = (0..config.games)
             .map(|_| {
                 let mut rng = seeds.fork();
-                let state = State::new(Board::random(&mut rng));
+                let state = State::new(Board::random(&mut rng), config.players);
                 let mut game = Game {
                     state,
                     mask: Mask::EMPTY,
@@ -285,7 +287,8 @@ impl Game {
         };
         let ending = Ending { finish, time: self.time };
         let board = Board::random(&mut self.rng);
-        self.restart(State::new(board));
+        let players = self.state.players();
+        self.restart(State::new(board, players));
         Some(ending)
     }
 

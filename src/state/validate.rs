@@ -2,11 +2,11 @@ use std::fmt;
 
 use crate::dev_card::{DevCard, DEV_CARDS};
 use crate::ids::{Set, VertexKind};
-use crate::player::Player;
+use crate::player::{Player, MAX_PLAYERS};
 use crate::resource::{Resource, RESOURCE_CARDS};
 use crate::topology::topology;
 
-use super::rules::{award, longest_road};
+use super::rules::{award, longest_road, MAX_OFFERS, MAX_OFFER_CARDS};
 use super::{Actor, Phase, State, WINNING_POINTS};
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -26,29 +26,64 @@ fn ensure(condition: bool, message: impl FnOnce() -> String) -> Result<(), Viola
 
 impl State {
     pub fn validate(&self) -> Result<(), Violation> {
+        self.validate_seats()?;
         self.validate_board()?;
         self.validate_cards()?;
+        self.validate_knowledge()?;
         self.validate_turn()
+    }
+
+    fn validate_seats(&self) -> Result<(), Violation> {
+        let n = self.players();
+        ensure((2..=MAX_PLAYERS).contains(&n), || format!("{n} players"))?;
+        for p in n..MAX_PLAYERS {
+            ensure(
+                self.settlements[p].is_empty()
+                    && self.cities[p].is_empty()
+                    && self.roads[p].is_empty()
+                    && self.hands[p] == [0; 5]
+                    && self.dev_cards[p] == [0; 5]
+                    && self.set_aside[p] == [0; 5]
+                    && self.knights[p] == 0
+                    && self.road_lengths[p] == 0
+                    && self.known[p] == [[0; 5]; MAX_PLAYERS]
+                    && self.known.iter().all(|row| row[p] == [0; 5]),
+                || format!("seat {p} is empty in a {n}-player game but holds something"),
+            )?;
+        }
+        let seated = |p: Option<Player>| p.is_none_or(|p| p.index() < n);
+        ensure(
+            self.current.index() < n && seated(self.longest_road) && seated(self.largest_army),
+            || "a player who is not seated".into(),
+        )?;
+        let in_phase = match self.phase {
+            Phase::Discard { player, .. } | Phase::Steal { victim: player, .. } | Phase::Over { winner: player } => Some(player),
+            _ => None,
+        };
+        ensure(seated(in_phase), || "the phase names a player who is not seated".into())
     }
 
     fn validate_board(&self) -> Result<(), Violation> {
         let t = topology();
-        let all: [Set<VertexKind>; 4] =
-            [self.settlements[0], self.settlements[1], self.cities[0], self.cities[1]];
-        for i in 0..4 {
-            for j in i + 1..4 {
+        let all: Vec<Set<VertexKind>> = self.seats().flat_map(|p| [self.settlements(p), self.cities(p)]).collect();
+        for i in 0..all.len() {
+            for j in i + 1..all.len() {
                 ensure((all[i] & all[j]).is_empty(), || "a vertex holds two buildings".into())?;
             }
         }
-        ensure((self.roads[0] & self.roads[1]).is_empty(), || "an edge holds two roads".into())?;
-        let occupied = all.iter().fold(Set::EMPTY, |a, &b| a | b);
+        for a in self.seats() {
+            for b in self.seats().filter(|&b| b > a) {
+                ensure((self.roads(a) & self.roads(b)).is_empty(), || "an edge holds two roads".into())?;
+            }
+        }
+        let occupied = self.all_buildings();
         for v in occupied.iter() {
             ensure(
                 (t.adjacent(v) & occupied).is_empty(),
                 || format!("buildings on adjacent vertices at {v:?}"),
             )?;
         }
-        for player in Player::BOTH {
+        for player in self.seats() {
             let p = player.index();
             ensure(
                 self.settlements[p].len() <= 5 && self.cities[p].len() <= 4,
@@ -79,7 +114,7 @@ impl State {
                 )?;
             }
             ensure(
-                self.road_lengths[p] == longest_road(self.roads[p], self.buildings(player.other())),
+                self.road_lengths[p] == longest_road(self.roads[p], self.all_buildings() - buildings),
                 || format!("{player:?}'s road length is stale"),
             )?;
         }
@@ -89,51 +124,81 @@ impl State {
     fn validate_cards(&self) -> Result<(), Violation> {
         for resource in Resource::ALL {
             let r = resource.index();
-            let held = u32::from(self.hands[0][r]) + u32::from(self.hands[1][r]) + u32::from(self.set_aside[r]);
+            let held: u32 = self.seats().map(|p| u32::from(self.hands[p.index()][r] + self.set_aside[p.index()][r])).sum();
             ensure(held <= u32::from(RESOURCE_CARDS), || format!("more than 19 {resource:?} in play"))?;
         }
         for card in DevCard::ALL {
             let c = card.index();
-            let held = u32::from(self.deck[c]) + u32::from(self.dev_cards[0][c]) + u32::from(self.dev_cards[1][c]);
+            let held: u32 = u32::from(self.deck[c]) + self.seats().map(|p| u32::from(self.dev_cards[p.index()][c])).sum::<u32>();
             ensure(held <= u32::from(DEV_CARDS[c]), || format!("more than {} {card:?} cards", DEV_CARDS[c]))?;
             ensure(
                 self.bought[c] <= self.dev_cards[self.current.index()][c],
                 || format!("bought {card:?} not held"),
             )?;
         }
+        let knights: u8 = self.seats().map(|p| self.knights[p.index()]).sum();
         ensure(
-            self.played(DevCard::Knight) == self.knights[0] + self.knights[1],
+            self.played(DevCard::Knight) == knights,
             || "the knights played do not match the knights missing".into(),
         )?;
         ensure(self.played(DevCard::VictoryPoint) == 0, || "a victory point card was played".into())?;
+        let n = self.players();
         ensure(
-            self.longest_road == award(self.longest_road, self.road_lengths, 5),
+            self.longest_road == award(self.longest_road, &self.road_lengths[..n], 5),
             || "the longest road is not where the lengths put it".into(),
         )?;
         ensure(
-            self.longest_road.is_some() || self.road_lengths.iter().all(|&l| l < 5),
-            || "an unheld road of 5".into(),
+            self.longest_road.is_some() || self.road_lengths[..n].iter().all(|&l| l < 5) || !leader(&self.road_lengths[..n]),
+            || "an unheld road of 5 with a single leader".into(),
         )?;
         ensure(
-            self.largest_army == award(self.largest_army, self.knights, 3),
+            self.largest_army == award(self.largest_army, &self.knights[..n], 3),
             || "the largest army is not where the knights put it".into(),
         )?;
         ensure(
-            self.largest_army.is_some() || self.knights.iter().all(|&k| k < 3),
-            || "an unheld army of 3".into(),
+            self.largest_army.is_some() || self.knights[..n].iter().all(|&k| k < 3) || !leader(&self.knights[..n]),
+            || "an unheld army of 3 with a single leader".into(),
         )?;
         Ok(())
     }
 
+    fn validate_knowledge(&self) -> Result<(), Violation> {
+        for observer in self.seats() {
+            ensure(
+                self.known[observer.index()][observer.index()] == [0; 5],
+                || "a player's knowledge of their own hand is stored".into(),
+            )?;
+            for player in self.others(observer) {
+                let (o, p) = (observer.index(), player.index());
+                for r in 0..5 {
+                    ensure(
+                        self.known[o][p][r] <= self.hands[p][r] + self.set_aside[p][r],
+                        || format!("{observer:?} is sure {player:?} holds more {:?} than they do", Resource::ALL[r]),
+                    )?;
+                }
+            }
+        }
+        if self.players() == 2 && !matches!(self.phase, Phase::Discard { .. }) {
+            for player in self.seats() {
+                let other = self.next(player);
+                ensure(
+                    self.known(player, other) == self.hand(other),
+                    || "with two players every hand is known".into(),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     fn validate_turn(&self) -> Result<(), Violation> {
-        let placed = self.settlements[0].len() + self.settlements[1].len() + self.cities[0].len() + self.cities[1].len();
+        let n = self.players();
+        let placed: usize = self.seats().map(|p| usize::from(self.buildings(p).len())).sum();
         let in_setup = matches!(self.phase, Phase::PlaceSettlement | Phase::PlaceRoad { .. });
         let fresh_turn = matches!(self.phase, Phase::Turn { rolled: false }) && !self.card_played;
-        let set_aside: u8 = self.set_aside.iter().sum();
+        let set_aside: u8 = self.seats().flat_map(|p| self.set_aside[p.index()]).sum();
         let bought: u8 = self.bought.iter().sum();
         if in_setup {
-            let roads = usize::from(self.roads[0].len() + self.roads[1].len());
-            let placed = usize::from(placed);
+            let roads: usize = self.seats().map(|p| usize::from(self.roads(p).len())).sum();
             let (roads_expected, placing) = match self.phase {
                 Phase::PlaceSettlement => (placed, placed),
                 _ => (placed.saturating_sub(1), placed.saturating_sub(1)),
@@ -142,21 +207,21 @@ impl State {
                 placed >= 1 || matches!(self.phase, Phase::PlaceSettlement),
                 || "a setup road with no settlement".into(),
             )?;
-            ensure(roads == roads_expected, || "setup roads out of step".into())?;
-            let order = [Player::First, Player::Second, Player::Second, Player::First];
-            ensure(order.get(placing) == Some(&self.current), || "the wrong player is placing".into())?;
-            for player in Player::BOTH {
+            ensure(roads == roads_expected && placing < 2 * n, || "setup roads out of step".into())?;
+            let expected = Player::new(if placing < n { placing } else { 2 * n - 1 - placing });
+            ensure(self.current == expected, || "the wrong player is placing".into())?;
+            for player in self.seats() {
                 let p = player.index();
                 let cards: u8 = self.hands[p].iter().sum();
                 let earned = if self.settlements[p].len() == 2 { 3 } else { 0 };
                 ensure(cards <= earned, || format!("{player:?} holds {cards} cards in setup"))?;
             }
             ensure(
-                self.dev_cards == [[0; 5]; 2] && !self.card_played && bought == 0,
+                self.dev_cards == [[0; 5]; MAX_PLAYERS] && !self.card_played && bought == 0,
                 || "cards in setup".into(),
             )?;
         } else {
-            for player in Player::BOTH {
+            for player in self.seats() {
                 let p = player.index();
                 ensure(
                     self.buildings(player).len() >= 2 && self.roads[p].len() >= 2,
@@ -165,6 +230,19 @@ impl State {
             }
         }
         ensure(!fresh_turn || bought == 0, || "cards bought before the roll".into())?;
+        ensure(self.offers <= MAX_OFFERS, || "more offers than allowed".into())?;
+        let before_roll = match self.phase {
+            Phase::PlaceSettlement | Phase::PlaceRoad { .. } | Phase::Dice => true,
+            Phase::Turn { rolled }
+            | Phase::MoveRobber { rolled }
+            | Phase::ChooseVictim { rolled }
+            | Phase::Steal { rolled, .. }
+            | Phase::RoadBuilding { rolled, .. }
+            | Phase::YearOfPlenty { rolled, .. }
+            | Phase::Monopoly { rolled } => !rolled,
+            _ => false,
+        };
+        ensure(!before_roll || self.offers == 0, || "offers made before the roll".into())?;
         match self.phase {
             Phase::PlaceRoad { settlement } => {
                 ensure(
@@ -176,9 +254,15 @@ impl State {
                 let hand = &self.hands[player.index()];
                 let from_here: u8 = hand[from.index()..].iter().sum();
                 ensure(owed >= 1 && from_here >= owed, || "a discard that cannot be completed".into())?;
-                if player == self.current {
-                    let highest = (0..5).rev().find(|&r| self.set_aside[r] > 0).unwrap_or(0);
-                    ensure(from == Resource::ALL[highest], || "the discard order is out of step".into())?;
+                let aside = self.set_aside[player.index()];
+                let highest = (0..5).rev().find(|&r| aside[r] > 0).unwrap_or(0);
+                ensure(from == Resource::ALL[highest], || "the discard order is out of step".into())?;
+                let mut q = self.current;
+                while q != player {
+                    let pre = self.hand_size(q) + self.set_aside[q.index()].iter().sum::<u8>();
+                    let discarded = pre > 7 && self.set_aside[q.index()].iter().sum::<u8>() == pre / 2;
+                    ensure(discarded || pre <= 7, || format!("{q:?} skipped their discard"))?;
+                    q = self.next(q);
                 }
             }
             Phase::RoadBuilding { roads, .. } => {
@@ -195,10 +279,45 @@ impl State {
                     || "year of plenty with an empty bank".into(),
                 )?;
             }
-            Phase::Steal { .. } => {
-                ensure(self.hand_size(self.current.other()) > 0, || "a steal from an empty hand".into())?;
+            Phase::ChooseVictim { .. } => {
+                ensure(
+                    self.others(self.current).any(|v| self.can_rob(v)),
+                    || "a victim to choose with no one to rob".into(),
+                )?;
+            }
+            Phase::Steal { victim, .. } => {
+                ensure(self.can_rob(victim), || "a steal from someone who cannot be robbed".into())?;
             }
             Phase::Draw => ensure(self.deck_size() > 0, || "a draw from an empty deck".into())?,
+            Phase::Offer { give, get } | Phase::Respond { give, get, .. } | Phase::Confirm { give, get, .. } => {
+                let (given, wanted) = (give.iter().sum::<u8>(), get.iter().sum::<u8>());
+                ensure(given <= MAX_OFFER_CARDS && wanted <= MAX_OFFER_CARDS, || "an offer of too many cards".into())?;
+                ensure((0..5).all(|r| give[r] == 0 || get[r] == 0), || "an offer to swap a resource for itself".into())?;
+                ensure(self.can_pay(self.current, give), || "an offer of cards the offerer does not hold".into())?;
+                ensure(self.offers >= 1 && self.offers <= MAX_OFFERS, || "an offer beyond the limit".into())?;
+                if !matches!(self.phase, Phase::Offer { .. }) {
+                    ensure(given > 0 && wanted > 0, || "an empty offer proposed".into())?;
+                }
+                match self.phase {
+                    Phase::Respond { responder, accepted, .. } => {
+                        ensure(responder != self.current, || "the offerer answers their own offer".into())?;
+                        let mut q = self.next(self.current);
+                        let mut asked = 0u8;
+                        while q != responder {
+                            asked |= 1 << q.index();
+                            q = self.next(q);
+                        }
+                        ensure(accepted & !asked == 0, || "an acceptance from a player not yet asked".into())?;
+                    }
+                    Phase::Confirm { accepted, .. } => {
+                        ensure(accepted != 0 && accepted >> self.current.index() & 1 == 0, || "no one to trade with".into())?;
+                        for p in self.others(self.current).filter(|p| accepted >> p.index() & 1 == 1) {
+                            ensure(self.can_pay(p, get), || format!("{p:?} accepted without the cards"))?;
+                        }
+                    }
+                    _ => {}
+                }
+            }
             _ => {}
         }
         if !matches!(self.phase, Phase::Discard { .. }) {
@@ -213,10 +332,16 @@ impl State {
                 )?;
             }
             _ => {
-                for player in Player::BOTH {
+                ensure(
+                    self.victory_points(self.current) < WINNING_POINTS,
+                    || format!("{:?} has won on their turn but play goes on", self.current),
+                )?;
+                for player in self.others(self.current) {
+                    let points = self.victory_points(player);
+                    let waiting = self.longest_road == Some(player) && points - 2 < WINNING_POINTS;
                     ensure(
-                        self.victory_points(player) < WINNING_POINTS,
-                        || format!("{player:?} has won but play goes on"),
+                        points < WINNING_POINTS || waiting,
+                        || format!("{player:?} has 10 points without having gained the last one off their turn"),
                     )?;
                 }
             }
@@ -230,4 +355,9 @@ impl State {
         }
         Ok(())
     }
+}
+
+fn leader(counts: &[u8]) -> bool {
+    let best = counts.iter().copied().max().unwrap_or(0);
+    counts.iter().filter(|&&c| c == best).count() == 1
 }

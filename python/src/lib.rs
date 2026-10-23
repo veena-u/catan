@@ -2,7 +2,7 @@ use catan::board::Board;
 use catan::buffer::{self, CHECKPOINT_EVERY, Config, Ending, Finish};
 use catan::ids::{Edge, Hex};
 use catan::observation::{OBSERVATION_BYTES, observe};
-use catan::player::Player;
+use catan::player::{Player, MAX_PLAYERS};
 use catan::rng::Rng;
 use catan::state::{ACTIONS, Actor, State};
 use catan::topology::topology as board_topology;
@@ -31,14 +31,17 @@ struct Buffer {
 #[pymethods]
 impl Buffer {
     #[new]
-    #[pyo3(signature = (games, history = 1024, max_decisions = 1000, seed = 0))]
-    fn new(games: usize, history: usize, max_decisions: u32, seed: u64) -> PyResult<Self> {
+    #[pyo3(signature = (games, history = 1024, max_decisions = 1000, seed = 0, players = 4))]
+    fn new(games: usize, history: usize, max_decisions: u32, seed: u64, players: usize) -> PyResult<Self> {
         if games == 0 || max_decisions == 0 || history == 0 || history as u64 % CHECKPOINT_EVERY != 0 {
             return Err(PyValueError::new_err(format!(
                 "games and max_decisions must be positive, and history a positive multiple of {CHECKPOINT_EVERY}"
             )));
         }
-        let inner = buffer::Buffer::new(Config { games, history, max_decisions, seed });
+        if !(2..=MAX_PLAYERS).contains(&players) {
+            return Err(PyValueError::new_err(format!("2 to {MAX_PLAYERS} players")));
+        }
+        let inner = buffer::Buffer::new(Config { games, history, max_decisions, seed, players });
         Ok(Buffer { inner, endings: vec![None; games] })
     }
 
@@ -215,10 +218,17 @@ struct Game {
 #[pymethods]
 impl Game {
     #[new]
-    #[pyo3(signature = (seed = 0))]
-    fn new(seed: u64) -> Self {
-        let state = State::new(Board::random(&mut Rng::new(seed)));
-        Game { seed, state, rng: Rng::new(seed ^ 0x9E37_79B9_7F4A_7C15), codes: Vec::new() }
+    #[pyo3(signature = (seed = 0, players = 4))]
+    fn new(seed: u64, players: usize) -> PyResult<Self> {
+        if !(2..=MAX_PLAYERS).contains(&players) {
+            return Err(PyValueError::new_err(format!("2 to {MAX_PLAYERS} players")));
+        }
+        let state = State::new(Board::random(&mut Rng::new(seed)), players);
+        Ok(Game { seed, state, rng: Rng::new(seed ^ 0x9E37_79B9_7F4A_7C15), codes: Vec::new() })
+    }
+
+    fn players(&self) -> usize {
+        self.state.players()
     }
 
     fn to_act(&self) -> Option<u8> {
@@ -262,7 +272,7 @@ impl Game {
 
     fn record(&self) -> String {
         let codes: Vec<String> = self.codes.iter().map(u16::to_string).collect();
-        format!("{};{}", self.seed, codes.join(","))
+        format!("{};{};{}", self.state.players(), self.seed, codes.join(","))
     }
 }
 
@@ -303,5 +313,6 @@ fn catan_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(topology, m)?)?;
     m.add("OBSERVATION_BYTES", OBSERVATION_BYTES)?;
     m.add("ACTIONS", ACTIONS)?;
+    m.add("MAX_PLAYERS", MAX_PLAYERS)?;
     Ok(())
 }

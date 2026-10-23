@@ -10,13 +10,15 @@ def main():
     parser.add_argument("baseline", help="e.g. runs/anneal/latest.pt")
     parser.add_argument("challengers", nargs="+", help="one or more .pt files")
     parser.add_argument("--games", type=int, default=2048)
+    parser.add_argument("--players", type=int, default=4)
     args = parser.parse_args()
 
     at = device()
     baseline = Network(load(args.baseline, at), at, seed=1)
     for i, path in enumerate(args.challengers):
         challenger = Network(load(path, at), at, seed=2 + i)
-        report(f"{path} vs {args.baseline}", play(challenger, baseline, games=args.games, parallel=min(args.games, 512), seed=99))
+        report(f"{path} vs {args.baseline}", play(challenger, baseline, games=args.games, parallel=min(args.games, 512), seed=99,
+                                                            players=args.players))
 
 
 if __name__ == "__main__":

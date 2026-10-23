@@ -3,12 +3,13 @@ import torch
 
 import catan
 
+SEATS = catan.MAX_PLAYERS
 HEXES, VERTICES, EDGES = 19, 54, 72
 TOKENS = 1 + HEXES + VERTICES + EDGES
-HEX_FEATURES = 6 + 13 + 1 + 1 + 4
-VERTEX_FEATURES = 4 + 7 + 1 + 5 + 4 + 2
-EDGE_FEATURES = 2 + 4 + 2
-GLOBAL_FEATURES = 44 + 3 + 3 + 2 + 12 + 1 + 1 + 3 + 6
+HEX_FEATURES = 6 + 13 + 1 + 1 + 2 * SEATS
+VERTEX_FEATURES = 2 * SEATS + 7 + 1 + 5 + 2 * SEATS + SEATS
+EDGE_FEATURES = SEATS + 2 * SEATS + SEATS
+GLOBAL_FEATURES = 133
 FLAT_FEATURES = HEXES * HEX_FEATURES + VERTICES * VERTEX_FEATURES + EDGES * EDGE_FEATURES + GLOBAL_FEATURES
 
 NONE = 255
@@ -45,21 +46,27 @@ def optional(values, classes):
     return one_hot(torch.where(values == NONE, classes, values.long()), classes + 1)
 
 
+def seats_present(obs):
+    return (torch.arange(SEATS, device=obs.device) < obs[:, 221:222].long()).float()
+
+
 def decode(obs):
     obs = obs.to(torch.uint8)
     hex_vertex, edge_vertex, vertex_vertex, edge_edge = adjacency(obs.device)
 
-    terrain = one_hot(obs[:, 64:83], 6)
-    tokens = obs[:, 83:102].long()
-    pips = torch.where(tokens == 0, 0, 6 - (7 - tokens).abs()).float() / 5
-    robber = one_hot(obs[:, 156], HEXES).unsqueeze(-1)
-    buildings = torch.stack([bits(obs, at, 8, VERTICES) for at in (0, 8, 16, 24)], -1)
-    roads = torch.stack([bits(obs, at, 16, EDGES) for at in (32, 48)], -1)
+    settlements = torch.stack([bits(obs, 32 * s, 8, VERTICES) for s in range(SEATS)], -1)
+    cities = torch.stack([bits(obs, 32 * s + 8, 8, VERTICES) for s in range(SEATS)], -1)
+    roads = torch.stack([bits(obs, 32 * s + 16, 16, EDGES) for s in range(SEATS)], -1)
+    buildings = torch.cat([settlements, cities], -1)
 
+    terrain = one_hot(obs[:, 128:147], 6)
+    tokens = obs[:, 147:166].long()
+    pips = torch.where(tokens == 0, 0, 6 - (7 - tokens).abs()).float() / 5
+    robber = one_hot(obs[:, 220], HEXES).unsqueeze(-1)
     hexes = torch.cat([terrain, one_hot(tokens, 13), pips.unsqueeze(-1), robber, hex_vertex @ buildings], -1)
 
-    harbors = one_hot(obs[:, 102:156], 7)
-    phase_vertex = one_hot(torch.where(obs[:, 209] == NONE, VERTICES, obs[:, 209].long()), VERTICES + 1)[:, :VERTICES]
+    harbors = one_hot(obs[:, 166:220], 7)
+    phase_vertex = one_hot(torch.where(obs[:, 300] == NONE, VERTICES, obs[:, 300].long()), VERTICES + 1)[:, :VERTICES]
     yields = hex_vertex.T @ (terrain[..., :5] * pips.unsqueeze(-1))
     vertices = torch.cat([
         buildings, harbors, phase_vertex.unsqueeze(-1), yields, vertex_vertex @ buildings, edge_vertex.T @ roads,
@@ -68,15 +75,23 @@ def decode(obs):
     edges = torch.cat([roads, edge_vertex @ buildings, edge_edge @ roads], -1)
 
     globals_ = torch.cat([
-        obs[:, 157:201].float() / 10,
-        one_hot(obs[:, 201], 3),
-        one_hot(obs[:, 202], 3),
-        obs[:, 203:205].float(),
-        one_hot(obs[:, 205], 12),
-        obs[:, 206:207].float(),
-        obs[:, 207:208].float() / 4,
-        optional(obs[:, 208], 2),
-        optional(obs[:, 210], 5),
+        seats_present(obs),
+        obs[:, 222:232].float() / 10,
+        obs[:, 232:253].float() / 10,
+        obs[:, 253:258].float() / 10,
+        obs[:, 258:292].float() / 10,
+        one_hot(obs[:, 292], SEATS + 1),
+        one_hot(obs[:, 293], SEATS + 1),
+        one_hot(obs[:, 294], SEATS),
+        obs[:, 295:296].float(),
+        one_hot(obs[:, 296], 16),
+        obs[:, 297:298].float(),
+        obs[:, 298:299].float() / 4,
+        optional(obs[:, 299], SEATS),
+        optional(obs[:, 301], 5),
+        obs[:, 302:312].float() / 4,
+        bits(obs, 312, 1, SEATS),
+        obs[:, 313:314].float() / 3,
     ], -1)
     return hexes, vertices, edges, globals_
 

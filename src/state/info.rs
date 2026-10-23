@@ -1,4 +1,4 @@
-use crate::player::Player;
+use crate::player::{Player, MAX_PLAYERS};
 use crate::resource::Resource;
 use crate::rng::Rng;
 
@@ -7,68 +7,85 @@ use super::{Phase, State};
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Hidden {
-    pub dev_cards: [u8; 5],
+    pub dev_cards: [[u8; 5]; MAX_PLAYERS],
     pub bought: [u8; 5],
     pub deck: [u8; 5],
-    pub set_aside: [u8; 5],
+    pub hands: [[u8; 5]; MAX_PLAYERS],
+    pub set_aside: [[u8; 5]; MAX_PLAYERS],
 }
 
 impl State {
     pub fn hidden_from(&self, observer: Player) -> Hidden {
-        let other = observer.other();
-        Hidden {
-            dev_cards: self.dev_cards[other.index()],
-            bought: if self.current == other { self.bought } else { [0; 5] },
+        let mut hidden = Hidden {
+            dev_cards: [[0; 5]; MAX_PLAYERS],
+            bought: if self.current != observer { self.bought } else { [0; 5] },
             deck: self.deck,
-            set_aside: if self.discards_hidden_from(observer) { self.set_aside } else { [0; 5] },
+            hands: [[0; 5]; MAX_PLAYERS],
+            set_aside: [[0; 5]; MAX_PLAYERS],
+        };
+        for other in self.others(observer) {
+            let o = other.index();
+            hidden.dev_cards[o] = self.dev_cards[o];
+            hidden.hands[o] = self.hands[o];
+            hidden.set_aside[o] = self.set_aside[o];
         }
+        hidden
     }
 
     pub fn with_hidden(&self, observer: Player, hidden: Hidden) -> Result<State, Violation> {
-        let other = observer.other().index();
         let mismatch = |what: &str| Err(Violation(format!("the hidden {what} change a public count")));
+        let sum = |counts: [u8; 5]| counts.iter().map(|&n| u32::from(n)).sum::<u32>();
+        let me = observer.index();
+        if hidden.dev_cards[me] != [0; 5] || hidden.hands[me] != [0; 5] || hidden.set_aside[me] != [0; 5] {
+            return mismatch("cards of the observer");
+        }
         for c in 0..5 {
-            if hidden.deck[c] + hidden.dev_cards[c] != self.deck[c] + self.dev_cards[other][c] {
+            let held = |cards: &[[u8; 5]; MAX_PLAYERS]| self.others(observer).map(|p| u32::from(cards[p.index()][c])).sum::<u32>();
+            if u32::from(hidden.deck[c]) + held(&hidden.dev_cards) != u32::from(self.deck[c]) + held(&self.dev_cards) {
                 return mismatch("development cards");
             }
+            let before = |hands: &[[u8; 5]; MAX_PLAYERS], aside: &[[u8; 5]; MAX_PLAYERS]| {
+                self.others(observer).map(|p| u32::from(hands[p.index()][c]) + u32::from(aside[p.index()][c])).sum::<u32>()
+            };
+            if before(&hidden.hands, &hidden.set_aside) != before(&self.hands, &self.set_aside) {
+                return mismatch("hands");
+            }
         }
-        let sum = |counts: [u8; 5]| counts.iter().map(|&n| u32::from(n)).sum::<u32>();
-        if sum(hidden.dev_cards) != sum(self.dev_cards[other]) {
-            return mismatch("development cards");
+        for other in self.others(observer) {
+            let o = other.index();
+            if sum(hidden.dev_cards[o]) != sum(self.dev_cards[o]) {
+                return mismatch("development cards");
+            }
+            if sum(hidden.hands[o]) != sum(self.hands[o]) || sum(hidden.set_aside[o]) != sum(self.set_aside[o]) {
+                return mismatch("hands");
+            }
+            if (0..5).any(|r| hidden.hands[o][r] + hidden.set_aside[o][r] < self.known[me][o][r]) {
+                return mismatch("hands");
+            }
+            if !self.discards_hidden_from(observer, other) && hidden.set_aside[o] != self.set_aside[o] {
+                return mismatch("discards");
+            }
         }
-        let bought_now = if self.current.index() == other { self.bought } else { [0; 5] };
-        if sum(hidden.bought) != sum(bought_now) || (self.current.index() != other && hidden.bought != [0; 5]) {
+        let bought_now = if self.current != observer { self.bought } else { [0; 5] };
+        if sum(hidden.bought) != sum(bought_now) || (self.current == observer && hidden.bought != [0; 5]) {
             return mismatch("bought cards");
         }
-        let hidden_discards = self.discards_hidden_from(observer);
-        let discards_match = if hidden_discards {
-            sum(hidden.set_aside) == sum(self.set_aside)
-        } else {
-            hidden.set_aside == [0; 5]
-        };
-        if !discards_match {
-            return mismatch("discards");
-        }
         let mut world = *self;
-        world.dev_cards[other] = hidden.dev_cards;
         world.deck = hidden.deck;
-        if self.current.index() == other {
+        if self.current != observer {
             world.bought = hidden.bought;
         }
-        if hidden_discards {
-            for r in 0..5 {
-                let before = self.hands[other][r] + self.set_aside[r];
-                if hidden.set_aside[r] > before {
-                    return mismatch("discards");
-                }
-                world.set_aside[r] = hidden.set_aside[r];
-                world.hands[other][r] = before - hidden.set_aside[r];
-            }
-            if let Phase::Discard { player, owed, .. } = self.phase {
-                if player == self.current {
-                    let highest = (0..5).rev().find(|&r| hidden.set_aside[r] > 0).unwrap_or(0);
-                    world.phase = Phase::Discard { player, owed, from: Resource::ALL[highest] };
-                }
+        for other in self.others(observer) {
+            let o = other.index();
+            world.dev_cards[o] = hidden.dev_cards[o];
+            world.hands[o] = hidden.hands[o];
+            world.set_aside[o] = hidden.set_aside[o];
+        }
+        if let Phase::Discard { player, owed, .. } = self.phase {
+            if player != observer {
+                let aside = world.set_aside[player.index()];
+                let highest = (0..5).rev().find(|&r| aside[r] > 0).unwrap_or(0);
+                world.phase = Phase::Discard { player, owed, from: Resource::ALL[highest] };
             }
         }
         world.validate()?;
@@ -77,28 +94,50 @@ impl State {
 
     pub fn sample_hidden(&self, observer: Player, rng: &mut Rng) -> State {
         self.with_hidden(observer, self.hidden_from(observer)).expect("a valid state");
-        let other = observer.other().index();
-        let unseen: [u8; 5] = std::array::from_fn(|c| self.deck[c] + self.dev_cards[other][c]);
-        let held: u8 = self.dev_cards[other].iter().sum();
-        let bought: u8 = if self.current.index() == other { self.bought.iter().sum() } else { 0 };
-        let before: [u8; 5] = std::array::from_fn(|r| self.hands[other][r] + self.set_aside[r]);
-        let discarded: u8 = self.set_aside.iter().sum();
+        let me = observer.index();
+        let others: Vec<Player> = self.others(observer).collect();
+        let unseen_cards: [u8; 5] =
+            std::array::from_fn(|c| self.deck[c] + others.iter().map(|p| self.dev_cards[p.index()][c]).sum::<u8>());
+        let bought: u8 = if self.current != observer { self.bought.iter().sum() } else { 0 };
+        let before = |p: Player| -> [u8; 5] { std::array::from_fn(|r| self.hands[p.index()][r] + self.set_aside[p.index()][r]) };
+        let unknown_pool: [u8; 5] =
+            std::array::from_fn(|r| others.iter().map(|&p| before(p)[r] - self.known[me][p.index()][r]).sum::<u8>());
         loop {
-            let dev_cards = deal(unseen, held, rng);
-            let hidden = Hidden {
-                dev_cards,
-                bought: deal(dev_cards, bought, rng),
-                deck: std::array::from_fn(|c| unseen[c] - dev_cards[c]),
-                set_aside: if self.discards_hidden_from(observer) { deal(before, discarded, rng) } else { [0; 5] },
-            };
+            let mut hidden = self.hidden_from(observer);
+            let mut cards = unseen_cards;
+            for &p in &others {
+                let dealt = deal(cards, self.dev_card_count(p), rng);
+                (0..5).for_each(|c| cards[c] -= dealt[c]);
+                hidden.dev_cards[p.index()] = dealt;
+            }
+            hidden.deck = cards;
+            if self.current != observer {
+                hidden.bought = deal(hidden.dev_cards[self.current.index()], bought, rng);
+            }
+            let mut pool = unknown_pool;
+            for &p in &others {
+                let o = p.index();
+                let size: u8 = before(p).iter().sum();
+                let known = self.known[me][o];
+                let unknown = deal(pool, size - known.iter().sum::<u8>(), rng);
+                (0..5).for_each(|r| pool[r] -= unknown[r]);
+                let whole: [u8; 5] = std::array::from_fn(|r| known[r] + unknown[r]);
+                let aside = if self.discards_hidden_from(observer, p) {
+                    deal(whole, self.set_aside[o].iter().sum(), rng)
+                } else {
+                    self.set_aside[o]
+                };
+                hidden.set_aside[o] = aside;
+                hidden.hands[o] = std::array::from_fn(|r| whole[r] - aside[r]);
+            }
             if let Ok(world) = self.with_hidden(observer, hidden) {
                 return world;
             }
         }
     }
 
-    fn discards_hidden_from(&self, observer: Player) -> bool {
-        matches!(self.phase, Phase::Discard { .. }) && self.current != observer
+    pub(super) fn discards_hidden_from(&self, observer: Player, player: Player) -> bool {
+        matches!(self.phase, Phase::Discard { .. }) && player != observer
     }
 }
 
@@ -111,4 +150,3 @@ fn deal(mut counts: [u8; 5], n: u8, rng: &mut Rng) -> [u8; 5] {
     }
     dealt
 }
-

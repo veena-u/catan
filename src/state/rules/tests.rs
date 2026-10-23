@@ -4,10 +4,19 @@ use crate::ids::{Hex, Set};
 use crate::dev_card::DEV_CARDS;
 use crate::resource::RESOURCE_CARDS;
 use crate::state::Hidden;
+use crate::observation::{observe, OBSERVATION_BYTES};
 use std::collections::{BTreeMap, HashSet};
 
 fn new_game(seed: u64) -> State {
-    State::new(Board::random(&mut Rng::new(seed)))
+    game_of(seed, 2)
+}
+
+fn game_of(seed: u64, players: usize) -> State {
+    State::new(Board::random(&mut Rng::new(seed)), players)
+}
+
+fn seats<T: Copy + Default>(items: &[T]) -> [T; MAX_PLAYERS] {
+    std::array::from_fn(|i| items.get(i).copied().unwrap_or_default())
 }
 
 fn random_step(state: &mut State, rng: &mut Rng) {
@@ -24,9 +33,9 @@ fn random_step(state: &mut State, rng: &mut Rng) {
     }
 }
 
-fn after_setup(seed: u64) -> State {
+fn after_setup_of(seed: u64, players: usize) -> State {
     let mut rng = Rng::new(seed);
-    let mut state = new_game(seed);
+    let mut state = game_of(seed, players);
     while matches!(state.phase, Phase::PlaceSettlement | Phase::PlaceRoad { .. }) {
         random_step(&mut state, &mut rng);
     }
@@ -34,8 +43,13 @@ fn after_setup(seed: u64) -> State {
 }
 
 fn scenario(seed: u64) -> State {
-    let mut state = after_setup(seed);
-    state.hands = [[0; 5]; 2];
+    scenario_of(seed, 2)
+}
+
+fn scenario_of(seed: u64, players: usize) -> State {
+    let mut state = after_setup_of(seed, players);
+    state.hands = [[0; 5]; MAX_PLAYERS];
+    state.known = [[[0; 5]; MAX_PLAYERS]; MAX_PLAYERS];
     state.current = Player::First;
     state.phase = Phase::Turn { rolled: true };
     state
@@ -84,12 +98,19 @@ fn a_mask_is_a_set_of_actions() {
 }
 
 #[test]
-fn setup_goes_first_second_second_first_and_the_second_settlement_earns() {
+fn setup_snakes_out_and_back_and_the_second_settlement_earns() {
+    for players in 2..=MAX_PLAYERS {
+        setup_snakes_for(players);
+    }
+}
+
+fn setup_snakes_for(players: usize) {
     let t = topology();
-    let mut state = new_game(3);
+    let mut state = game_of(3, players);
     assert_eq!(state.legal_actions().len(), 54);
     let mut placed = Vec::new();
-    for (round, placer) in [Player::First, Player::Second, Player::Second, Player::First].into_iter().enumerate() {
+    let order: Vec<Player> = (0..players).chain((0..players).rev()).map(Player::new).collect();
+    for (round, placer) in order.into_iter().enumerate() {
         assert_eq!((state.phase, state.current), (Phase::PlaceSettlement, placer), "round {round}");
         let free = state.legal_actions().len();
         let blocked: HashSet<Vertex> =
@@ -105,7 +126,7 @@ fn setup_goes_first_second_second_first_and_the_second_settlement_earns() {
         let earned: [u8; 5] = std::array::from_fn(|r| state.hands[placer.index()][r] - hand_before[r]);
         let producing = t.hexes_at(vertex).iter().filter_map(|h| state.board.terrain(h).resource());
         let mut expected = [0; 5];
-        if round >= 2 {
+        if round >= players {
             producing.for_each(|r| expected[r.index()] += 1);
         }
         assert_eq!(earned, expected, "round {round}");
@@ -124,8 +145,8 @@ fn production_scenario() -> (State, Hex, Resource) {
     let mut state = scenario(4);
     let hex = Hex::all().find(|&h| state.board.token(h) == Some(12)).unwrap();
     let corners = topology().corners(hex);
-    state.settlements = [Set::EMPTY, Set::single(corners[3])];
-    state.cities = [Set::single(corners[0]), Set::EMPTY];
+    state.settlements = seats(&[Set::EMPTY, Set::single(corners[3])]);
+    state.cities = seats(&[Set::single(corners[0]), Set::EMPTY]);
     state.robber = state.board.desert();
     (state, hex, state.board.terrain(hex).resource().unwrap())
 }
@@ -147,7 +168,7 @@ fn production_pays_a_settlement_one_and_a_city_two_unless_the_bank_is_short() {
 
     for (bank, paid) in [(2, false), (3, true)] {
         let mut s = state;
-        s.set_aside[r] = RESOURCE_CARDS - bank;
+        s.set_aside[0][r] = RESOURCE_CARDS - bank;
         s.produce(12);
         assert_eq!((s.hands[0][r], s.hands[1][r]), if paid { (2, 1) } else { (0, 0) }, "bank {bank}");
     }
@@ -161,7 +182,28 @@ fn production_pays_a_settlement_one_and_a_city_two_unless_the_bank_is_short() {
     let mut robbed = state;
     robbed.robber = hex;
     robbed.produce(12);
-    assert_eq!(robbed.hands, [[0; 5]; 2]);
+    assert_eq!(robbed.hands, [[0; 5]; MAX_PLAYERS]);
+}
+
+#[test]
+fn with_several_players_short_of_the_bank_no_one_is_paid_and_a_lone_claim_takes_what_is_left() {
+    let mut state = scenario_of(4, 3);
+    let hex = Hex::all().find(|&h| state.board.token(h) == Some(12)).unwrap();
+    let c = topology().corners(hex);
+    state.settlements = seats(&[Set::single(c[0]), Set::single(c[2]), Set::single(c[4])]);
+    state.cities = [Set::EMPTY; MAX_PLAYERS];
+    state.robber = state.board.desert();
+    let r = state.board.terrain(hex).resource().unwrap().index();
+    let mut short = state;
+    short.set_aside[0][r] = RESOURCE_CARDS - 2;
+    short.produce(12);
+    assert_eq!((short.hands[0][r], short.hands[1][r], short.hands[2][r]), (0, 0, 0));
+    let mut plenty = state;
+    plenty.produce(12);
+    assert_eq!((plenty.hands[0][r], plenty.hands[1][r], plenty.hands[2][r]), (1, 1, 1));
+    for observer in [0, 1, 2] {
+        assert_eq!(plenty.known(Player::new(observer), Player::Third)[r], 1, "production is public");
+    }
 }
 
 fn discard_paths(state: State, player: Player, start: [u8; 5], paths: &mut Vec<[u8; 5]>) {
@@ -205,7 +247,7 @@ fn each_choice_of_discards_has_exactly_one_path() {
 #[test]
 fn both_players_discard_and_the_first_players_cards_stay_face_down_until_the_end() {
     let mut state = scenario(6);
-    state.hands = [[2, 2, 2, 2, 0], [3, 3, 3, 0, 0]];
+    state.hands = seats(&[[2, 2, 2, 2, 0], [3, 3, 3, 0, 0]]);
     state.phase = Phase::Dice;
     state.happen(Outcome::Dice(7));
     assert_eq!(state.phase, Phase::Discard { player: Player::First, owed: 4, from: Resource::Brick });
@@ -217,16 +259,16 @@ fn both_players_discard_and_the_first_players_cards_stay_face_down_until_the_end
     let Phase::Discard { player: Player::Second, owed: 4, .. } = state.phase else {
         panic!("the second player discards next, not {:?}", state.phase)
     };
-    assert_eq!(state.set_aside.iter().sum::<u8>(), 4);
+    assert_eq!(state.set_aside[0].iter().sum::<u8>(), 4);
     assert_eq!(Resource::ALL.map(|r| state.bank(r)), bank_before, "set aside, not yet in the bank");
     let hidden = state.hidden_from(Player::Second);
-    assert_eq!(hidden.set_aside.iter().sum::<u8>(), 4);
+    assert_eq!(hidden.set_aside[0].iter().sum::<u8>(), 4);
     for _ in 0..4 {
         let action = state.legal_actions().iter().next().unwrap();
         state.transition(action);
     }
     assert_eq!(state.phase, Phase::MoveRobber { rolled: true });
-    assert_eq!(state.set_aside, [0; 5]);
+    assert_eq!(state.set_aside, [[0; 5]; MAX_PLAYERS]);
     assert_eq!(Resource::ALL.iter().map(|&r| state.bank(r)).sum::<u8>(), bank_before.iter().sum::<u8>() + 4 + 4);
 }
 
@@ -243,15 +285,18 @@ fn the_robber_steals_only_from_a_building_on_its_hex_with_cards_in_hand() {
         s.hands[1][0] = cards;
         s.phase = Phase::MoveRobber { rolled: true };
         s.transition(Action::Robber(hex));
-        assert_eq!(s.phase, if steals { Phase::Steal { rolled: true } } else { Phase::Turn { rolled: true } });
+        assert_eq!(s.phase, if steals { Phase::ChooseVictim { rolled: true } } else { Phase::Turn { rolled: true } });
         assert_eq!(s.robber, hex);
+        if steals {
+            assert_eq!(s.legal_actions().iter().collect::<Vec<_>>(), [Action::Rob(1)], "one victim, so the choice is forced");
+        }
     }
     let mut s = state;
     s.phase = Phase::MoveRobber { rolled: true };
     assert!(!s.legal_actions().contains(Action::Robber(s.robber)), "the robber must move");
     assert_eq!(s.legal_actions().len(), 18);
     s.hands[1] = [0, 0, 2, 0, 1];
-    s.phase = Phase::Steal { rolled: true };
+    s.phase = Phase::Steal { rolled: true, victim: Player::Second };
     assert_eq!(s.chances().weights(), &[0, 0, 2, 0, 1]);
     s.happen(Outcome::Steal(Resource::Wool));
     assert_eq!((s.hands[0][2], s.hands[1][2]), (1, 1));
@@ -310,8 +355,8 @@ fn bank_trades_offer_every_rate_the_harbors_give() {
         rates.sort();
         rates
     };
-    state.settlements = [Set::EMPTY, state.settlements[1] | state.cities[1]];
-    state.cities = [Set::EMPTY; 2];
+    state.settlements = seats(&[Set::EMPTY, state.settlements[1] | state.cities[1]]);
+    state.cities = [Set::EMPTY; MAX_PLAYERS];
     state.hands[0] = [4, 4, 0, 0, 0];
     assert_eq!(rates(&state, Resource::Brick), [4]);
     state.settlements[0] = Set::single(generic);
@@ -343,10 +388,15 @@ fn awards_stay_on_ties_and_go_to_a_strict_leader_with_the_minimum() {
         (Some(Second), [9, 9], Some(Second)),
     ];
     for (holder, counts, expected) in cases {
-        assert_eq!(award(holder, counts, 5), expected, "{holder:?} {counts:?}");
+        assert_eq!(award(holder, &counts, 5), expected, "{holder:?} {counts:?}");
     }
-    assert_eq!(award(None, [3, 2], 3), Some(First));
-    assert_eq!(award(None, [2, 0], 3), None);
+    assert_eq!(award(None, &[3, 2], 3), Some(First));
+    assert_eq!(award(None, &[2, 0], 3), None);
+    use Player::Third;
+    assert_eq!(award(None, &[5, 6, 6], 5), None, "a tie for the lead");
+    assert_eq!(award(Some(First), &[4, 6, 6], 5), None, "the holder falls behind a tie");
+    assert_eq!(award(Some(First), &[6, 6, 6], 5), Some(First), "the holder keeps it on a tie");
+    assert_eq!(award(Some(Second), &[3, 4, 7], 5), Some(Third));
 }
 
 fn longest_road_by_euler(roads: &[Edge], blocked: Set<VertexKind>) -> u8 {
@@ -428,7 +478,7 @@ fn a_settlement_that_cuts_the_longest_road_moves_or_sets_aside_the_title() {
     let t = topology();
     let mut state = scenario(12);
     let start = state.buildings(Player::Second).iter().next().unwrap();
-    state.roads = [Set::EMPTY; 2];
+    state.roads = [Set::EMPTY; MAX_PLAYERS];
     let others = state.buildings(Player::First);
     let mut path = vec![start];
     'search: for _ in 0..1000 {
@@ -446,7 +496,7 @@ fn a_settlement_that_cuts_the_longest_road_moves_or_sets_aside_the_title() {
     }
     assert_eq!(path.len(), 6);
     state.roads[1] = path.windows(2).map(|w| t.edge_between(w[0], w[1]).unwrap()).collect();
-    state.road_lengths = [state.find_road_length(Player::First), state.find_road_length(Player::Second)];
+    state.road_lengths = seats(&[state.find_road_length(Player::First), state.find_road_length(Player::Second)]);
     assert_eq!(state.road_lengths[1], 5);
     state.longest_road = Some(Player::Second);
 
@@ -498,12 +548,20 @@ fn road_building_and_year_of_plenty_stop_early_when_nothing_is_left() {
 #[test]
 fn monopoly_takes_every_card_of_the_resource_named() {
     let mut state = scenario(14);
-    state.hands = [[1, 0, 0, 0, 0], [3, 2, 0, 0, 0]];
+    state.hands = seats(&[[1, 0, 0, 0, 0], [3, 2, 0, 0, 0]]);
     state.dev_cards[0][DevCard::Monopoly.index()] = 1;
     state.transition(Action::PlayMonopoly);
     state.transition(Action::Resource(Resource::Brick));
-    assert_eq!(state.hands, [[4, 0, 0, 0, 0], [0, 2, 0, 0, 0]]);
+    assert_eq!(state.hands, seats(&[[4, 0, 0, 0, 0], [0, 2, 0, 0, 0]]));
     assert_eq!(state.phase, Phase::Turn { rolled: true });
+
+    let mut four = scenario_of(14, 4);
+    four.hands = seats(&[[0; 5], [2, 0, 0, 0, 0], [0, 0, 0, 0, 0], [5, 1, 0, 0, 0]]);
+    four.dev_cards[0][DevCard::Monopoly.index()] = 1;
+    four.transition(Action::PlayMonopoly);
+    four.transition(Action::Resource(Resource::Brick));
+    assert_eq!(four.hands, seats(&[[7, 0, 0, 0, 0], [0; 5], [0; 5], [0, 1, 0, 0, 0]]));
+    assert_eq!(four.known(Player::Third, Player::First), [7, 0, 0, 0, 0], "a monopoly is public");
 }
 
 #[test]
@@ -515,7 +573,7 @@ fn forced_actions_are_taken_and_the_turn_passes_to_the_next_roll() {
         .find(|&n| {
             let mut s = state;
             s.produce(n);
-            s.hands == [[0; 5]; 2]
+            s.hands == [[0; 5]; MAX_PLAYERS]
         })
         .unwrap();
     state.resolve(Outcome::Dice(silent));
@@ -533,7 +591,7 @@ fn step_refuses_what_cannot_happen() {
     let mut state = new_game(16);
     assert_eq!(state.step(Action::EndTurn.index()), Err(Invalid { code: Action::EndTurn.index() }));
     assert!(state.step(ACTIONS as u16).is_err());
-    state.phase = Phase::Steal { rolled: true };
+    state.phase = Phase::Steal { rolled: true, victim: Player::Second };
     state.hands[1] = [0, 1, 0, 0, 0];
     assert!(state.step(0).is_err(), "no brick to steal");
     assert!(state.step(5).is_err(), "not an outcome");
@@ -545,13 +603,20 @@ fn step_refuses_what_cannot_happen() {
 fn the_unseen_cards_are_the_deck_and_the_other_hand() {
     let mut state = scenario(17);
     state.deck = [10, 4, 1, 2, 2];
-    state.dev_cards = [[1, 0, 1, 0, 0], [2, 1, 0, 0, 0]];
-    state.knights = [1, 0];
+    state.dev_cards = seats(&[[1, 0, 1, 0, 0], [2, 1, 0, 0, 0]]);
+    state.knights = seats(&[1, 0]);
     let unseen: [u8; 5] = std::array::from_fn(|c| DEV_CARDS[c] - state.dev_cards[0][c] - state.played(DevCard::ALL[c]));
     assert_eq!(unseen, [12, 5, 1, 2, 2]);
     assert_eq!(unseen, std::array::from_fn(|c| state.deck[c] + state.dev_cards[1][c]));
     let hidden = state.hidden_from(Player::First);
-    assert_eq!(hidden, Hidden { dev_cards: [2, 1, 0, 0, 0], bought: [0; 5], deck: state.deck, set_aside: [0; 5] });
+    let expected = Hidden {
+        dev_cards: seats(&[[0; 5], [2, 1, 0, 0, 0]]),
+        bought: [0; 5],
+        deck: state.deck,
+        hands: seats(&[[0; 5], state.hands[1]]),
+        set_aside: [[0; 5]; MAX_PLAYERS],
+    };
+    assert_eq!(hidden, expected);
 }
 
 #[test]
@@ -563,14 +628,14 @@ fn only_a_hand_of_more_than_seven_discards_and_it_discards_half_rounded_down() {
         ([[1; 5], [3, 3, 1, 0, 0]], Phase::MoveRobber { rolled: true }),
     ] {
         let mut state = scenario(18);
-        state.hands = hands;
+        state.hands = seats(&hands);
         state.phase = Phase::Dice;
         state.happen(Outcome::Dice(7));
         assert_eq!(state.phase, expected, "{hands:?}");
     }
     for (second, expected_second) in [([3, 3, 1, 0, 0], false), ([3, 3, 2, 0, 0], true)] {
         let mut state = scenario(18);
-        state.hands = [[8, 0, 0, 0, 1], second];
+        state.hands = seats(&[[8, 0, 0, 0, 1], second]);
         state.phase = Phase::Discard { player: Player::First, owed: 1, from: Resource::Brick };
         state.transition(Action::Resource(Resource::Brick));
         assert_eq!(matches!(state.phase, Phase::Discard { player: Player::Second, owed: 4, .. }), expected_second);
@@ -584,11 +649,168 @@ fn a_road_does_not_extend_past_the_other_players_building() {
     let home = state.buildings(Player::First).iter().next().unwrap();
     let road = t.edges_at(home).iter().next().unwrap();
     let far = t.ends(road).into_iter().find(|&v| v != home).unwrap();
-    state.roads = [Set::single(road), Set::EMPTY];
-    state.settlements = [Set::single(home), Set::single(far)];
-    state.cities = [Set::EMPTY; 2];
+    state.roads = seats(&[Set::single(road), Set::EMPTY]);
+    state.settlements = seats(&[Set::single(home), Set::single(far)]);
+    state.cities = [Set::EMPTY; MAX_PLAYERS];
     let spots = state.road_spots(Player::First);
     assert_eq!(spots, t.edges_at(home) - Set::single(road), "only from home, not past {far:?}");
     state.settlements[1] = Set::EMPTY;
     assert_eq!(state.road_spots(Player::First), (t.edges_at(home) | t.edges_at(far)) - Set::single(road));
+}
+
+#[test]
+fn the_robber_may_rob_any_exposed_player_with_cards() {
+    let mut state = scenario_of(20, 4);
+    let t = topology();
+    let hex = Hex::all().find(|&h| h != state.robber && state.board.token(h).is_some()).unwrap();
+    let c = t.corners(hex);
+    state.settlements = seats(&[Set::EMPTY, Set::single(c[0]), Set::single(c[2]), Set::single(c[4])]);
+    state.cities = [Set::EMPTY; MAX_PLAYERS];
+    state.hands = seats(&[[0; 5], [1, 0, 0, 0, 0], [0, 2, 0, 0, 0], [0; 5]]);
+    state.phase = Phase::MoveRobber { rolled: true };
+    state.transition(Action::Robber(hex));
+    assert_eq!(state.phase, Phase::ChooseVictim { rolled: true });
+    assert_eq!(state.legal_actions().iter().collect::<Vec<_>>(), [Action::Rob(1), Action::Rob(2)], "the fourth player has no cards");
+    state.transition(Action::Rob(2));
+    assert_eq!(state.phase, Phase::Steal { rolled: true, victim: Player::Third });
+    assert_eq!(state.chances().weights(), &[0, 2, 0, 0, 0]);
+}
+
+#[test]
+fn a_steal_is_seen_by_its_two_players_and_blurs_what_the_others_know() {
+    let mut state = scenario_of(21, 3);
+    state.hands = seats(&[[0; 5], [2, 1, 0, 0, 0], [0; 5]]);
+    for o in 0..3 {
+        for p in 0..3 {
+            if o != p {
+                state.known[o][p] = state.hands[p];
+            }
+        }
+    }
+    state.steal(Player::First, Player::Second, Resource::Brick.index());
+    assert_eq!(state.known(Player::First, Player::Second), [1, 1, 0, 0, 0], "the thief knows what it took");
+    assert_eq!(state.known(Player::Second, Player::First), [1, 0, 0, 0, 0], "the victim knows what it lost");
+    assert_eq!(state.known(Player::Third, Player::Second), [1, 0, 0, 0, 0], "a bystander only knows a card left");
+    assert_eq!(state.known(Player::Third, Player::First), [0; 5], "and that the thief gained one it cannot name");
+}
+
+#[test]
+fn random_games_of_every_size_follow_the_rules_and_hide_what_they_should() {
+    let mut rng = Rng::new(22);
+    for players in 2..=MAX_PLAYERS {
+        let mut won = 0;
+        for game in 0..40 {
+            let mut state = game_of(1000 + game, players);
+            for step in 0..4000 {
+                state.validate().unwrap_or_else(|v| panic!("{players} players, game {game}, step {step}: {v}"));
+                let Some(actor) = state.actor() else {
+                    won += 1;
+                    break;
+                };
+                if step % 9 == 0 {
+                    if let Actor::Player(observer) = actor {
+                        let mut seen = [0; OBSERVATION_BYTES];
+                        observe(&state, observer, &mut seen);
+                        let mut again = [0; OBSERVATION_BYTES];
+                        observe(&state.sample_hidden(observer, &mut rng), observer, &mut again);
+                        assert_eq!(seen, again, "{players} players: re-dealing hidden cards changed what {observer:?} sees");
+                    }
+                }
+                random_step(&mut state, &mut rng);
+            }
+        }
+        assert!(won >= 30, "{players} players: only {won} of 40 random games finished");
+    }
+}
+
+#[test]
+fn a_player_given_the_longest_road_off_their_turn_wins_when_their_turn_comes() {
+    let mut state = scenario_of(23, 3);
+    let points = state.public_victory_points(Player::Third);
+    state.longest_road = Some(Player::Third);
+    state.dev_cards[2][DevCard::VictoryPoint.index()] = WINNING_POINTS - points - 2;
+    state.current = Player::Second;
+    state.phase = Phase::Turn { rolled: true };
+    assert!(state.victory_points(Player::Third) >= WINNING_POINTS);
+    state.transition(Action::EndTurn);
+    assert_eq!(state.phase, Phase::Over { winner: Player::Third });
+}
+
+fn offer_paths(state: State, paths: &mut Vec<([u8; 5], [u8; 5])>) {
+    match state.phase {
+        Phase::Offer { give, get } => {
+            if state.legal_actions().contains(Action::Propose) {
+                paths.push((give, get));
+            }
+            for action in state.legal_actions().iter().filter(|a| matches!(a, Action::Give(_) | Action::Want(_))) {
+                let mut next = state;
+                next.transition(action);
+                offer_paths(next, paths);
+            }
+        }
+        _ => unreachable!(),
+    }
+}
+
+#[test]
+fn each_offer_is_built_by_exactly_one_path_from_cards_the_offerer_holds() {
+    let mut state = scenario_of(24, 3);
+    state.hands[0] = [2, 0, 1, 0, 0];
+    state.transition(Action::Offer);
+    let mut paths = Vec::new();
+    offer_paths(state, &mut paths);
+    let distinct: HashSet<_> = paths.iter().copied().collect();
+    assert_eq!(distinct.len(), paths.len(), "an offer reached twice");
+    for (give, get) in &paths {
+        assert!((0..5).all(|r| give[r] <= state.hands[0][r]), "{give:?} is more than the hand");
+        assert!((0..5).all(|r| give[r] == 0 || get[r] == 0), "a resource on both sides");
+        assert!(give.iter().sum::<u8>() >= 1 && get.iter().sum::<u8>() >= 1);
+        assert!(get.iter().sum::<u8>() <= MAX_OFFER_CARDS);
+    }
+    let gives: HashSet<[u8; 5]> = paths.iter().map(|&(g, _)| g).collect();
+    assert_eq!(gives.len(), 5, "every non-empty part of [2, 0, 1, 0, 0]: 1 or 2 brick, with or without the wool, or the wool alone");
+}
+
+#[test]
+fn an_accepted_offer_trades_with_the_chosen_partner_and_everyone_sees_it() {
+    let mut state = scenario_of(25, 4);
+    state.hands = seats(&[[2, 0, 0, 0, 0], [0, 0, 0, 0, 1], [0; 5], [0, 0, 0, 0, 3]]);
+    state.transition(Action::Offer);
+    for action in [Action::Give(Resource::Brick), Action::Give(Resource::Brick), Action::Want(Resource::Ore), Action::Propose] {
+        assert!(state.legal_actions().contains(action), "{action:?}");
+        state.transition(action);
+    }
+    assert!(matches!(state.phase, Phase::Respond { responder: Player::Second, .. }));
+    assert_eq!(state.actor(), Some(Actor::Player(Player::Second)));
+    state.transition(Action::Accept);
+    assert_eq!(state.known(Player::Third, Player::Second)[4], 1, "accepting shows you hold the ore");
+    assert_eq!(state.legal_actions().iter().collect::<Vec<_>>(), [Action::Decline], "the third player has no ore");
+    state.transition(Action::Decline);
+    state.transition(Action::Accept);
+    assert_eq!(state.legal_actions().iter().collect::<Vec<_>>(), [Action::Cancel, Action::TradeWith(1), Action::TradeWith(3)]);
+    state.transition(Action::TradeWith(3));
+    assert_eq!(state.hands, seats(&[[0, 0, 0, 0, 1], [0, 0, 0, 0, 1], [0; 5], [2, 0, 0, 0, 2]]));
+    assert_eq!(state.phase, Phase::Turn { rolled: true });
+    assert_eq!(state.known(Player::Second, Player::Fourth)[0], 2, "a trade is public");
+    state.validate().unwrap();
+}
+
+#[test]
+fn offers_are_limited_per_turn_and_a_refused_offer_changes_nothing() {
+    let mut state = scenario_of(26, 2);
+    state.hands = seats(&[[1, 0, 0, 0, 0], [0; 5]]);
+    for _ in 0..MAX_OFFERS {
+        assert!(state.legal_actions().contains(Action::Offer));
+        state.transition(Action::Offer);
+        state.transition(Action::Give(Resource::Brick));
+        state.transition(Action::Want(Resource::Ore));
+        state.transition(Action::Propose);
+        assert_eq!(state.legal_actions().iter().collect::<Vec<_>>(), [Action::Decline], "no ore to accept with");
+        state.transition(Action::Decline);
+        assert_eq!(state.phase, Phase::Turn { rolled: true });
+    }
+    assert!(!state.legal_actions().contains(Action::Offer), "{MAX_OFFERS} offers a turn");
+    assert_eq!(state.hands[0], [1, 0, 0, 0, 0]);
+    state.transition(Action::EndTurn);
+    assert_eq!(state.offers, 0);
 }

@@ -173,6 +173,12 @@ impl<K: Kind> Set<K> {
     }
 }
 
+impl<K: Kind> Default for Set<K> {
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
 impl<K: Kind> BitOr for Set<K> {
     type Output = Self;
     fn bitor(self, other: Self) -> Self {

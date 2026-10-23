@@ -9,7 +9,7 @@ pub use validate::Violation;
 use crate::board::Board;
 use crate::dev_card::{DevCard, DEV_CARDS};
 use crate::ids::{EdgeKind, Hex, Set, Vertex, VertexKind};
-use crate::player::Player;
+use crate::player::{Player, MAX_PLAYERS};
 use crate::resource::{Resource, RESOURCE_CARDS};
 use crate::symmetry::Symmetry;
 
@@ -25,11 +25,11 @@ pub enum Phase {
     PlaceRoad { // waiting for a setup road to be placed
         settlement: Vertex, // the road must touch this settlement
     },
-    Turn { // waiting for opponent's next move
-        rolled: bool, // dice roll yet? 
+    Turn { // waiting for the current player's next move
+        rolled: bool, // dice roll yet?
     },
     Dice, // waiting for dice to be rolled
-    Discard { // waiting for player to discard half their hand
+    Discard { // waiting for a player over 7 cards to discard one
         player: Player, // who is discarding
         owed: u8, // how many cards left to discard
         from: Resource, // lowest card allowed
@@ -37,8 +37,12 @@ pub enum Phase {
     MoveRobber { // waiting for player to move robber
         rolled: bool, // dice roll yet?
     },
+    ChooseVictim { // waiting for the robber's mover to pick whom to rob
+        rolled: bool, // dice roll yet?
+    },
     Steal { // waiting for chance to pick a stolen card
         rolled: bool, // dice roll yet?
+        victim: Player, // whose hand the card comes from
     },
     Draw, // waiting for player to draw a dev card
     RoadBuilding { // waiting for player to place two roads (dev card)
@@ -55,23 +59,43 @@ pub enum Phase {
     Over { // end of game
         winner: Player,
     },
+    Offer { // the current player is building a trade offer, card by card
+        give: [u8; 5], // what they would give
+        get: [u8; 5], // what they want in return
+    },
+    Respond { // each other player in turn accepts or declines the offer
+        give: [u8; 5],
+        get: [u8; 5],
+        responder: Player, // who answers now
+        accepted: u8, // bit p set: player p accepted
+    },
+    Confirm { // the current player picks a partner among those who accepted, or cancels
+        give: [u8; 5],
+        get: [u8; 5],
+        accepted: u8,
+    },
 }
 
+type PerPlayer<T> = [T; MAX_PLAYERS];
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct State { // most fields are indexed by player
+pub struct State { // most fields are indexed by player; seats past `players` stay empty
     board: Board,
-    settlements: [Set<VertexKind>; 2],
-    cities: [Set<VertexKind>; 2],
-    roads: [Set<EdgeKind>; 2],
-    road_lengths: [u8; 2],
+    players: u8,
+    settlements: PerPlayer<Set<VertexKind>>,
+    cities: PerPlayer<Set<VertexKind>>,
+    roads: PerPlayer<Set<EdgeKind>>,
+    road_lengths: PerPlayer<u8>,
     robber: Hex,
-    hands: [[u8; 5]; 2],
-    set_aside: [u8; 5],
-    dev_cards: [[u8; 5]; 2],
+    hands: PerPlayer<[u8; 5]>,
+    known: PerPlayer<PerPlayer<[u8; 5]>>, // known[o][p]: the fewest of each resource o is sure p holds
+    set_aside: PerPlayer<[u8; 5]>,
+    dev_cards: PerPlayer<[u8; 5]>,
     deck: [u8; 5],
     bought: [u8; 5],
     card_played: bool,
-    knights: [u8; 2],
+    offers: u8, // trade offers made this turn
+    knights: PerPlayer<u8>,
     longest_road: Option<Player>,
     largest_army: Option<Player>,
     current: Player,
@@ -79,21 +103,25 @@ pub struct State { // most fields are indexed by player
 }
 
 impl State {
-    pub fn new(board: Board) -> State {
+    pub fn new(board: Board, players: usize) -> State {
+        assert!((2..=MAX_PLAYERS).contains(&players), "2 to {MAX_PLAYERS} players");
         State {
             robber: board.desert(),
             board,
-            settlements: [Set::EMPTY; 2],
-            cities: [Set::EMPTY; 2],
-            roads: [Set::EMPTY; 2],
-            road_lengths: [0; 2],
-            hands: [[0; 5]; 2],
-            set_aside: [0; 5],
-            dev_cards: [[0; 5]; 2],
+            players: players as u8,
+            settlements: [Set::EMPTY; MAX_PLAYERS],
+            cities: [Set::EMPTY; MAX_PLAYERS],
+            roads: [Set::EMPTY; MAX_PLAYERS],
+            road_lengths: [0; MAX_PLAYERS],
+            hands: [[0; 5]; MAX_PLAYERS],
+            known: [[[0; 5]; MAX_PLAYERS]; MAX_PLAYERS],
+            set_aside: [[0; 5]; MAX_PLAYERS],
+            dev_cards: [[0; 5]; MAX_PLAYERS],
             deck: DEV_CARDS,
             bought: [0; 5],
             card_played: false,
-            knights: [0; 2],
+            offers: 0,
+            knights: [0; MAX_PLAYERS],
             longest_road: None,
             largest_army: None,
             current: Player::First,
@@ -103,6 +131,23 @@ impl State {
 
     pub fn board(&self) -> &Board {
         &self.board
+    }
+
+    pub fn players(&self) -> usize {
+        usize::from(self.players)
+    }
+
+    pub fn seats(&self) -> impl Iterator<Item = Player> + use<> {
+        Player::ALL.into_iter().take(self.players())
+    }
+
+    pub fn others(&self, player: Player) -> impl Iterator<Item = Player> + use<> {
+        let n = self.players();
+        (1..n).map(move |offset| player.after(offset, n))
+    }
+
+    pub fn next(&self, player: Player) -> Player {
+        player.after(1, self.players())
     }
 
     pub fn settlements(&self, player: Player) -> Set<VertexKind> {
@@ -115,6 +160,10 @@ impl State {
 
     pub fn buildings(&self, player: Player) -> Set<VertexKind> {
         self.settlements[player.index()] | self.cities[player.index()]
+    }
+
+    pub fn all_buildings(&self) -> Set<VertexKind> {
+        self.seats().fold(Set::EMPTY, |all, p| all | self.buildings(p))
     }
 
     pub fn roads(&self, player: Player) -> Set<EdgeKind> {
@@ -133,17 +182,26 @@ impl State {
         self.hands[player.index()][resource.index()]
     }
 
+    pub fn hand(&self, player: Player) -> [u8; 5] {
+        self.hands[player.index()]
+    }
+
     pub fn hand_size(&self, player: Player) -> u8 {
         self.hands[player.index()].iter().sum()
     }
 
-    pub fn set_aside(&self, resource: Resource) -> u8 {
-        self.set_aside[resource.index()]
+    pub fn known(&self, observer: Player, player: Player) -> [u8; 5] {
+        if observer == player { self.hands[player.index()] } else { self.known[observer.index()][player.index()] }
+    }
+
+    pub fn set_aside(&self, player: Player) -> [u8; 5] {
+        self.set_aside[player.index()]
     }
 
     pub fn bank(&self, resource: Resource) -> u8 {
         let r = resource.index();
-        RESOURCE_CARDS - self.hands[0][r] - self.hands[1][r] - self.set_aside[r]
+        let held: u8 = self.seats().map(|p| self.hands[p.index()][r] + self.set_aside[p.index()][r]).sum();
+        RESOURCE_CARDS - held
     }
 
     pub fn dev_cards(&self, player: Player, card: DevCard) -> u8 {
@@ -160,7 +218,7 @@ impl State {
 
     pub fn played(&self, card: DevCard) -> u8 {
         let c = card.index();
-        DEV_CARDS[c] - self.deck[c] - self.dev_cards[0][c] - self.dev_cards[1][c]
+        DEV_CARDS[c] - self.deck[c] - self.seats().map(|p| self.dev_cards[p.index()][c]).sum::<u8>()
     }
 
     pub fn bought(&self, card: DevCard) -> u8 {
@@ -169,6 +227,10 @@ impl State {
 
     pub fn card_played(&self) -> bool {
         self.card_played
+    }
+
+    pub fn offers(&self) -> u8 {
+        self.offers
     }
 
     pub fn knights(&self, player: Player) -> u8 {
@@ -194,7 +256,7 @@ impl State {
     pub fn actor(&self) -> Option<Actor> {
         match self.phase {
             Phase::Dice | Phase::Steal { .. } | Phase::Draw => Some(Actor::Chance),
-            Phase::Discard { player, .. } => Some(Actor::Player(player)),
+            Phase::Discard { player, .. } | Phase::Respond { responder: player, .. } => Some(Actor::Player(player)),
             Phase::Over { .. } => None,
             _ => Some(Actor::Player(self.current)),
         }

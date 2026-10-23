@@ -8,7 +8,7 @@ from torch import nn
 import catan
 
 from .agents import Random
-from .features import decode
+from .features import SEATS, decode
 from .model import Flat, Tokens, device
 
 HEX_CORNERS, EDGE_ENDS = (torch.from_numpy(a.astype(np.int64)) for a in catan.topology())
@@ -16,8 +16,8 @@ TERRAIN_IN_BOX = [3, 4, 4, 4, 3, 1]
 SUMS = 11
 
 
-def positions(count, games=4096, every=40, seed=0):
-    buffer, agent = catan.Buffer(games, seed=seed), Random(seed, kinds=True)
+def positions(count, games=4096, every=40, seed=0, players=4):
+    buffer, agent = catan.Buffer(games, seed=seed, players=players), Random(seed, kinds=True)
     rng = np.random.default_rng(seed)
     seen, legal, kept = [], [], 0
     while kept < count:
@@ -34,7 +34,7 @@ def positions(count, games=4096, every=40, seed=0):
 
 def production(obs):
     hexes, vertices, _, _ = decode(obs)
-    weight = vertices[..., [0, 1]] + 2 * vertices[..., [2, 3]]
+    weight = vertices[..., :SEATS] + 2 * vertices[..., SEATS:2 * SEATS]
     per_hex = weight[:, HEX_CORNERS.to(obs.device)].sum(2).transpose(1, 2)
     terrain, tokens, robber = hexes[..., :6], hexes[..., 6:19], hexes[..., 20]
     producing = (1 - robber) * (1 - terrain[..., 5])
@@ -45,15 +45,15 @@ def check(obs, masks):
     hexes, vertices, edges, _ = decode(obs)
     assert (hexes[..., :6].sum(1) == torch.tensor(TERRAIN_IN_BOX, dtype=torch.float)).all(), "terrain"
     assert (hexes[..., 20].sum(1) == 1).all(), "one robber"
-    assert (vertices[..., 4:11].argmax(-1).gt(0).sum(1) == 18).all(), "18 harbor vertices"
-    assert (vertices[..., :4].sum(-1) <= 1).all(), "one building per vertex"
-    assert (edges[..., :2].sum(-1) <= 1).all(), "one road per edge"
-    built = vertices[..., :4].sum(-1) > 0
+    assert (vertices[..., 2 * SEATS:2 * SEATS + 7].argmax(-1).gt(0).sum(1) == 18).all(), "18 harbor vertices"
+    assert (vertices[..., :2 * SEATS].sum(-1) <= 1).all(), "one building per vertex"
+    assert (edges[..., :SEATS].sum(-1) <= 1).all(), "one road per edge"
+    built = vertices[..., :2 * SEATS].sum(-1) > 0
     neighbours = torch.zeros_like(built)
     for a, b in EDGE_ENDS.tolist():
         neighbours[:, a] |= built[:, b]
         neighbours[:, b] |= built[:, a]
-    setup = obs[:, 205] == 0
+    setup = obs[:, 296] == 0
     expected = ~built & ~neighbours
     assert (masks[setup, :54] == expected[setup]).all(), "setup settlement spots follow the distance rule"
     return int(setup.sum())
@@ -63,11 +63,11 @@ class Quiz(nn.Module):
     def __init__(self, model):
         super().__init__()
         self.model = model
-        self.production = nn.Linear(model.width, 2 * SUMS * 5)
+        self.production = nn.Linear(model.width, SEATS * SUMS * 5)
 
     def forward(self, obs):
         logits, _, summary = self.model(obs)
-        return logits, self.production(summary).view(-1, 2, SUMS, 5)
+        return logits, self.production(summary).view(-1, SEATS, SUMS, 5)
 
 
 @torch.no_grad()

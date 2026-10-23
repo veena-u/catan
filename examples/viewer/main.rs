@@ -4,7 +4,7 @@ use catan::board::{Board, Harbor, Terrain};
 use catan::dev_card::DevCard;
 use catan::ids::{Edge, Hex, Vertex};
 use catan::observation::{observe, OBSERVATION_BYTES, PHASES};
-use catan::player::Player;
+use catan::player::{Player, MAX_PLAYERS};
 use catan::resource::Resource;
 use catan::rng::Rng;
 use catan::state::{Action, Actor, Outcome, Phase, State, ACTIONS};
@@ -13,7 +13,13 @@ use catan::topology::topology;
 type View = [u8; OBSERVATION_BYTES];
 
 const LEAK_SAMPLES: usize = 16;
-const PLAYERS: [Color32; 2] = [Color32::from_rgb(37, 99, 235), Color32::from_rgb(234, 88, 12)];
+const PLAYERS: [Color32; MAX_PLAYERS] = [
+    Color32::from_rgb(37, 99, 235),
+    Color32::from_rgb(234, 88, 12),
+    Color32::from_rgb(22, 163, 74),
+    Color32::from_rgb(219, 39, 119),
+];
+const SEATS: [&str; MAX_PLAYERS] = ["me", "+1", "+2", "+3"];
 const ACCENT: Color32 = Color32::from_rgb(139, 92, 246);
 const GOOD: Color32 = Color32::from_rgb(34, 160, 80);
 const BAD: Color32 = Color32::from_rgb(220, 38, 38);
@@ -21,14 +27,16 @@ const SEA: Color32 = Color32::from_rgb(28, 45, 54);
 const CHANGED: Color32 = Color32::from_rgba_premultiplied(120, 95, 10, 90);
 const TERRAIN: [Terrain; 6] =
     [Terrain::Hills, Terrain::Forest, Terrain::Pasture, Terrain::Fields, Terrain::Mountains, Terrain::Desert];
-const BLOCKS: [(&str, u16, u16); 7] = [
+const BLOCKS: [(&str, u16, u16); 9] = [
     ("settlements", 0, 54),
     ("cities", 54, 108),
     ("roads", 108, 180),
     ("robber", 180, 199),
     ("resources", 199, 204),
     ("trades", 204, 264),
-    ("other", 264, ACTIONS as u16),
+    ("other", 264, 271),
+    ("rob a player", 271, 274),
+    ("player trades", 274, ACTIONS as u16),
 ];
 
 fn main() -> eframe::Result {
@@ -36,7 +44,7 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default().with_inner_size([1500.0, 1000.0]),
         ..Default::default()
     };
-    eframe::run_native("Catan rules viewer", options, Box::new(|_| Ok(Box::new(Viewer::new(1)))))
+    eframe::run_native("Catan rules viewer", options, Box::new(|_| Ok(Box::new(Viewer::new(1, 4)))))
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -48,6 +56,7 @@ enum Tab {
 
 struct Viewer {
     seed: u64,
+    players: usize,
     steps: Vec<u16>,
     states: Vec<State>,
     at: usize,
@@ -56,18 +65,19 @@ struct Viewer {
     game_text: String,
     show_ids: bool,
     tab: Tab,
-    before: Option<[View; 2]>,
+    before: Option<Vec<View>>,
     violation: Option<(usize, String)>,
-    leak_free: [Option<bool>; 2],
+    leak_free: Vec<Option<bool>>,
     message: Option<String>,
 }
 
 impl Viewer {
-    fn new(seed: u64) -> Viewer {
+    fn new(seed: u64, players: usize) -> Viewer {
         let mut viewer = Viewer {
             seed,
+            players,
             steps: Vec::new(),
-            states: vec![State::new(Board::random(&mut Rng::new(seed)))],
+            states: vec![State::new(Board::random(&mut Rng::new(seed)), players)],
             at: 0,
             rng: Rng::new(seed),
             seed_text: seed.to_string(),
@@ -76,7 +86,7 @@ impl Viewer {
             tab: Tab::Views,
             before: None,
             violation: None,
-            leak_free: [None; 2],
+            leak_free: Vec::new(),
             message: None,
         };
         viewer.refresh();
@@ -87,14 +97,14 @@ impl Viewer {
         self.states[self.at]
     }
 
-    fn views(&self) -> [View; 2] {
+    fn views(&self) -> Vec<View> {
         let state = self.state();
-        Player::BOTH.map(|p| view(&state, p))
+        state.seats().map(|p| view(&state, p)).collect()
     }
 
-    fn load(&mut self, seed: u64, codes: &[u16]) {
+    fn load(&mut self, seed: u64, players: usize, codes: &[u16]) {
         let (show_ids, tab) = (self.show_ids, self.tab);
-        *self = Viewer::new(seed);
+        *self = Viewer::new(seed, players);
         (self.show_ids, self.tab) = (show_ids, tab);
         for (i, &code) in codes.iter().enumerate() {
             if !self.push(code) {
@@ -161,9 +171,9 @@ impl Viewer {
         self.violation = self.states.iter().enumerate().find_map(|(i, s)| s.validate().err().map(|v| (i, v.0)));
         let state = self.state();
         let rng = &mut self.rng;
-        self.leak_free = Player::BOTH.map(|p| leak_free(&state, p, rng));
+        self.leak_free = state.seats().map(|p| leak_free(&state, p, rng)).collect();
         let codes: Vec<String> = self.steps.iter().map(u16::to_string).collect();
-        self.game_text = format!("{};{}", self.seed, codes.join(","));
+        self.game_text = format!("{};{};{}", self.players, self.seed, codes.join(","));
     }
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
@@ -175,7 +185,13 @@ impl Viewer {
             let entered = seed.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             if ui.button("New board").clicked() || entered {
                 if let Ok(seed) = self.seed_text.trim().parse() {
-                    self.load(seed, &[]);
+                    self.load(seed, self.players, &[]);
+                }
+            }
+            ui.label("players");
+            for n in 2..=MAX_PLAYERS {
+                if ui.selectable_label(self.players == n, n.to_string()).clicked() && self.players != n {
+                    self.load(self.seed, n, &[]);
                 }
             }
             ui.separator();
@@ -202,11 +218,16 @@ impl Viewer {
                 ui.ctx().copy_text(self.game_text.clone());
             }
             if ui.button("Load").clicked() {
-                let (seed, codes) = self.game_text.split_once(';').unwrap_or((&self.game_text, ""));
+                let parts: Vec<&str> = self.game_text.split(';').collect();
+                let (players, seed, codes) = match parts[..] {
+                    [players, seed, codes] => (players.trim().parse().ok(), seed, codes),
+                    [seed, codes] => (Some(2), seed, codes),
+                    _ => (None, "", ""),
+                };
                 let codes: Vec<u16> = codes.split(',').filter_map(|c| c.trim().parse().ok()).collect();
-                match seed.trim().parse() {
-                    Ok(seed) => self.load(seed, &codes),
-                    Err(_) => self.message = Some("a game is written seed;code,code,...".into()),
+                match (players.filter(|n| (2..=MAX_PLAYERS).contains(n)), seed.trim().parse()) {
+                    (Some(players), Ok(seed)) => self.load(seed, players, &codes),
+                    _ => self.message = Some("a game is written players;seed;code,code,...".into()),
                 }
             }
             ui.separator();
@@ -330,14 +351,14 @@ impl Viewer {
             let label = if harbor == Harbor::Generic { "3:1" } else { "2:1" };
             painter.text(tag, Align2::CENTER_CENTER, label, FontId::proportional(0.2 * s), ink);
         }
-        for p in Player::BOTH {
+        for p in state.seats() {
             for e in state.roads(p).iter() {
                 let [a, b] = t.ends(e).map(vertex);
                 painter.line_segment([a, b], Stroke::new(0.2 * s, background));
                 painter.line_segment([a, b], Stroke::new(0.13 * s, PLAYERS[p.index()]));
             }
         }
-        for p in Player::BOTH {
+        for p in state.seats() {
             let color = PLAYERS[p.index()];
             for v in state.settlements(p).iter() {
                 painter.circle(vertex(v), 0.16 * s, color, Stroke::new(2.5, background));
@@ -419,18 +440,18 @@ impl Viewer {
 
     fn views_tab(&self, ui: &mut egui::Ui) {
         let views = self.views();
-        ui.columns(2, |columns| {
+        ui.columns(views.len(), |columns| {
             for (k, ui) in columns.iter_mut().enumerate() {
-                let player = Player::BOTH[k];
+                let player = Player::new(k);
                 ui.colored_label(PLAYERS[k], RichText::new(format!("{player:?} sees")).strong());
-                match self.leak_free[k] {
+                match self.leak_free.get(k).copied().flatten() {
                     None => ui.weak("hidden-info check skipped"),
                     Some(true) => ui.colored_label(GOOD, format!("hidden cards re-dealt {LEAK_SAMPLES}×: bytes unchanged")),
                     Some(false) => ui.colored_label(BAD, "bytes change with hidden cards"),
                 };
                 egui::Grid::new(("view", k)).striped(true).num_columns(3).show(ui, |ui| {
                     for (name, offset, len, value) in decode(&views[k]) {
-                        let changed = self.before.is_some_and(|b| b[k][offset..offset + len] != views[k][offset..offset + len]);
+                        let changed = self.before.as_ref().is_some_and(|b| b.get(k).is_some_and(|b| b[offset..offset + len] != views[k][offset..offset + len]));
                         let value = RichText::new(value);
                         ui.monospace(offset.to_string());
                         ui.label(name);
@@ -440,7 +461,7 @@ impl Viewer {
                 });
             }
         });
-        ui.weak("Values are decoded from the 211 bytes, not from the state. Highlighted values changed since the last state shown.");
+        ui.weak(format!("Values are decoded from the {OBSERVATION_BYTES} bytes, not from the state. Seats are relative: +1 is the next player. Highlighted values changed since the last state shown."));
     }
 }
 
@@ -534,10 +555,10 @@ fn players(ui: &mut egui::Ui, state: &State) {
         let names: Vec<&str> = held.iter().filter(|(h, _)| *h == Some(p)).map(|(_, n)| *n).collect();
         if names.is_empty() { "—".to_string() } else { names.join(", ") }
     };
-    egui::Grid::new("players").striped(true).num_columns(3).show(ui, |ui| {
+    egui::Grid::new("players").striped(true).num_columns(state.players() + 1).show(ui, |ui| {
         let row = |ui: &mut egui::Ui, label: &str, cell: &dyn Fn(&mut egui::Ui, Player)| {
             ui.label(label);
-            for p in Player::BOTH {
+            for p in state.seats() {
                 cell(ui, p);
             }
             ui.end_row();
@@ -548,7 +569,8 @@ fn players(ui: &mut egui::Ui, state: &State) {
         row(ui, "points", &|ui, p| {
             ui.label(format!("{} (public {})", state.victory_points(p), state.public_victory_points(p)));
         });
-        row(ui, "hand", &|ui, p| resources(ui, Resource::ALL.map(|r| state.resources(p, r))));
+        row(ui, "hand", &|ui, p| resources(ui, state.hand(p)));
+        row(ui, "set aside", &|ui, p| resources(ui, state.set_aside(p)));
         row(ui, "dev cards", &|ui, p| {
             ui.label(cards(DevCard::ALL.map(|c| state.dev_cards(p, c))));
         });
@@ -571,14 +593,12 @@ fn players(ui: &mut egui::Ui, state: &State) {
         ui.label("bank");
         resources(ui, Resource::ALL.map(|r| state.bank(r)));
         ui.end_row();
-        ui.label("set aside");
-        resources(ui, Resource::ALL.map(|r| state.set_aside(r)));
-        ui.end_row();
         for (label, value) in [
             ("deck", format!("{} cards", state.deck_size())),
             ("played", cards(DevCard::ALL.map(|c| state.played(c)))),
             ("bought this turn", cards(DevCard::ALL.map(|c| state.bought(c)))),
             ("card played this turn", state.card_played().to_string()),
+            ("offers this turn", state.offers().to_string()),
         ] {
             ui.label(label);
             ui.label(value);
@@ -611,30 +631,42 @@ fn mask_tab(ui: &mut egui::Ui, state: &State) -> Option<u16> {
 
 fn hidden_tab(ui: &mut egui::Ui, state: &State) {
     let names = |counts: [u8; 5], labels: [&str; 5]| {
-        (0..5).map(|i| format!("{} {}", labels[i], counts[i])).collect::<Vec<_>>().join(" · ")
+        (0..5).filter(|&i| counts[i] > 0).map(|i| format!("{} {}", labels[i], counts[i])).collect::<Vec<_>>().join(" · ")
     };
     let cards = DevCard::ALL.map(card_name);
     let resources = Resource::ALL.map(resource_name);
-    ui.columns(2, |columns| {
+    ui.columns(state.players(), |columns| {
         for (k, ui) in columns.iter_mut().enumerate() {
-            let player = Player::BOTH[k];
-            let hidden = state.hidden_from(player);
-            ui.colored_label(PLAYERS[k], RichText::new(format!("Hidden from {player:?}")).strong());
+            let observer = Player::new(k);
+            let hidden = state.hidden_from(observer);
+            ui.colored_label(PLAYERS[k], RichText::new(format!("Hidden from {observer:?}")).strong());
             egui::Grid::new(("hidden", k)).striped(true).num_columns(2).show(ui, |ui| {
-                for (label, value) in [
-                    ("their dev cards", names(hidden.dev_cards, cards)),
-                    ("their cards bought this turn", names(hidden.bought, cards)),
-                    ("deck", names(hidden.deck, cards)),
-                    ("their face-down discards", names(hidden.set_aside, resources)),
-                ] {
-                    ui.label(label);
-                    ui.add(egui::Label::new(value).wrap());
+                for other in state.others(observer) {
+                    let o = other.index();
+                    let known = state.known(observer, other);
+                    ui.colored_label(PLAYERS[o], format!("{other:?}"));
+                    ui.add(
+                        egui::Label::new(format!(
+                            "hand {} (sure of {}) · dev {} · aside {}",
+                            names(hidden.hands[o], resources),
+                            names(known, resources),
+                            names(hidden.dev_cards[o], cards),
+                            names(hidden.set_aside[o], resources)
+                        ))
+                        .wrap(),
+                    );
                     ui.end_row();
                 }
+                ui.label("bought this turn");
+                ui.label(names(hidden.bought, cards));
+                ui.end_row();
+                ui.label("deck");
+                ui.label(names(hidden.deck, cards));
+                ui.end_row();
             });
         }
     });
-    ui.weak("Exactly what hidden_from returns: the part of the state each player cannot see.");
+    ui.weak("What hidden_from returns for each player, and the lower bound each is sure of for every other hand.");
 }
 
 fn heading(ui: &mut egui::Ui, text: &str) {
@@ -667,7 +699,7 @@ fn on_board(action: Action) -> bool {
     matches!(action, Action::Settlement(_) | Action::City(_) | Action::Road(_) | Action::Robber(_))
 }
 
-fn decode(b: &View) -> Vec<(&'static str, usize, usize, String)> {
+fn decode(b: &View) -> Vec<(String, usize, usize, String)> {
     let u64_at = |at: usize| u64::from_le_bytes(b[at..at + 8].try_into().expect("8 bytes"));
     let u128_at = |at: usize| u128::from_le_bytes(b[at..at + 16].try_into().expect("16 bytes"));
     let bits = |word: u128, prefix: &str| {
@@ -679,7 +711,8 @@ fn decode(b: &View) -> Vec<(&'static str, usize, usize, String)> {
     };
     let resources = |at: usize| named(at, &|i| resource_name(Resource::ALL[i]));
     let cards = |at: usize| named(at, &|i| card_name(DevCard::ALL[i]));
-    let holder = |code: u8| ["no one", "me", "them"].get(usize::from(code)).map_or(format!("? {code}"), |s| s.to_string());
+    let seat = |code: u8| SEATS.get(usize::from(code)).map_or("—".to_string(), |s| s.to_string());
+    let holder = |code: u8| if code == 0 { "no one".to_string() } else { seat(code - 1) };
     let flag = |code: u8| (code == 1).to_string();
     let terrain = |code: u8| TERRAIN.get(usize::from(code)).map_or("?", |&t| terrain_name(t));
     let harbor = |code: u8| match code {
@@ -687,42 +720,56 @@ fn decode(b: &View) -> Vec<(&'static str, usize, usize, String)> {
         c => format!("2:1 {}", resource_name(Resource::ALL[usize::from(c - 2)])),
     };
     let join = |items: Vec<String>| items.join(" ");
+    let per_seat = |at: usize| join((0..usize::from(b[221])).map(|s| format!("{} {}", SEATS[s], b[at + s])).collect());
+    let players = usize::from(b[221]);
 
-    vec![
-        ("my settlements", 0, 8, bits(u128::from(u64_at(0)), "v")),
-        ("their settlements", 8, 8, bits(u128::from(u64_at(8)), "v")),
-        ("my cities", 16, 8, bits(u128::from(u64_at(16)), "v")),
-        ("their cities", 24, 8, bits(u128::from(u64_at(24)), "v")),
-        ("my roads", 32, 16, bits(u128_at(32), "e")),
-        ("their roads", 48, 16, bits(u128_at(48), "e")),
-        ("terrain by hex", 64, 19, join(b[64..83].iter().map(|&t| terrain(t).to_string()).collect())),
-        ("token by hex", 83, 19, join(b[83..102].iter().map(u8::to_string).collect())),
-        ("harbors by vertex", 102, 54, join((0..54).filter(|&v| b[102 + v] != 0).map(|v| format!("v{v} {}", harbor(b[102 + v]))).collect())),
-        ("robber", 156, 1, format!("h{}", b[156])),
-        ("my hand", 157, 5, resources(157)),
-        ("their hand", 162, 5, resources(162)),
-        ("my set-aside discards", 167, 5, resources(167)),
-        ("bank", 172, 5, resources(172)),
-        ("my dev cards", 177, 5, cards(177)),
-        ("my cards bought this turn", 182, 5, cards(182)),
-        ("their dev card count", 187, 1, b[187].to_string()),
-        ("their cards bought this turn", 188, 1, b[188].to_string()),
-        ("deck size", 189, 1, b[189].to_string()),
-        ("unseen dev cards", 190, 5, cards(190)),
-        ("knights: me, them", 195, 2, format!("{}, {}", b[195], b[196])),
-        ("road length: me, them", 197, 2, format!("{}, {}", b[197], b[198])),
-        ("points: me (all), them (public)", 199, 2, format!("{}, {}", b[199], b[200])),
-        ("longest road", 201, 1, holder(b[201])),
-        ("largest army", 202, 1, holder(b[202])),
-        ("my turn", 203, 1, flag(b[203])),
-        ("card played this turn", 204, 1, flag(b[204])),
-        ("phase", 205, 1, PHASES.get(usize::from(b[205])).map_or("?".into(), |p| p.to_string())),
-        ("rolled", 206, 1, flag(b[206])),
-        ("phase count", 207, 1, b[207].to_string()),
-        ("phase player", 208, 1, match b[208] { 0 => "me".into(), 1 => "them".into(), _ => "—".into() }),
-        ("phase vertex", 209, 1, match b[209] { u8::MAX => "—".into(), v => format!("v{v}") }),
-        ("next discard from", 210, 1, match b[210] { u8::MAX => "—".into(), r => resource_name(Resource::ALL[usize::from(r)]).into() }),
-    ]
+    let mut rows: Vec<(String, usize, usize, String)> = Vec::new();
+    for s in 0..players {
+        let at = 32 * s;
+        rows.push((format!("{} settlements", SEATS[s]), at, 8, bits(u128::from(u64_at(at)), "v")));
+        rows.push((format!("{} cities", SEATS[s]), at + 8, 8, bits(u128::from(u64_at(at + 8)), "v")));
+        rows.push((format!("{} roads", SEATS[s]), at + 16, 16, bits(u128_at(at + 16), "e")));
+    }
+    let mut row = |name: &str, at: usize, len: usize, value: String| rows.push((name.to_string(), at, len, value));
+    row("terrain by hex", 128, 19, join(b[128..147].iter().map(|&t| terrain(t).to_string()).collect()));
+    row("token by hex", 147, 19, join(b[147..166].iter().map(u8::to_string).collect()));
+    row("harbors by vertex", 166, 54, join((0..54).filter(|&v| b[166 + v] != 0).map(|v| format!("v{v} {}", harbor(b[166 + v]))).collect()));
+    row("robber", 220, 1, format!("h{}", b[220]));
+    row("players", 221, 1, b[221].to_string());
+    row("my hand", 222, 5, resources(222));
+    row("my set-aside discards", 227, 5, resources(227));
+    for s in 1..players {
+        let at = 232 + 7 * (s - 1);
+        row(&format!("{} hand: sure of", SEATS[s]), at, 5, resources(at));
+        row(&format!("{} hand: size, set aside", SEATS[s]), at + 5, 2, format!("{}, {}", b[at + 5], b[at + 6]));
+    }
+    row("bank", 253, 5, resources(253));
+    row("my dev cards", 258, 5, cards(258));
+    row("my cards bought this turn", 263, 5, cards(263));
+    for s in 1..players {
+        let at = 268 + 2 * (s - 1);
+        row(&format!("{} dev cards, bought this turn", SEATS[s]), at, 2, format!("{}, {}", b[at], b[at + 1]));
+    }
+    row("deck size", 274, 1, b[274].to_string());
+    row("unseen dev cards", 275, 5, cards(275));
+    row("knights", 280, 4, per_seat(280));
+    row("road length", 284, 4, per_seat(284));
+    row("points (mine all, others public)", 288, 4, per_seat(288));
+    row("longest road", 292, 1, holder(b[292]));
+    row("largest army", 293, 1, holder(b[293]));
+    row("whose turn", 294, 1, seat(b[294]));
+    row("card played this turn", 295, 1, flag(b[295]));
+    row("phase", 296, 1, PHASES.get(usize::from(b[296])).map_or("?".into(), |p| p.to_string()));
+    row("rolled", 297, 1, flag(b[297]));
+    row("phase count", 298, 1, b[298].to_string());
+    row("phase player", 299, 1, seat(b[299]));
+    row("phase vertex", 300, 1, match b[300] { u8::MAX => "—".into(), v => format!("v{v}") });
+    row("next discard from", 301, 1, match b[301] { u8::MAX => "—".into(), r => resource_name(Resource::ALL[usize::from(r)]).into() });
+    row("offer: gives", 302, 5, resources(302));
+    row("offer: wants", 307, 5, resources(307));
+    row("offer: accepted by", 312, 1, join((0..players).filter(|s| b[312] >> s & 1 == 1).map(|s| SEATS[s].to_string()).collect()));
+    row("offers this turn", 313, 1, b[313].to_string());
+    rows
 }
 
 fn action_label(action: Action) -> String {
@@ -743,6 +790,15 @@ fn action_label(action: Action) -> String {
         Action::PlayRoadBuilding => "play road building".into(),
         Action::PlayYearOfPlenty => "play year of plenty".into(),
         Action::PlayMonopoly => "play monopoly".into(),
+        Action::Rob(offset) => format!("rob player +{offset}"),
+        Action::Offer => "offer a trade".into(),
+        Action::Give(r) => format!("+1 {} to give", resource_name(r)),
+        Action::Want(r) => format!("+1 {} wanted", resource_name(r)),
+        Action::Propose => "propose the offer".into(),
+        Action::Cancel => "cancel".into(),
+        Action::Accept => "accept the offer".into(),
+        Action::Decline => "decline the offer".into(),
+        Action::TradeWith(offset) => format!("trade with player +{offset}"),
     }
 }
 
@@ -770,13 +826,23 @@ fn phase_label(phase: Phase) -> String {
         Phase::Dice => "dice".into(),
         Phase::Discard { player, owed, from } => format!("{player:?} discards: {owed} owed, from {}", resource_name(from)),
         Phase::MoveRobber { rolled: r } => format!("move the robber, {}", rolled(r)),
-        Phase::Steal { rolled: r } => format!("steal, {}", rolled(r)),
+        Phase::Steal { rolled: r, victim } => format!("steal from {victim:?}, {}", rolled(r)),
+        Phase::ChooseVictim { rolled: r } => format!("choose whom to rob, {}", rolled(r)),
         Phase::Draw => "draw the bought card".into(),
         Phase::RoadBuilding { roads, .. } => format!("road building: {roads} left"),
         Phase::YearOfPlenty { picks, .. } => format!("year of plenty: {picks} left"),
         Phase::Monopoly { .. } => "monopoly: name a resource".into(),
         Phase::Over { winner } => format!("over: {winner:?} wins"),
+        Phase::Offer { give, get } => format!("building an offer: give {} for {}", bundle(give), bundle(get)),
+        Phase::Respond { give, get, responder, .. } => format!("{responder:?} answers: {} for {}", bundle(give), bundle(get)),
+        Phase::Confirm { give, get, .. } => format!("choose a partner: {} for {}", bundle(give), bundle(get)),
     }
+}
+
+fn bundle(counts: [u8; 5]) -> String {
+    let parts: Vec<String> =
+        (0..5).filter(|&r| counts[r] > 0).map(|r| format!("{} {}", counts[r], resource_name(Resource::ALL[r]))).collect();
+    if parts.is_empty() { "nothing".into() } else { parts.join(" + ") }
 }
 
 fn actor_name(actor: Option<Actor>) -> String {

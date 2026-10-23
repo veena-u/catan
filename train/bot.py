@@ -1,10 +1,11 @@
 import numpy as np
 import torch
 
-from .features import EDGE_ENDS, HEX_CORNERS, decode
+from .features import EDGE_ENDS, SEATS, decode
 
 SETTLEMENT, CITY, ROAD, ROBBER, RESOURCE, TRADE = 0, 54, 108, 180, 199, 204
 ROLL, END_TURN, BUY_CARD, PLAY_KNIGHT, PLAY_ROAD_BUILDING, PLAY_YEAR_OF_PLENTY, PLAY_MONOPOLY = range(264, 271)
+ROB, ACCEPT, DECLINE = 271, 287, 288
 PHASE_DISCARD, PHASE_YEAR_OF_PLENTY, PHASE_MONOPOLY = 4, 9, 10
 
 COSTS = [  # brick, lumber, wool, grain, ore
@@ -17,33 +18,48 @@ TRADES = [(TRADE + 20 * (rate - 2) + 4 * give + get, give, get + (get >= give), 
           for rate in (2, 3, 4) for give in range(5) for get in range(4)]
 
 
+def affordable(hand):
+    return next((a for a, cost in COSTS[:3] if (hand >= cost).all()), None)
+
+
 class Bot:
-    """Builds the most valuable thing it can afford, trades only to afford something, robs the opponent's best hex."""
+    """Builds the most valuable thing it can afford, trades only to afford something, robs the leader."""
 
     def __call__(self, obs, masks):
         hexes, vertices, _, _ = (x.numpy() for x in decode(torch.from_numpy(obs)))
         return np.array([self.choose(o, m, h, v) for o, m, h, v in zip(obs, masks, hexes, vertices)])
 
     def choose(self, obs, legal, hexes, vertices):
-        hand = obs[157:162].astype(int)
-        phase = obs[205]
-        pips = vertices[:, 12:17] * 5
+        hand = obs[222:227].astype(int)
+        phase = obs[296]
+        pips = vertices[:, 16:21] * 5
         value = pips.sum(1) + 0.5 * (pips > 0).sum(1)
         best = lambda options, score: max(options, key=score)
         among = lambda start, count: [i for i in range(start, start + count) if legal[i]]
+        players = int(obs[221])
+
+        if legal[ACCEPT] or legal[DECLINE]:
+            after = hand - obs[307:312] + obs[302:307]
+            return ACCEPT if legal[ACCEPT] and affordable(hand) is None and affordable(after) is not None else DECLINE
 
         resources = among(RESOURCE, 5)
         if resources:
             if phase == PHASE_DISCARD:
                 return best(resources, lambda i: hand[i - RESOURCE])
             if phase == PHASE_MONOPOLY:
-                return best(resources, lambda i: obs[162 + i - RESOURCE])
+                held = lambda r: sum(int(obs[232 + 7 * (s - 1) + r]) for s in range(1, players))
+                return best(resources, lambda i: held(i - RESOURCE))
             return best(resources, lambda i: -hand[i - RESOURCE])
+
+        victims = among(ROB, SEATS - 1)
+        if victims:
+            return best(victims, lambda i: obs[288 + i - ROB + 1])
 
         robber = among(ROBBER, 19)
         if robber:
-            weight = lambda h, me: hexes[h, 21 + me] + 2 * hexes[h, 23 + me]
-            return best(robber, lambda i: hexes[i - ROBBER, 19] * 5 * (weight(i - ROBBER, 1) - 3 * weight(i - ROBBER, 0)))
+            weight = lambda h, s: hexes[h, 21 + s] + 2 * hexes[h, 21 + SEATS + s]
+            others = lambda h: sum(weight(h, s) for s in range(1, SEATS))
+            return best(robber, lambda i: hexes[i - ROBBER, 19] * 5 * (others(i - ROBBER) - 3 * weight(i - ROBBER, 0)))
 
         for start, count in ((CITY, 54), (SETTLEMENT, 54)):
             spots = among(start, count)
@@ -59,7 +75,6 @@ class Bot:
             if legal[action]:
                 return action
 
-        affordable = lambda h: next((a for a, cost in COSTS[:3] if (h >= cost).all()), None)
         if affordable(hand) is None:
             for action, give, get, rate in TRADES:
                 if legal[action]:
@@ -73,8 +88,8 @@ class Bot:
             return BUY_CARD
         roads = among(ROAD, 72)
         if roads:
-            reach = lambda e: max(value[v] * (vertices[v, :4].sum() == 0) * (vertices[v, 17:21].sum() == 0)
-                                  for v in EDGE_ENDS[e])
+            free = lambda v: vertices[v, :2 * SEATS].sum() == 0 and vertices[v, 21:21 + 2 * SEATS].sum() == 0
+            reach = lambda e: max(value[v] * free(v) for v in EDGE_ENDS[e])
             return best(roads, lambda i: reach(i - ROAD))
         if legal[END_TURN]:
             return END_TURN

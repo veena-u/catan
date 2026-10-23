@@ -61,12 +61,14 @@ class Search:
         o, m, p = worlds.observe()
         live, winners = p >= 0, worlds.winners()
         root = np.repeat(players[rows.numpy()], self.samples)
+        seats = int(obs[0, 221])
         value = np.zeros(len(p), np.float32)
         if live.any():
             _, v = self.evaluate(o[live])
-            value[live] = np.where(p[live] == root[live], v.numpy(), -v.numpy())
+            offset = (root[live] - p[live]) % seats
+            value[live] = v.numpy()[np.arange(len(offset)), offset]
         over = winners >= 0
-        value[over] = np.where(winners[over] == root[over], 1.0, -1.0)
+        value[over] = np.where(winners[over] == root[over], 1.0, -1.0 / (seats - 1))
 
         q = torch.full((len(obs), k), float("-inf"))
         q[rows, ranks] = torch.from_numpy(value.reshape(-1, self.samples).mean(1))
@@ -83,6 +85,7 @@ def main():
     parser.add_argument("--depth", type=int, default=16, help="decisions played forward in each imagined world")
     parser.add_argument("--eta", type=float, default=10.0, help="how far the search may move away from the network's choice")
     parser.add_argument("--bot", action="store_true", help="also play search against the bot")
+    parser.add_argument("--players", type=int, default=4)
     args = parser.parse_args()
 
     at = device()
@@ -90,11 +93,12 @@ def main():
     search = Search(model, at, args.candidates, args.samples, args.depth, args.eta)
     parallel = min(args.games, 256)
     start = time.time()
-    report("search vs network", play(search, Network(model, at, seed=1), games=args.games, parallel=parallel, seed=7))
+    report("search vs network", play(search, Network(model, at, seed=1), games=args.games, parallel=parallel, seed=7,
+                                           players=args.players))
     print(f"  ({time.time() - start:.0f}s)")
     if args.bot:
         start = time.time()
-        report("search vs bot", play(search, Bot(), games=args.games, parallel=parallel, seed=8))
+        report("search vs bot", play(search, Bot(), games=args.games, parallel=parallel, seed=8, players=args.players))
         print(f"  ({time.time() - start:.0f}s)")
 
 

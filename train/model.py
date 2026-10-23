@@ -3,12 +3,14 @@ import math
 import torch
 from torch import nn
 
+import catan
+
 from .features import (
-    EDGE_FEATURES, EDGES, FLAT_FEATURES, GLOBAL_FEATURES, HEX_FEATURES, HEXES, RELATIONS, TOKENS, VERTEX_FEATURES,
-    VERTICES, decode, flat, relations,
+    EDGE_FEATURES, EDGES, FLAT_FEATURES, GLOBAL_FEATURES, HEX_FEATURES, HEXES, RELATIONS, SEATS, TOKENS,
+    VERTEX_FEATURES, VERTICES, decode, flat, relations,
 )
 
-ACTIONS = 271
+ACTIONS = catan.ACTIONS
 OTHER = ACTIONS - 2 * VERTICES - EDGES - HEXES
 
 
@@ -21,12 +23,12 @@ class Flat(nn.Module):
             size = width
         self.trunk = nn.Sequential(*layers)
         self.policy = nn.Linear(width, ACTIONS)
-        self.value = nn.Linear(width, 1)
+        self.value = nn.Linear(width, SEATS)
         self.width = width
 
     def forward(self, obs):
         summary = self.trunk(flat(obs))
-        return self.policy(summary), torch.tanh(self.value(summary)).squeeze(-1), summary
+        return self.policy(summary), torch.tanh(self.value(summary)), summary
 
 
 class Block(nn.Module):
@@ -59,7 +61,7 @@ class Tokens(nn.Module):
         self.queries = nn.Linear(width, 4 * width)
         self.keys = nn.Linear(width, width)
         self.other = nn.Linear(width, OTHER)
-        self.value = nn.Linear(width, 1)
+        self.value = nn.Linear(width, SEATS)
         self.width = width
 
     def forward(self, obs):
@@ -85,7 +87,7 @@ class Tokens(nn.Module):
             score(hex_keys, robber),
             self.other(summary),
         ], -1)
-        return logits, torch.tanh(self.value(summary)).squeeze(-1), summary
+        return logits, torch.tanh(self.value(summary)), summary
 
 
 def masked(logits, mask):

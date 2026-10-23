@@ -89,7 +89,7 @@ mod tests {
 
     #[test]
     fn worlds_keep_what_the_searcher_sees_and_play_on_legally() {
-        let mut buffer = Buffer::new(Config { games: 16, history: 64, max_decisions: 5_000, seed: 5 });
+        let mut buffer = Buffer::new(Config { games: 16, history: 64, max_decisions: 5_000, seed: 5, players: 4 });
         let mut rng = Rng::new(1);
         let mut endings = vec![None; buffer.len()];
         for _ in 0..80 {

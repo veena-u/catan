@@ -27,6 +27,7 @@ def main():
     parser.add_argument("run", help="a run directory with iter_*.pt checkpoints")
     parser.add_argument("--checkpoints", type=int, default=6, help="how many, evenly spaced, including the last")
     parser.add_argument("--games", type=int, default=256, help="games per pairing")
+    parser.add_argument("--players", type=int, default=4)
     args = parser.parse_args()
 
     at = device()
@@ -39,7 +40,8 @@ def main():
 
     wins = np.zeros((len(names), len(names)))
     for (i, a), (j, b) in itertools.combinations(enumerate(names), 2):
-        result = play(players[a], players[b], games=args.games, parallel=min(args.games, 512), seed=i * 100 + j)
+        result = play(players[a], players[b], games=args.games, parallel=min(args.games, 512), seed=i * 100 + j,
+                      players=args.players)
         wins[i, j], wins[j, i] = result["wins"], result["losses"]
         print(f"{a:>12s} vs {b:<12s} {result['win_rate']:.3f}", flush=True)
 
