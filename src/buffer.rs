@@ -7,7 +7,7 @@ use crate::board::Board;
 use crate::observation::{observe, OBSERVATION_BYTES};
 use crate::player::Player;
 use crate::rng::Rng;
-use crate::state::{Action, Actor, Mask, Phase, State, Violation};
+use crate::state::{Action, Actor, Mask, Outcome, Phase, State, Violation};
 
 pub const CHECKPOINT_EVERY: u64 = 16;
 pub const PAD: u16 = u16::MAX;
@@ -20,6 +20,7 @@ pub struct Config {
     pub max_decisions: u32, // max decisions before a game is truncated
     pub seed: u64,
     pub players: usize, // players per game, 2 to 4
+    pub paired: bool, // each run of `players` games shares boards and dice rolls, game by game
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -72,11 +73,15 @@ struct Game {
     state: State,
     mask: Mask,
     rng: Rng,
+    dice_rng: Rng,
+    deal: Option<u64>,
+    round: u64,
     time: u64,
     decisions: u32,
     codes: Box<[u16]>,
     checkpoints: Box<[State]>,
     dice: Vec<(u8, State)>,
+    rolls: Vec<u8>,
 }
 
 impl Buffer {
@@ -90,19 +95,25 @@ impl Buffer {
         assert!((2..=crate::player::MAX_PLAYERS).contains(&config.players), "2 to 4 players");
         let mut seeds = Rng::new(config.seed);
         let games = (0..config.games)
-            .map(|_| {
-                let mut rng = seeds.fork();
-                let state = State::new(Board::random(&mut rng), config.players);
+            .map(|slot| {
+                let rng = seeds.fork();
+                let deal = config.paired.then(|| mix(config.seed, (slot / config.players) as u64));
                 let mut game = Game {
-                    state,
+                    state: State::new(Board::random(&mut Rng::new(0)), config.players),
                     mask: Mask::EMPTY,
                     rng,
+                    dice_rng: Rng::new(0),
+                    deal,
+                    round: 0,
                     time: 0,
                     decisions: 0,
                     codes: vec![PAD; config.history].into_boxed_slice(),
-                    checkpoints: vec![state; config.history / CHECKPOINT_EVERY as usize].into_boxed_slice(),
+                    checkpoints: Vec::new().into_boxed_slice(),
                     dice: Vec::new(),
+                    rolls: Vec::new(),
                 };
+                game.state = game.fresh(config.players);
+                game.checkpoints = vec![game.state; config.history / CHECKPOINT_EVERY as usize].into_boxed_slice();
                 game.settle(false);
                 game
             })
@@ -136,6 +147,10 @@ impl Buffer {
 
     pub fn dice(&self, game: usize) -> &[(u8, State)] {
         &self.games[game].dice
+    }
+
+    pub fn rolls(&self, game: usize) -> &[u8] {
+        &self.games[game].rolls
     }
 
     pub fn step(&mut self, actions: &[u16], endings: &mut [Option<Ending>]) -> Result<(), IllegalAction> {
@@ -262,13 +277,34 @@ impl Game {
         self.time += 1;
     }
 
+    fn fresh(&mut self, players: usize) -> State {
+        let board = match self.deal {
+            Some(deal) => {
+                let seed = mix(deal, self.round);
+                self.dice_rng = Rng::new(seed ^ 0xD1CE);
+                Board::random(&mut Rng::new(seed))
+            }
+            None => {
+                self.dice_rng = self.rng.fork();
+                Board::random(&mut self.rng)
+            }
+        };
+        self.round += 1;
+        State::new(board, players)
+    }
+
     fn settle(&mut self, track_dice: bool) {
         self.dice.clear();
+        self.rolls.clear();
         if track_dice && matches!(self.state.phase(), Phase::Dice) {
             expand(&self.state, &mut self.dice);
         }
         while let Some(Actor::Chance) = self.state.actor() {
-            let outcome = self.state.sample_outcome(&mut self.rng);
+            let rolling = matches!(self.state.phase(), Phase::Dice);
+            let outcome = self.state.sample_outcome(if rolling { &mut self.dice_rng } else { &mut self.rng });
+            if let Outcome::Dice(sum) = outcome {
+                self.rolls.push(sum);
+            }
             self.record(outcome.index());
             self.state.resolve(outcome);
         }
@@ -286,9 +322,11 @@ impl Game {
             None => return None,
         };
         let ending = Ending { finish, time: self.time };
-        let board = Board::random(&mut self.rng);
         let players = self.state.players();
-        self.restart(State::new(board, players));
+        let state = self.fresh(players);
+        let rolls = std::mem::take(&mut self.rolls);
+        self.restart(state);
+        self.rolls = rolls;
         Some(ending)
     }
 
@@ -303,6 +341,13 @@ impl Game {
         self.decisions = 0;
         self.settle(false);
     }
+}
+
+fn mix(seed: u64, k: u64) -> u64 {
+    let mut z = seed ^ k.wrapping_add(1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
 }
 
 fn expand(state: &State, into: &mut Vec<(u8, State)>) {

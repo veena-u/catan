@@ -7,7 +7,7 @@ import catan
 
 from .features import (
     EDGE_FEATURES, EDGES, FLAT_FEATURES, GLOBAL_FEATURES, HEX_FEATURES, HEXES, RELATIONS, SEATS, TOKENS,
-    VERTEX_FEATURES, VERTICES, decode, flat, relations,
+    VERTEX_FEATURES, VERTICES, decode, flat, relations, symmetry_tables,
 )
 
 ACTIONS = catan.ACTIONS
@@ -26,9 +26,9 @@ class Flat(nn.Module):
         self.value = nn.Linear(width, SEATS)
         self.width = width
 
-    def forward(self, obs):
-        summary = self.trunk(flat(obs))
-        return self.policy(summary), torch.tanh(self.value(summary)), summary
+    def forward(self, obs, symmetry=None):
+        summary = self.trunk(flat(obs, symmetry))
+        return untwist(self.policy(summary), symmetry), torch.tanh(self.value(summary)), summary
 
 
 class Block(nn.Module):
@@ -64,8 +64,8 @@ class Tokens(nn.Module):
         self.value = nn.Linear(width, SEATS)
         self.width = width
 
-    def forward(self, obs):
-        hexes, vertices, edges, globals_ = decode(obs)
+    def forward(self, obs, symmetry=None):
+        hexes, vertices, edges, globals_ = decode(obs, symmetry)
         x = torch.cat([
             self.embed[0](globals_).unsqueeze(1),
             self.embed[1](hexes),
@@ -87,7 +87,13 @@ class Tokens(nn.Module):
             score(hex_keys, robber),
             self.other(summary),
         ], -1)
-        return logits, torch.tanh(self.value(summary)), summary
+        return untwist(logits, symmetry), torch.tanh(self.value(summary)), summary
+
+
+def untwist(logits, symmetry):
+    if symmetry is None:
+        return logits
+    return logits.gather(1, symmetry_tables(logits.device)[3][symmetry])
 
 
 def masked(logits, mask):

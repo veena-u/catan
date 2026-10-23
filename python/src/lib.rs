@@ -1,10 +1,12 @@
 use catan::board::Board;
 use catan::buffer::{self, CHECKPOINT_EVERY, Config, Ending, Finish};
-use catan::ids::{Edge, Hex};
+use catan::dev_card::DevCard;
+use catan::ids::{Edge, Hex, Vertex};
+use catan::symmetry::{Symmetry, SYMMETRIES};
 use catan::observation::{OBSERVATION_BYTES, observe};
 use catan::player::{Player, MAX_PLAYERS};
 use catan::rng::Rng;
-use catan::state::{ACTIONS, Actor, State};
+use catan::state::{ACTIONS, Action, Actor, State};
 use catan::topology::topology as board_topology;
 use catan::worlds;
 use numpy::{AllowTypeChange, PyArray1, PyArray2, PyArrayLike1, PyArrayMethods};
@@ -31,8 +33,8 @@ struct Buffer {
 #[pymethods]
 impl Buffer {
     #[new]
-    #[pyo3(signature = (games, history = 1024, max_decisions = 1000, seed = 0, players = 4))]
-    fn new(games: usize, history: usize, max_decisions: u32, seed: u64, players: usize) -> PyResult<Self> {
+    #[pyo3(signature = (games, history = 1024, max_decisions = 1000, seed = 0, players = 4, paired = false))]
+    fn new(games: usize, history: usize, max_decisions: u32, seed: u64, players: usize, paired: bool) -> PyResult<Self> {
         if games == 0 || max_decisions == 0 || history == 0 || history as u64 % CHECKPOINT_EVERY != 0 {
             return Err(PyValueError::new_err(format!(
                 "games and max_decisions must be positive, and history a positive multiple of {CHECKPOINT_EVERY}"
@@ -41,7 +43,7 @@ impl Buffer {
         if !(2..=MAX_PLAYERS).contains(&players) {
             return Err(PyValueError::new_err(format!("2 to {MAX_PLAYERS} players")));
         }
-        let inner = buffer::Buffer::new(Config { games, history, max_decisions, seed, players });
+        let inner = buffer::Buffer::new(Config { games, history, max_decisions, seed, players, paired });
         Ok(Buffer { inner, endings: vec![None; games] })
     }
 
@@ -68,6 +70,35 @@ impl Buffer {
             .detach(|| worlds::Worlds::new(inner, &games, actions, samples, seed))
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
         Ok(Worlds { inner: worlds })
+    }
+
+    fn rolls<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<u8>> {
+        let n = self.inner.len();
+        let mut counts = vec![vec![0u8; 11]; n];
+        for (game, row) in counts.iter_mut().enumerate() {
+            for &sum in self.inner.rolls(game) {
+                row[usize::from(sum - 2)] += 1;
+            }
+        }
+        PyArray2::from_vec2(py, &counts).expect("rows of 11")
+    }
+
+    fn hidden<'py>(&self, py: Python<'py>) -> Bound<'py, numpy::PyArrayDyn<u8>> {
+        let n = self.inner.len();
+        let mut out = vec![0u8; n * (MAX_PLAYERS - 1) * 10];
+        for game in 0..n {
+            let state = self.inner.state(game);
+            let Some(Actor::Player(me)) = state.actor() else { continue };
+            for (k, other) in state.others(me).enumerate() {
+                let at = (game * (MAX_PLAYERS - 1) + k) * 10;
+                let (hand, aside) = (state.hand(other), state.set_aside(other));
+                for r in 0..5 {
+                    out[at + r] = hand[r] + aside[r];
+                    out[at + 5 + r] = state.dev_cards(other, DevCard::ALL[r]);
+                }
+            }
+        }
+        PyArray1::from_vec(py, out).reshape(vec![n, MAX_PLAYERS - 1, 10]).expect("sizes match")
     }
 
     fn track_dice(&mut self, on: bool) {
@@ -270,6 +301,21 @@ impl Game {
         }
     }
 
+    fn observe_transformed<'py>(&self, py: Python<'py>, symmetry: usize) -> PyResult<(Bound<'py, PyArray1<u8>>, Bound<'py, PyArray1<bool>>)> {
+        if symmetry >= SYMMETRIES {
+            return Err(PyValueError::new_err(format!("{SYMMETRIES} symmetries")));
+        }
+        let state = self.state.transformed(Symmetry::new(symmetry));
+        let Some(Actor::Player(player)) = state.actor() else {
+            return Err(PyValueError::new_err("no player is to act"));
+        };
+        let mut bytes = [0; OBSERVATION_BYTES];
+        observe(&state, player, &mut bytes);
+        let words = state.legal_actions().words();
+        let legal = (0..ACTIONS).map(|i| words[i / 64] >> (i % 64) & 1 == 1);
+        Ok((PyArray1::from_slice(py, &bytes), PyArray1::from_iter(py, legal)))
+    }
+
     fn record(&self) -> String {
         let codes: Vec<String> = self.codes.iter().map(u16::to_string).collect();
         format!("{};{};{}", self.state.players(), self.seed, codes.join(","))
@@ -288,6 +334,23 @@ fn masks<'py>(py: Python<'py>, words: &[[u64; 5]]) -> Bound<'py, PyArray2<bool>>
         }
     }
     array
+}
+
+#[pyfunction]
+fn symmetries<'py>(py: Python<'py>) -> (Bound<'py, PyArray2<u8>>, Bound<'py, PyArray2<u8>>, Bound<'py, PyArray2<u8>>, Bound<'py, PyArray2<u16>>) {
+    let table = |f: &dyn Fn(Symmetry) -> Vec<u8>| -> Vec<Vec<u8>> { Symmetry::all().map(f).collect() };
+    let hexes = table(&|s| Hex::all().map(|h| s.hex(h).index() as u8).collect());
+    let vertices = table(&|s| Vertex::all().map(|v| s.vertex(v).index() as u8).collect());
+    let edges = table(&|s| Edge::all().map(|e| s.edge(e).index() as u8).collect());
+    let actions: Vec<Vec<u16>> = Symmetry::all()
+        .map(|s| (0..ACTIONS as u16).map(|i| Action::from_index(i).expect("an action").transformed(s).index()).collect())
+        .collect();
+    (
+        PyArray2::from_vec2(py, &hexes).expect("rows"),
+        PyArray2::from_vec2(py, &vertices).expect("rows"),
+        PyArray2::from_vec2(py, &edges).expect("rows"),
+        PyArray2::from_vec2(py, &actions).expect("rows"),
+    )
 }
 
 #[pyfunction]
@@ -311,6 +374,7 @@ fn catan_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Buffer>()?;
     m.add_class::<Game>()?;
     m.add_function(wrap_pyfunction!(topology, m)?)?;
+    m.add_function(wrap_pyfunction!(symmetries, m)?)?;
     m.add("OBSERVATION_BYTES", OBSERVATION_BYTES)?;
     m.add("ACTIONS", ACTIONS)?;
     m.add("MAX_PLAYERS", MAX_PLAYERS)?;

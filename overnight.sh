@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# The overnight queue for full Catan: a baseline run first, then each run changes one thing from it.
+# The overnight queue for full Catan: a baseline run first, then each run changes one thing from it,
+# then everything together for twice as long. Comparisons are paired: same boards and dice, seats rotated.
 # After every run: head-to-head against the baseline and per-game habits, so stopping early loses nothing.
 # Run from the repo root inside tmux:  bash overnight.sh
 set -uo pipefail
@@ -7,8 +8,7 @@ if [ -f /venv/main/bin/activate ]; then source /venv/main/bin/activate; fi
 cd "$(dirname "$0")"
 
 PLAYERS=${PLAYERS:-4}
-BASE=${BASE:-"--games 2048 --rounds 64 --eval-every 10 --anneal-power 0.5 --anneal-steps 20 --players $PLAYERS"}
-BIG=${BIG:-"--width 256 --depth 6 --minibatch 2048"}
+BASE=${BASE:-"--games 2048 --rounds 64 --eval-every 20 --anneal-power 0.5 --anneal-steps 20 --players $PLAYERS"}
 SHORT=${SHORT:-300}
 LONG=${LONG:-600}
 
@@ -43,8 +43,9 @@ python -c "import catan; catan.Buffer(1, players=$PLAYERS).track_dice(False)" 2>
 }
 ITERATIONS=$SHORT run base
 [ -f runs/base/latest.pt ] || { echo "the baseline failed; stopping"; exit 1; }
+ITERATIONS=$SHORT run symmetry --symmetry
+ITERATIONS=$SHORT run future-dice --future-dice
+ITERATIONS=$SHORT run critic --privileged
 ITERATIONS=$SHORT run dice --average-dice
-ITERATIONS=$SHORT run keep --keep 0.3
-ITERATIONS=$SHORT run big $BIG
-ITERATIONS=$LONG run all-long --average-dice $BIG
+ITERATIONS=$LONG run all --symmetry --future-dice --privileged --average-dice
 echo "=== done ($(date))"

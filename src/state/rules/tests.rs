@@ -755,7 +755,7 @@ fn offer_paths(state: State, paths: &mut Vec<([u8; 5], [u8; 5])>) {
 #[test]
 fn each_offer_is_built_by_exactly_one_path_from_cards_the_offerer_holds() {
     let mut state = scenario_of(24, 3);
-    state.hands[0] = [2, 0, 1, 0, 0];
+    state.hands = seats(&[[2, 0, 1, 0, 0], [0, 4, 0, 4, 0], [0, 0, 4, 0, 4]]);
     state.transition(Action::Offer);
     let mut paths = Vec::new();
     offer_paths(state, &mut paths);
@@ -813,4 +813,19 @@ fn offers_are_limited_per_turn_and_a_refused_offer_changes_nothing() {
     assert_eq!(state.hands[0], [1, 0, 0, 0, 0]);
     state.transition(Action::EndTurn);
     assert_eq!(state.offers, 0);
+}
+
+#[test]
+fn an_offer_never_asks_for_more_than_the_other_players_could_hold() {
+    let mut state = scenario_of(27, 3);
+    state.hands = seats(&[[2, 0, 0, 0, 0], [0, 1, 0, 0, 0], [0, 1, 0, 0, 2]]);
+    state.transition(Action::Offer);
+    state.transition(Action::Give(Resource::Brick));
+    state.transition(Action::Want(Resource::Lumber));
+    assert!(state.legal_actions().contains(Action::Want(Resource::Lumber)), "two lumber are out there");
+    state.transition(Action::Want(Resource::Lumber));
+    let wants: Vec<Action> = state.legal_actions().iter().filter(|a| matches!(a, Action::Want(_))).collect();
+    assert_eq!(wants, [Action::Want(Resource::Ore)], "no third lumber exists, and ore is the only other resource held");
+    state.transition(Action::Want(Resource::Ore));
+    assert!(!state.legal_actions().iter().any(|a| matches!(a, Action::Want(_))), "no hand is bigger than three cards");
 }

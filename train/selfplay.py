@@ -13,8 +13,11 @@ import catan
 from .agents import KIND_COUNT, KINDS, Network, Random
 from .bot import Bot
 from .evaluate import play
-from .features import SEATS
+from .features import SEATS, SYMMETRIES
 from .model import Tokens, device
+
+HIDDEN = (SEATS - 1) * 10
+DICE_SUMS = 11
 
 KIND_MATRIX = torch.from_numpy(np.eye(KIND_COUNT, dtype=np.float32)[KINDS])
 
@@ -57,17 +60,34 @@ def rewards(winner, players, seats=SEATS):
     return reward
 
 
+class Critics(nn.Module):
+    """Value heads used only in training: one that also sees every hidden card, one that also sees the dice to come."""
+
+    def __init__(self, width):
+        super().__init__()
+        self.hidden = nn.Sequential(nn.Linear(width + HIDDEN, width), nn.GELU(), nn.Linear(width, SEATS))
+        self.future = nn.Sequential(nn.Linear(width + DICE_SUMS, width), nn.GELU(), nn.Linear(width, SEATS))
+
+    def privileged(self, summary, hidden):
+        return torch.tanh(self.hidden(torch.cat([summary.float(), hidden.flatten(1).float() / 5], -1)))
+
+    def with_future(self, summary, rolls):
+        return torch.tanh(self.future(torch.cat([summary.float(), rolls.float()], -1)))
+
+
 class Rollout:
-    def __init__(self, model, buffer, at, autocast, players, average_dice=False):
-        self.model, self.buffer, self.at, self.autocast = model, buffer, at, autocast
+    def __init__(self, model, critics, buffer, at, autocast, players, average_dice=False, privileged=False):
+        self.model, self.critics, self.buffer, self.at, self.autocast = model, critics, buffer, at, autocast
         self.games, self.players = len(buffer), players
-        self.average_dice = average_dice
+        self.average_dice, self.privileged = average_dice, privileged
         buffer.track_dice(average_dice)
 
     @torch.no_grad()
-    def evaluate(self, obs, masks):
+    def evaluate(self, obs, masks, hidden=None):
         with torch.autocast(self.at.type, dtype=torch.bfloat16, enabled=self.autocast):
-            logits, values, _ = self.model(obs)
+            logits, values, summary = self.model(obs)
+        if hidden is not None:
+            values = self.critics.privileged(summary, hidden)
         dist, _ = policy(logits, masks)
         return dist, values.float()
 
@@ -98,6 +118,8 @@ class Rollout:
         log_probs = torch.zeros(rounds, n, device=at)
         values = torch.zeros(rounds, n, SEATS, device=at)
         actors = torch.zeros(rounds, n, dtype=torch.long, device=at)
+        hidden = torch.zeros(rounds, n, SEATS - 1, 10, dtype=torch.uint8, device=at)
+        rolls = torch.zeros(rounds, n, DICE_SUMS, device=at)
         done, ends = torch.zeros(rounds, n, dtype=torch.bool, device=at), torch.zeros(rounds, n, SEATS, device=at)
         rolled, expected = torch.zeros(rounds, n, dtype=torch.bool, device=at), torch.zeros(rounds, n, SEATS, device=at)
         stats = {"won": 0, "truncated": 0, "first_won": 0}
@@ -105,10 +127,12 @@ class Rollout:
         for t in range(rounds):
             o, m, p = self.buffer.observe()
             obs[t], masks[t], actors[t] = self.tensor(o), self.tensor(m), self.tensor(p, np.int64)
-            dist, v = self.evaluate(obs[t], masks[t])
+            hidden[t] = self.tensor(self.buffer.hidden())
+            dist, v = self.evaluate(obs[t], masks[t], hidden[t] if self.privileged else None)
             a = dist.sample()
             actions[t], log_probs[t], values[t] = a, dist.log_prob(a), to_absolute(v, actors[t], self.players)
             endings = self.buffer.step(a.cpu().numpy())
+            rolls[t] = self.tensor(self.buffer.rolls().astype(np.float32))
             if self.average_dice:
                 games, value = self.expected_after_roll()
                 if value is not None:
@@ -128,10 +152,25 @@ class Rollout:
                 o, _, q = self.buffer.observe_at(list(games), list(times))
                 ends[t, list(games)] = self.value(self.tensor(o), self.tensor(q, np.int64))
 
-        o, _, p = self.buffer.observe()
-        last = self.value(self.tensor(o), self.tensor(p, np.int64))
-        batch = dict(obs=obs, masks=masks, actions=actions, log_probs=log_probs, actors=actors)
+        o, m, p = self.buffer.observe()
+        if self.privileged:
+            _, last = self.evaluate(self.tensor(o), self.tensor(m), self.tensor(self.buffer.hidden()))
+            last = to_absolute(last, self.tensor(p, np.int64), self.players)
+        else:
+            last = self.value(self.tensor(o), self.tensor(p, np.int64))
+        future = upcoming(rolls, done)
+        batch = dict(obs=obs, masks=masks, actions=actions, log_probs=log_probs, actors=actors, hidden=hidden, future=future)
         return batch, values, (done, ends, rolled, expected, last), stats
+
+
+def upcoming(rolls, done, decay=0.9):
+    """For each decision, the dice rolled from it on in its game, nearer rolls counting more."""
+    future = torch.zeros_like(rolls)
+    following = torch.zeros_like(rolls[0])
+    for t in reversed(range(rolls.shape[0])):
+        following = rolls[t] + decay * following * (~done[t])[:, None]
+        future[t] = following
+    return future / 3
 
 
 def sync(at):
@@ -153,12 +192,13 @@ def advantages(values, done, ends, rolled, expected, last, lam):
     return result
 
 
-def update(model, optimizer, batch, adv, returns, players, args, autocast, magnet_weight):
+def update(model, critics, optimizer, batch, adv, returns, players, args, autocast, magnet_weight):
     flat = {k: v.flatten(0, 1) for k, v in batch.items()}
     actors = flat["actors"]
     own = adv.flatten(0, 1).gather(1, actors[:, None]).squeeze(1)
     targets = to_relative(returns.flatten(0, 1), actors, players)
     total = len(own)
+    seats = slice(0, players)
     threshold = own.abs().float().quantile(1 - args.keep) if args.keep < 1 else -1.0
     informative = own.abs() >= threshold
     logs = {"policy": 0.0, "value": 0.0, "kl_magnet": 0.0, "approx_kl": 0.0, "clipped": 0.0,
@@ -167,21 +207,30 @@ def update(model, optimizer, batch, adv, returns, players, args, autocast, magne
     for _ in range(args.epochs):
         for pick in torch.randperm(total, device=own.device).split(args.minibatch):
             obs, masks = flat["obs"][pick], flat["masks"][pick]
+            symmetry = torch.randint(SYMMETRIES, (len(pick),), device=obs.device) if args.symmetry else None
             with torch.autocast(obs.device.type, dtype=torch.bfloat16, enabled=autocast):
-                logits, values, _ = model(obs)
+                logits, values, summary = model(obs, symmetry)
             dist, log_probs = policy(logits, masks)
             new = dist.log_prob(flat["actions"][pick])
             ratio = (new - flat["log_probs"][pick]).exp()
+            target = targets[pick]
+            value_loss = nn.functional.mse_loss(values.float()[:, seats], target[:, seats])
+            a = own[pick]
+            if args.privileged:
+                value_loss = value_loss + nn.functional.mse_loss(critics.privileged(summary, flat["hidden"][pick])[:, seats], target[:, seats])
+            if args.future_dice:
+                baseline = critics.with_future(summary, flat["future"][pick])
+                value_loss = value_loss + nn.functional.mse_loss(baseline[:, seats], target[:, seats])
+                a = target[:, 0] - baseline[:, 0].detach()
             kept = informative[pick]
-            ratio, a = ratio[kept], own[pick][kept]
+            ratio, a = ratio[kept], a[kept]
             a = (a - a.mean()) / (a.std() + 1e-8)
             policy_loss = -torch.min(ratio * a, ratio.clamp(1 - args.clip, 1 + args.clip) * a).mean()
-            value_loss = nn.functional.mse_loss(values.float()[:, :players], targets[pick][:, :players])
             magnet = kl_to_magnet(log_probs, masks).mean()
             loss = policy_loss + args.value_coef * value_loss + magnet_weight * magnet
             optimizer.zero_grad()
             loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+            nn.utils.clip_grad_norm_([*model.parameters(), *critics.parameters()], args.max_grad_norm)
             optimizer.step()
             with torch.no_grad():
                 logs["policy"] += policy_loss.item()
@@ -216,6 +265,11 @@ def main():
                         help="train the policy only on this fraction of moves, those with the largest advantage magnitude")
     parser.add_argument("--average-dice", action="store_true",
                         help="score a move followed by a roll against the average over all 11 rolls, not the one rolled")
+    parser.add_argument("--symmetry", action="store_true", help="turn each training sample by a random board symmetry")
+    parser.add_argument("--privileged", action="store_true",
+                        help="score moves with a critic that also sees every hidden card (training only)")
+    parser.add_argument("--future-dice", action="store_true",
+                        help="score moves against a baseline that also knows the dice rolled next (ICLR 2019)")
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--max-decisions", type=int, default=5000)
     parser.add_argument("--eval-every", type=int, default=10)
@@ -232,9 +286,10 @@ def main():
     (out / "args.json").write_text(json.dumps(vars(args), indent=2))
 
     model = Tokens(args.width, args.depth).to(at)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    critics = Critics(args.width).to(at)
+    optimizer = torch.optim.AdamW([*model.parameters(), *critics.parameters()], lr=args.lr)
     buffer = catan.Buffer(args.games, history=64, max_decisions=args.max_decisions, seed=args.seed, players=args.players)
-    rollout = Rollout(model, buffer, at, autocast, args.players, args.average_dice)
+    rollout = Rollout(model, critics, buffer, at, autocast, args.players, args.average_dice, args.privileged)
     log = open(out / "log.txt", "a")
 
     def say(line):
@@ -260,7 +315,7 @@ def main():
         for group in optimizer.param_groups:
             group["lr"] = args.lr * scale
         model.train()
-        logs = update(model, optimizer, batch, adv, returns, args.players, args, autocast, args.magnet * scale)
+        logs = update(model, critics, optimizer, batch, adv, returns, args.players, args, autocast, args.magnet * scale)
         sync(at)
         update_time = time.time() - clock
         decisions += args.games * args.rounds
@@ -282,7 +337,7 @@ def main():
                 result = play(player, opponent, games=args.eval_games, parallel=min(args.eval_games, 512),
                               seed=10_000 + iteration, players=args.players)
                 line += f"  vs {name} {result['win_rate']:.3f}"
-            checkpoint = {"model": model.state_dict(), "args": vars(args), "iteration": iteration}
+            checkpoint = {"model": model.state_dict(), "critics": critics.state_dict(), "args": vars(args), "iteration": iteration}
             torch.save(checkpoint, out / f"iter_{iteration:05d}.pt")
             torch.save(checkpoint, out / "latest.pt")
             previous = copy.deepcopy(model).eval()

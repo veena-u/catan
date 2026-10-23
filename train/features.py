@@ -22,7 +22,22 @@ EDGE_VERTEX[np.arange(EDGES)[:, None], EDGE_ENDS] = 1
 VERTEX_VERTEX = EDGE_VERTEX.T @ EDGE_VERTEX * (1 - np.eye(VERTICES, dtype=np.float32))
 EDGE_EDGE = (EDGE_VERTEX @ EDGE_VERTEX.T > 0) * (1 - np.eye(EDGES, dtype=np.float32))
 
+SYMMETRY_HEX, SYMMETRY_VERTEX, SYMMETRY_EDGE, SYMMETRY_ACTION = (a.astype(np.int64) for a in catan.symmetries())
+SYMMETRIES = len(SYMMETRY_HEX)
+_INVERSE = tuple(np.argsort(t, axis=1) for t in (SYMMETRY_HEX, SYMMETRY_VERTEX, SYMMETRY_EDGE))
+
 _cache = {}
+_symmetry_cache = {}
+
+
+def symmetry_tables(device):
+    if device not in _symmetry_cache:
+        _symmetry_cache[device] = tuple(torch.from_numpy(t).to(device) for t in (*_INVERSE, SYMMETRY_ACTION))
+    return _symmetry_cache[device]
+
+
+def turn(rows, inverse):
+    return rows.gather(1, inverse[..., None].expand(-1, -1, rows.shape[-1]))
 
 
 def adjacency(device):
@@ -50,7 +65,7 @@ def seats_present(obs):
     return (torch.arange(SEATS, device=obs.device) < obs[:, 221:222].long()).float()
 
 
-def decode(obs):
+def decode(obs, symmetry=None):
     obs = obs.to(torch.uint8)
     hex_vertex, edge_vertex, vertex_vertex, edge_edge = adjacency(obs.device)
 
@@ -93,11 +108,16 @@ def decode(obs):
         bits(obs, 312, 1, SEATS),
         obs[:, 313:314].float() / 3,
     ], -1)
+    if symmetry is not None:
+        hex_inverse, vertex_inverse, edge_inverse, _ = symmetry_tables(obs.device)
+        hexes = turn(hexes, hex_inverse[symmetry])
+        vertices = turn(vertices, vertex_inverse[symmetry])
+        edges = turn(edges, edge_inverse[symmetry])
     return hexes, vertices, edges, globals_
 
 
-def flat(obs):
-    hexes, vertices, edges, globals_ = decode(obs)
+def flat(obs, symmetry=None):
+    hexes, vertices, edges, globals_ = decode(obs, symmetry)
     return torch.cat([hexes.flatten(1), vertices.flatten(1), edges.flatten(1), globals_], -1)
 
 

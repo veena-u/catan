@@ -4,7 +4,7 @@ use crate::board::Harbor;
 use crate::dev_card::DevCard;
 use crate::ids::{Edge, EdgeKind, Hex, Set, Vertex, VertexKind, EDGES, VERTICES};
 use crate::player::{Player, MAX_PLAYERS};
-use crate::resource::Resource;
+use crate::resource::{Resource, RESOURCE_CARDS};
 use crate::rng::Rng;
 use crate::symmetry::Symmetry;
 use crate::topology::topology;
@@ -330,9 +330,12 @@ impl State {
                         }
                     }
                 }
-                if given > 0 && wanted < MAX_OFFER_CARDS {
+                let largest_hand = self.others(player).map(|o| self.hand_size(o)).max().unwrap_or(0);
+                if given > 0 && wanted < MAX_OFFER_CARDS && wanted < largest_hand {
                     for resource in Resource::ALL.into_iter().filter(|&r| r >= highest(get).unwrap_or(Resource::Brick)) {
-                        if give[resource.index()] == 0 {
+                        let r = resource.index();
+                        let elsewhere = RESOURCE_CARDS - self.bank(resource) - self.hands[p][r] - self.set_aside[p][r];
+                        if give[r] == 0 && get[r] < elsewhere {
                             mask.insert(Action::Want(resource));
                         }
                     }

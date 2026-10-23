@@ -8,9 +8,12 @@ import catan
 from .agents import Random
 
 
-def play(a, b, games=4096, parallel=512, seed=0, max_decisions=5000, players=4):
+def play(a, b, games=4096, parallel=512, seed=0, max_decisions=5000, players=4, paired=True):
+    """`a` against `b` in every other seat. Paired: each group of `players` games deals the same board and dice,
+    with `a` in a different seat in each, so luck falls evenly on both sides."""
+    parallel = max(players, parallel // players * players)
     per_slot = math.ceil(games / parallel)
-    buffer = catan.Buffer(parallel, max_decisions=max_decisions, seed=seed, players=players)
+    buffer = catan.Buffer(parallel, max_decisions=max_decisions, seed=seed, players=players, paired=paired)
     seat_a = np.arange(parallel) % players
     finished = np.zeros(parallel, int)
     wins = losses = truncated = first_wins = decided = 0
