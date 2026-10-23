@@ -7,9 +7,9 @@ from .model import masked
 
 KINDS = np.array(
     [0] * 54 + [1] * 54 + [2] * 72 + [3] * 19 + [4] * 5 + [5] * 60 + list(range(6, 13))
-    + [13] * 3 + [14] + [15] * 5 + [16] * 5 + [17, 18, 19, 20] + [21] * 3
+    + [13] * 3 + [14] * catan.DEALS + [15, 16] + [17] * 3 + [18] * 3 + [19]
 )
-KIND_COUNT = 22
+KIND_COUNT = 20
 assert len(KINDS) == catan.ACTIONS
 _ONE_HOT = np.eye(KIND_COUNT)[KINDS]
 

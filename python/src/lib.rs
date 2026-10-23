@@ -6,7 +6,7 @@ use catan::symmetry::{Symmetry, SYMMETRIES};
 use catan::observation::{OBSERVATION_BYTES, observe};
 use catan::player::{Player, MAX_PLAYERS};
 use catan::rng::Rng;
-use catan::state::{ACTIONS, Action, Actor, State};
+use catan::state::{ACTIONS, Action, Actor, DEALS, Deal, MASK_WORDS, State};
 use catan::topology::topology as board_topology;
 use catan::worlds;
 use numpy::{AllowTypeChange, PyArray1, PyArray2, PyArrayLike1, PyArrayMethods};
@@ -150,7 +150,7 @@ impl Buffer {
     fn observe<'py>(&self, py: Python<'py>) -> Batch<'py> {
         let n = self.inner.len();
         let observations = PyArray2::zeros(py, [n, OBSERVATION_BYTES], false);
-        let (mut words, mut players) = (vec![[0; 5]; n], vec![Player::First; n]);
+        let (mut words, mut players) = (vec![[0; MASK_WORDS]; n], vec![Player::First; n]);
         {
             let mut view = observations.readwrite();
             let out = view.as_slice_mut().expect("a new array is contiguous").as_chunks_mut().0;
@@ -198,7 +198,7 @@ impl Buffer {
         }
         let n = games.len();
         let observations = PyArray2::zeros(py, [n, OBSERVATION_BYTES], false);
-        let (mut words, mut players) = (vec![[0; 5]; n], vec![Player::First; n]);
+        let (mut words, mut players) = (vec![[0; MASK_WORDS]; n], vec![Player::First; n]);
         let result = {
             let mut view = observations.readwrite();
             let out = view.as_slice_mut().expect("a new array is contiguous").as_chunks_mut().0;
@@ -224,7 +224,7 @@ impl Worlds {
     fn observe<'py>(&self, py: Python<'py>) -> (Bound<'py, PyArray2<u8>>, Bound<'py, PyArray2<bool>>, Bound<'py, PyArray1<i8>>) {
         let n = self.inner.len();
         let observations = PyArray2::zeros(py, [n, OBSERVATION_BYTES], false);
-        let (mut words, mut players) = (vec![[0; 5]; n], vec![None; n]);
+        let (mut words, mut players) = (vec![[0; MASK_WORDS]; n], vec![None; n]);
         {
             let mut view = observations.readwrite();
             let out = view.as_slice_mut().expect("a new array is contiguous").as_chunks_mut().0;
@@ -337,7 +337,7 @@ impl Game {
     }
 }
 
-fn masks<'py>(py: Python<'py>, words: &[[u64; 5]]) -> Bound<'py, PyArray2<bool>> {
+fn masks<'py>(py: Python<'py>, words: &[[u64; MASK_WORDS]]) -> Bound<'py, PyArray2<bool>> {
     let array = PyArray2::zeros(py, [words.len(), ACTIONS], false);
     {
         let mut view = array.readwrite();
@@ -383,6 +383,13 @@ fn player_codes<'py>(py: Python<'py>, players: &[Player]) -> Bound<'py, PyArray1
     PyArray1::from_iter(py, players.iter().map(|p| p.index() as u8))
 }
 
+/// The trade menu: row i is what deal i gives (first five counts) and gets (last five), as its proposer sees it.
+#[pyfunction]
+fn deals(py: Python<'_>) -> Bound<'_, PyArray2<u8>> {
+    let rows: Vec<Vec<u8>> = Deal::all().iter().map(|d| [d.give, d.get].concat()).collect();
+    PyArray2::from_vec2(py, &rows).expect("rows of 10")
+}
+
 #[pymodule]
 #[pyo3(name = "catan")]
 fn catan_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -392,6 +399,8 @@ fn catan_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(symmetries, m)?)?;
     m.add("OBSERVATION_BYTES", OBSERVATION_BYTES)?;
     m.add("ACTIONS", ACTIONS)?;
+    m.add("DEALS", DEALS)?;
+    m.add_function(wrap_pyfunction!(deals, m)?)?;
     m.add("MAX_PLAYERS", MAX_PLAYERS)?;
     Ok(())
 }

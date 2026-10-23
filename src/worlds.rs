@@ -2,7 +2,7 @@ use crate::buffer::{parallel, Buffer};
 use crate::observation::{observe, OBSERVATION_BYTES};
 use crate::player::Player;
 use crate::rng::Rng;
-use crate::state::{Action, Actor, Invalid, State};
+use crate::state::{Action, Actor, Invalid, State, MASK_WORDS};
 
 pub struct Worlds {
     states: Vec<State>,
@@ -67,7 +67,7 @@ impl Worlds {
         &self.states[world]
     }
 
-    pub fn observe(&self, observations: &mut [[u8; OBSERVATION_BYTES]], masks: &mut [[u64; 5]], players: &mut [Option<Player>]) {
+    pub fn observe(&self, observations: &mut [[u8; OBSERVATION_BYTES]], masks: &mut [[u64; MASK_WORDS]], players: &mut [Option<Player>]) {
         for (((world, observation), mask), player) in self.states.iter().zip(observations).zip(masks).zip(players) {
             *player = match world.actor() {
                 Some(Actor::Player(p)) => {
@@ -139,7 +139,7 @@ mod tests {
             }
         }
         let n = worlds.len();
-        let (mut obs, mut masks, mut players) = (vec![[0; OBSERVATION_BYTES]; n], vec![[0; 5]; n], vec![None; n]);
+        let (mut obs, mut masks, mut players) = (vec![[0; OBSERVATION_BYTES]; n], vec![[0; MASK_WORDS]; n], vec![None; n]);
         for _ in 0..30 {
             worlds.observe(&mut obs, &mut masks, &mut players);
             let actions: Vec<u16> = (0..n)

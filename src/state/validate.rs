@@ -6,7 +6,7 @@ use crate::player::{Player, MAX_PLAYERS};
 use crate::resource::{Resource, RESOURCE_CARDS};
 use crate::topology::topology;
 
-use super::rules::{award, longest_road, MAX_OFFERS, MAX_OFFER_CARDS};
+use super::rules::{award, longest_road, Deal, DEALS, MAX_OFFERS};
 use super::{Actor, Phase, State, WINNING_POINTS};
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -289,17 +289,14 @@ impl State {
                 ensure(self.can_rob(victim), || "a steal from someone who cannot be robbed".into())?;
             }
             Phase::Draw => ensure(self.deck_size() > 0, || "a draw from an empty deck".into())?,
-            Phase::Offer { give, get } | Phase::Respond { give, get, .. } | Phase::Confirm { give, get, .. } => {
-                let (given, wanted) = (give.iter().sum::<u8>(), get.iter().sum::<u8>());
-                ensure(given <= MAX_OFFER_CARDS && wanted <= MAX_OFFER_CARDS, || "an offer of too many cards".into())?;
-                ensure((0..5).all(|r| give[r] == 0 || get[r] == 0), || "an offer to swap a resource for itself".into())?;
-                ensure(self.can_pay(self.current, give), || "an offer of cards the offerer does not hold".into())?;
+            Phase::Respond { deal, accepted, counters, .. } | Phase::Confirm { deal, accepted, counters } => {
+                let known = |id: u8| usize::from(id) < DEALS;
+                ensure(known(deal) && counters.iter().flatten().all(|&c| known(c)), || "a deal not on the menu".into())?;
+                let offered = Deal::from_id(deal);
+                ensure(self.can_pay(self.current, offered.give), || "an offer of cards the offerer does not hold".into())?;
                 ensure(self.offers >= 1 && self.offers <= MAX_OFFERS, || "an offer beyond the limit".into())?;
-                if !matches!(self.phase, Phase::Offer { .. }) {
-                    ensure(given > 0 && wanted > 0, || "an empty offer proposed".into())?;
-                }
-                match self.phase {
-                    Phase::Respond { responder, accepted, .. } => {
+                let asked = match self.phase {
+                    Phase::Respond { responder, .. } => {
                         ensure(responder != self.current, || "the offerer answers their own offer".into())?;
                         let mut q = self.next(self.current);
                         let mut asked = 0u8;
@@ -307,15 +304,29 @@ impl State {
                             asked |= 1 << q.index();
                             q = self.next(q);
                         }
-                        ensure(accepted & !asked == 0, || "an acceptance from a player not yet asked".into())?;
+                        asked
                     }
-                    Phase::Confirm { accepted, .. } => {
-                        ensure(accepted != 0 && accepted >> self.current.index() & 1 == 0, || "no one to trade with".into())?;
-                        for p in self.others(self.current).filter(|p| accepted >> p.index() & 1 == 1) {
-                            ensure(self.can_pay(p, get), || format!("{p:?} accepted without the cards"))?;
-                        }
+                    _ => {
+                        let any = accepted != 0 || counters.iter().any(Option::is_some);
+                        ensure(any, || "no one to trade with".into())?;
+                        self.others(self.current).fold(0u8, |bits, p| bits | 1 << p.index())
                     }
-                    _ => {}
+                };
+                ensure(accepted & !asked == 0, || "an acceptance from a player not yet asked".into())?;
+                for (p, counter) in counters.iter().enumerate() {
+                    ensure(counter.is_none() || asked >> p & 1 == 1, || "a counter-offer from a player not yet asked".into())?;
+                }
+                for p in self.others(self.current) {
+                    let i = p.index();
+                    if accepted >> i & 1 == 1 {
+                        ensure(counters[i].is_none(), || format!("{p:?} both accepted and countered"))?;
+                        ensure(self.can_pay(p, offered.get), || format!("{p:?} accepted without the cards"))?;
+                    }
+                    if let Some(counter) = counters[i] {
+                        let counter = Deal::from_id(counter);
+                        ensure(counter != offered.reversed(), || format!("{p:?} countered with the same deal"))?;
+                        ensure(self.can_pay(p, counter.give), || format!("{p:?} countered with cards they do not hold"))?;
+                    }
                 }
             }
             _ => {}

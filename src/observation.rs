@@ -3,11 +3,11 @@ use crate::dev_card::{DevCard, DEV_CARDS};
 use crate::ids::{Hex, Vertex};
 use crate::player::{Player, MAX_PLAYERS};
 use crate::resource::Resource;
-use crate::state::{Phase, State};
+use crate::state::{Deal, Phase, State};
 
-pub const OBSERVATION_BYTES: usize = 314;
+pub const OBSERVATION_BYTES: usize = 344;
 
-pub const PHASES: [&str; 16] = [
+pub const PHASES: [&str; 15] = [
     "PlaceSettlement",
     "PlaceRoad",
     "Turn",
@@ -21,7 +21,6 @@ pub const PHASES: [&str; 16] = [
     "Monopoly",
     "Over",
     "ChooseVictim",
-    "Offer",
     "Respond",
     "Confirm",
 ];
@@ -106,21 +105,22 @@ pub fn observe(state: &State, observer: Player, out: &mut [u8; OBSERVATION_BYTES
         Phase::Monopoly { rolled } => (10, rolled, 0, none, none, none),
         Phase::Over { winner } => (11, false, 0, relative(winner), none, none),
         Phase::ChooseVictim { rolled } => (12, rolled, 0, none, none, none),
-        Phase::Offer { .. } => (13, true, 0, none, none, none),
-        Phase::Respond { responder, .. } => (14, true, 0, relative(responder), none, none),
-        Phase::Confirm { .. } => (15, true, 0, none, none, none),
+        Phase::Respond { responder, .. } => (13, true, 0, relative(responder), none, none),
+        Phase::Confirm { .. } => (14, true, 0, none, none, none),
     };
     put(&[kind, u8::from(rolled), count, player, vertex, from]);
 
-    let (give, get, accepted) = match state.phase() {
-        Phase::Offer { give, get } => (give, get, 0),
-        Phase::Respond { give, get, accepted, .. } | Phase::Confirm { give, get, accepted } => (give, get, accepted),
-        _ => ([0; 5], [0; 5], 0),
+    let (deal, accepted, counters) = match state.phase() {
+        Phase::Respond { deal, accepted, counters, .. } | Phase::Confirm { deal, accepted, counters } => (Some(deal), accepted, counters),
+        _ => (None, 0, [None; MAX_PLAYERS]),
     };
+    let sides = |deal: Option<u8>| deal.map_or([[0; 5]; 2], |id| [Deal::from_id(id).give, Deal::from_id(id).get]);
     let accepted_relative = (0..n).filter(|&p| accepted >> p & 1 == 1).fold(0u8, |bits, p| bits | 1 << relative(Player::new(p)));
-    put(&give);
-    put(&get);
+    put(&sides(deal).concat());
     put(&[accepted_relative, state.offers()]);
+    for s in 1..MAX_PLAYERS {
+        put(&sides(seat(s).and_then(|p| counters[p.index()])).concat());
+    }
     debug_assert_eq!(at, OBSERVATION_BYTES);
 }
 

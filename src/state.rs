@@ -3,7 +3,7 @@ mod rules;
 mod validate;
 
 pub use info::Hidden;
-pub use rules::{longest_road, Action, Chances, Invalid, Mask, Outcome, ACTIONS, WINNING_POINTS};
+pub use rules::{longest_road, Action, Chances, Deal, Invalid, Mask, Outcome, ACTIONS, DEALS, MASK_WORDS, MAX_OFFERS, WINNING_POINTS};
 pub use validate::Violation;
 
 use crate::board::Board;
@@ -59,20 +59,16 @@ pub enum Phase {
     Over { // end of game
         winner: Player,
     },
-    Offer { // the current player is building a trade offer, card by card
-        give: [u8; 5], // what they would give
-        get: [u8; 5], // what they want in return
-    },
-    Respond { // each other player in turn accepts or declines the offer
-        give: [u8; 5],
-        get: [u8; 5],
+    Respond { // each other player in turn accepts, declines, or counters the current player's deal
+        deal: u8, // which deal, as the current player gives and gets
         responder: Player, // who answers now
         accepted: u8, // bit p set: player p accepted
+        counters: [Option<u8>; MAX_PLAYERS], // the deal player p proposed instead, as p gives and gets
     },
-    Confirm { // the current player picks a partner among those who accepted, or cancels
-        give: [u8; 5],
-        get: [u8; 5],
+    Confirm { // the current player trades with one who accepted, takes a counter-offer, or cancels
+        deal: u8,
         accepted: u8,
+        counters: [Option<u8>; MAX_PLAYERS],
     },
 }
 

@@ -7,7 +7,7 @@ use crate::board::Board;
 use crate::observation::{observe, OBSERVATION_BYTES};
 use crate::player::Player;
 use crate::rng::Rng;
-use crate::state::{Action, Actor, Mask, Outcome, Phase, State, Violation};
+use crate::state::{Action, Actor, Mask, Outcome, Phase, State, Violation, MASK_WORDS};
 
 pub const CHECKPOINT_EVERY: u64 = 16;
 pub const PAD: u16 = u16::MAX;
@@ -172,7 +172,7 @@ impl Buffer {
     pub fn observe(
         &self,
         observations: &mut [[u8; OBSERVATION_BYTES]],
-        masks: &mut [[u64; 5]],
+        masks: &mut [[u64; MASK_WORDS]],
         players: &mut [Player],
     ) {
         let n = self.games.len();
@@ -218,7 +218,7 @@ impl Buffer {
         games: &[usize],
         times: &[u64],
         observations: &mut [[u8; OBSERVATION_BYTES]],
-        masks: &mut [[u64; 5]],
+        masks: &mut [[u64; MASK_WORDS]],
         players: &mut [Player],
     ) -> Result<(), Unavailable> {
         let n = games.len();

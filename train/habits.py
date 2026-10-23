@@ -13,13 +13,16 @@ KINDS = [("settlement", 0, 54), ("city", 54, 108), ("road", 108, 180), ("robber"
          ("resource pick", 199, 204), ("trade 2:1", 204, 224), ("trade 3:1", 224, 244), ("trade 4:1", 244, 264),
          ("roll", 264, 265), ("end turn", 265, 266), ("buy dev card", 266, 267), ("play knight", 267, 268),
          ("play road building", 268, 269), ("play year of plenty", 269, 270), ("play monopoly", 270, 271),
-         ("rob a player", 271, 274), ("offer a trade", 274, 275), ("offer: give a card", 275, 280),
-         ("offer: want a card", 280, 285), ("propose", 285, 286), ("cancel", 286, 287), ("accept an offer", 287, 288),
-         ("decline an offer", 288, 289), ("complete a trade", 289, 292)]
+         ("rob a player", 271, 274), ("offer a trade", 274, 504), ("accept an offer", 504, 505),
+         ("decline an offer", 505, 506), ("trade with an accepter", 506, 509), ("take a counter-offer", 509, 512),
+         ("cancel a trade", 512, 513), ("counter an offer", None, None)]
+PHASE_RESPOND = 13
 
 
-def kind(code):
-    return next(name for name, low, high in KINDS if low <= code < high)
+def kind(code, phase):
+    if 274 <= code < 504 and phase == PHASE_RESPOND:
+        return "counter an offer"
+    return next(name for name, low, high in KINDS if low is not None and low <= code < high)
 
 
 def main():
@@ -48,7 +51,7 @@ def main():
                 low, high = next((lo, hi) for n, lo, hi in KINDS if n == label)
                 offered[name][label] += bool(mask[low:high].any())
             code = int(agent(obs[None], mask[None])[0])
-            moves[name][kind(code)] += 1
+            moves[name][kind(code, obs[296])] += 1
             last[name] = obs
             game.step(code)
             game.settle()
@@ -62,7 +65,7 @@ def main():
     print(f"network wins {wins}/{n} ({wins / n:.0%}; fair share {1 / args.players:.0%})\n")
     print(f"{'per game':28s} {'network':>9s} {'each bot':>9s}")
     for label, *_ in KINDS:
-        if label in ("roll", "end turn", "resource pick", "propose", "cancel"):
+        if label in ("roll", "end turn", "resource pick"):
             continue
         print(f"{label:28s} {moves['network'][label] / n:9.2f} {moves['bot'][label] / bots:9.2f}")
     print()

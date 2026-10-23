@@ -11,7 +11,7 @@ use catan::observation::{observe, OBSERVATION_BYTES, PHASES};
 use catan::player::{Player, MAX_PLAYERS};
 use catan::resource::Resource;
 use catan::rng::Rng;
-use catan::state::{Action, Actor, Outcome, Phase, State, ACTIONS};
+use catan::state::{Action, Actor, Deal, Outcome, Phase, State, ACTIONS};
 use catan::topology::topology;
 
 type View = [u8; OBSERVATION_BYTES];
@@ -32,7 +32,7 @@ const SEA: Color32 = Color32::from_rgb(28, 45, 54);
 const CHANGED: Color32 = Color32::from_rgba_premultiplied(120, 95, 10, 90);
 const TERRAIN: [Terrain; 6] =
     [Terrain::Hills, Terrain::Forest, Terrain::Pasture, Terrain::Fields, Terrain::Mountains, Terrain::Desert];
-const BLOCKS: [(&str, u16, u16); 9] = [
+const BLOCKS: [(&str, u16, u16); 10] = [
     ("settlements", 0, 54),
     ("cities", 54, 108),
     ("roads", 108, 180),
@@ -41,7 +41,8 @@ const BLOCKS: [(&str, u16, u16); 9] = [
     ("trades", 204, 264),
     ("other", 264, 271),
     ("rob a player", 271, 274),
-    ("player trades", 274, ACTIONS as u16),
+    ("trade offers", 274, 504),
+    ("answers", 504, ACTIONS as u16),
 ];
 
 fn main() -> eframe::Result {
@@ -391,10 +392,12 @@ impl Viewer {
                 heading(ui, "Moves");
                 ui.colored_label(actor_color(actor), format!("{} is thinking…", actor_name(actor)));
             }
-            None if fresh_offer(&state) => self.offer_builder(ui),
             None => {
                 if let Some(code) = moves(ui, &state) {
                     self.take(code);
+                }
+                if state.legal_actions().iter().any(|a| matches!(a, Action::Deal(_))) {
+                    self.offer_builder(ui, &state);
                 }
             }
         }
@@ -404,12 +407,22 @@ impl Viewer {
         }
     }
 
-    fn offer_builder(&mut self, ui: &mut egui::Ui) {
-        heading(ui, "Build your offer");
+    fn offer_builder(&mut self, ui: &mut egui::Ui, state: &State) {
+        let countering = matches!(state.phase(), Phase::Respond { .. });
+        heading(ui, if countering { "Or counter with your own terms" } else { "Offer a trade" });
+        if let Phase::Respond { deal, .. } = state.phase() {
+            let offered = Deal::from_id(deal);
+            ui.label(format!(
+                "{:?} offered: you give {}, you get {}. Your counter below is from your side.",
+                state.current(),
+                bundle(offered.get),
+                bundle(offered.give)
+            ));
+        }
         egui::Grid::new("offer").num_columns(3).show(ui, |ui| {
             ui.label("");
             ui.strong("you give");
-            ui.strong("you want");
+            ui.strong("you get");
             ui.end_row();
             for resource in Resource::ALL {
                 let r = resource.index();
@@ -429,38 +442,21 @@ impl Viewer {
             }
         });
         let [give, get] = self.draft;
-        let ready = give.iter().sum::<u8>() > 0 && get.iter().sum::<u8>() > 0;
-        ui.horizontal(|ui| {
-            if ui.add_enabled(ready, egui::Button::new("Propose")).clicked() {
-                let mut codes: Vec<u16> = Vec::new();
-                for (side, action) in [(give, Action::Give as fn(Resource) -> Action), (get, Action::Want)] {
-                    for resource in Resource::ALL {
-                        codes.extend(std::iter::repeat_n(action(resource).index(), usize::from(side[resource.index()])));
-                    }
-                }
-                codes.push(Action::Propose.index());
-                let mut trial = self.state();
-                if codes.iter().all(|&c| trial.step(c).is_ok()) {
-                    self.branch();
-                    codes.iter().for_each(|&c| {
-                        self.push(c);
-                    });
-                    self.at = self.steps.len();
+        let legal = Deal { give, get }.id().map(Action::Deal).filter(|&a| state.legal_actions().contains(a));
+        if ui.button(if countering { "Counter" } else { "Propose" }).clicked() {
+            match legal {
+                Some(action) => {
                     self.draft = [[0; 5]; 2];
-                    self.refresh();
-                } else {
-                    self.message = Some("that offer is not allowed; see the rules below".into());
+                    self.take(action.index());
                 }
+                None => self.message = Some("that trade is not allowed; see the rules below".into()),
             }
-            if ui.button("Cancel").clicked() {
-                self.draft = [[0; 5]; 2];
-                self.take(Action::Cancel.index());
-            }
-        });
+        }
         ui.weak(
-            "At most 4 cards on each side; you must hold what you give; you cannot want what you give; \
-             no one can be asked for more cards than the largest other hand holds, \
-             or for more of a resource than the other players hold between them.",
+            "One or two cards on each side, never the same resource on both. You must hold what you give. \
+             You can only ask for cards someone might hold, judging from everything public: \
+             what they collected, built, traded and showed. \
+             A counter cannot simply reverse the offer: that is accepting it.",
         );
     }
 
@@ -713,12 +709,16 @@ fn moves(ui: &mut egui::Ui, state: &State) -> Option<u16> {
         }
         Some(Actor::Player(player)) => {
             let legal: Vec<Action> = state.legal_actions().iter().collect();
+            if let Phase::Confirm { accepted, counters, .. } = state.phase() {
+                answers(ui, state, accepted, counters);
+            }
             heading(ui, &format!("Moves for {player:?} · {} legal", legal.len()));
-            let (board, other): (Vec<Action>, Vec<Action>) = legal.into_iter().partition(|a| on_board(*a));
+            let (board, other): (Vec<Action>, Vec<Action>) =
+                legal.into_iter().filter(|a| !matches!(a, Action::Deal(_))).partition(|a| on_board(*a));
             let mut buttons = |ui: &mut egui::Ui, actions: &[Action]| {
                 ui.horizontal_wrapped(|ui| {
                     for &a in actions {
-                        if ui.button(format!("{}  #{}", action_label(a), a.index())).clicked() {
+                        if ui.button(format!("{}  #{}", step_label(state, a.index()), a.index())).clicked() {
                             chosen = Some(a.index());
                         }
                     }
@@ -740,15 +740,32 @@ fn moves(ui: &mut egui::Ui, state: &State) -> Option<u16> {
     chosen
 }
 
-fn fresh_offer(state: &State) -> bool {
-    matches!(state.phase(), Phase::Offer { give, get } if give == [0; 5] && get == [0; 5])
-}
-
 fn public(state: &State, human: Player) -> bool {
     match state.phase() {
         Phase::Steal { victim, .. } => state.current() == human || victim == human,
         Phase::Draw => state.current() == human,
         _ => true,
+    }
+}
+
+fn answers(ui: &mut egui::Ui, state: &State, accepted: u8, counters: [Option<u8>; MAX_PLAYERS]) {
+    heading(ui, "Answers to the offer");
+    let proposer = state.current();
+    for other in state.others(proposer) {
+        let answer = match counters[other.index()] {
+            Some(id) => {
+                let deal = Deal::from_id(id);
+                let affordable = if state.hand(proposer).iter().zip(deal.get).all(|(&held, n)| held >= n) {
+                    ""
+                } else {
+                    " (you do not hold that)"
+                };
+                format!("counters: you would give {}, you would get {}{affordable}", bundle(deal.get), bundle(deal.give))
+            }
+            None if accepted >> other.index() & 1 == 1 => "accepts".into(),
+            None => "declines".into(),
+        };
+        ui.colored_label(PLAYERS[other.index()], format!("{other:?} {answer}"));
     }
 }
 
@@ -1002,6 +1019,10 @@ fn decode(b: &View) -> Vec<(String, usize, usize, String)> {
     row("offer: wants", 307, 5, resources(307));
     row("offer: accepted by", 312, 1, join((0..players).filter(|s| b[312] >> s & 1 == 1).map(|s| SEATS[s].to_string()).collect()));
     row("offers this turn", 313, 1, b[313].to_string());
+    for s in 1..MAX_PLAYERS {
+        let at = 314 + 10 * (s - 1);
+        row(&format!("counter from {}", SEATS[s]), at, 10, format!("gives {}, gets {}", resources(at), resources(at + 5)));
+    }
     rows
 }
 
@@ -1024,14 +1045,15 @@ fn action_label(action: Action) -> String {
         Action::PlayYearOfPlenty => "play year of plenty".into(),
         Action::PlayMonopoly => "play monopoly".into(),
         Action::Rob(offset) => format!("rob player +{offset}"),
-        Action::Offer => "offer a trade".into(),
-        Action::Give(r) => format!("+1 {} to give", resource_name(r)),
-        Action::Want(r) => format!("+1 {} wanted", resource_name(r)),
-        Action::Propose => "propose the offer".into(),
-        Action::Cancel => "cancel".into(),
+        Action::Deal(id) => {
+            let deal = Deal::from_id(id);
+            format!("offer: gives {}, wants {}", bundle(deal.give), bundle(deal.get))
+        }
         Action::Accept => "accept the offer".into(),
         Action::Decline => "decline the offer".into(),
         Action::TradeWith(offset) => format!("trade with player +{offset}"),
+        Action::TakeCounter(offset) => format!("take player +{offset}'s counter-offer"),
+        Action::Cancel => "decline them all".into(),
     }
 }
 
@@ -1046,7 +1068,28 @@ fn outcome_label(outcome: Outcome) -> String {
 fn step_label(state: &State, code: u16) -> String {
     match state.actor() {
         Some(Actor::Chance) => state.outcome(code).map_or("?".into(), outcome_label),
-        _ => Action::from_index(code).map_or("?".into(), action_label),
+        _ => match (state.phase(), Action::from_index(code)) {
+            (Phase::Respond { deal, responder, .. }, Some(Action::Accept)) => {
+                let deal = Deal::from_id(deal);
+                format!("accept: {responder:?} gives {}, gets {}", bundle(deal.get), bundle(deal.give))
+            }
+            (Phase::Respond { responder, .. }, Some(Action::Deal(id))) => {
+                let deal = Deal::from_id(id);
+                let proposer = state.current();
+                format!("counter: {responder:?} gives {}, {proposer:?} gives {}", bundle(deal.give), bundle(deal.get))
+            }
+            (Phase::Confirm { counters, .. }, Some(Action::TakeCounter(offset))) => {
+                let partner = state.current().after(usize::from(offset), state.players());
+                let deal = Deal::from_id(counters[partner.index()].expect("a counter-offer"));
+                format!("take {partner:?}'s counter: you give {}, you get {}", bundle(deal.get), bundle(deal.give))
+            }
+            (Phase::Confirm { deal, .. }, Some(Action::TradeWith(offset))) => {
+                let partner = state.current().after(usize::from(offset), state.players());
+                let deal = Deal::from_id(deal);
+                format!("trade with {partner:?}: you give {}, you get {}", bundle(deal.give), bundle(deal.get))
+            }
+            (_, action) => action.map_or("?".into(), action_label),
+        },
     }
 }
 
@@ -1067,16 +1110,19 @@ fn phase_label(state: &State) -> String {
         Phase::YearOfPlenty { picks, .. } => format!("year of plenty: {picks} left"),
         Phase::Monopoly { .. } => "monopoly: name a resource".into(),
         Phase::Over { winner } => format!("over: {winner:?} wins"),
-        Phase::Offer { give, get } => format!("{proposer:?} is building an offer: gives {}, wants {}", bundle(give), bundle(get)),
-        Phase::Respond { give, get, responder, .. } => format!(
-            "{proposer:?} offers {} for {}: does {responder:?} accept (giving {} to get {})?",
-            bundle(give),
-            bundle(get),
-            bundle(get),
-            bundle(give)
-        ),
-        Phase::Confirm { give, get, .. } => {
-            format!("{proposer:?} chooses who to trade with: gives {}, gets {}", bundle(give), bundle(get))
+        Phase::Respond { deal, responder, .. } => {
+            let Deal { give, get } = Deal::from_id(deal);
+            format!(
+                "{proposer:?} offers to give {} for {}: {responder:?} accepts (gives {}, gets {}), declines, or counters",
+                bundle(give),
+                bundle(get),
+                bundle(get),
+                bundle(give)
+            )
+        }
+        Phase::Confirm { deal, .. } => {
+            let Deal { give, get } = Deal::from_id(deal);
+            format!("{proposer:?} trades {} for {} with someone who accepted, takes a counter-offer, or cancels", bundle(give), bundle(get))
         }
     }
 }

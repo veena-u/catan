@@ -701,7 +701,7 @@ fn random_games_of_every_size_follow_the_rules_and_hide_what_they_should() {
         let mut won = 0;
         for game in 0..40 {
             let mut state = game_of(1000 + game, players);
-            for step in 0..4000 {
+            for step in 0..10_000 {
                 state.validate().unwrap_or_else(|v| panic!("{players} players, game {game}, step {step}: {v}"));
                 let Some(actor) = state.actor() else {
                     won += 1;
@@ -736,58 +736,74 @@ fn a_player_given_the_longest_road_off_their_turn_wins_when_their_turn_comes() {
     assert_eq!(state.phase, Phase::Over { winner: Player::Third });
 }
 
-fn offer_paths(state: State, paths: &mut Vec<([u8; 5], [u8; 5])>) {
-    match state.phase {
-        Phase::Offer { give, get } => {
-            if state.legal_actions().contains(Action::Propose) {
-                paths.push((give, get));
-            }
-            for action in state.legal_actions().iter().filter(|a| matches!(a, Action::Give(_) | Action::Want(_))) {
-                let mut next = state;
-                next.transition(action);
-                offer_paths(next, paths);
-            }
-        }
-        _ => unreachable!(),
+fn deal(give: [u8; 5], get: [u8; 5]) -> Action {
+    Action::Deal(Deal { give, get }.id().expect("on the menu"))
+}
+
+fn deals(state: &State) -> Vec<Deal> {
+    state.legal_actions().iter().filter_map(|a| if let Action::Deal(id) = a { Some(Deal::from_id(id)) } else { None }).collect()
+}
+
+#[test]
+fn the_menu_holds_every_trade_of_one_or_two_cards_a_side_once() {
+    let menu = Deal::all();
+    assert_eq!(menu.len(), DEALS);
+    assert_eq!(menu.iter().copied().collect::<HashSet<_>>().len(), DEALS, "a deal listed twice");
+    for (id, &d) in menu.iter().enumerate() {
+        assert_eq!(d.id(), Some(id as u8));
+        assert!((1..=2).contains(&d.give.iter().sum::<u8>()) && (1..=2).contains(&d.get.iter().sum::<u8>()));
+        assert!((0..5).all(|r| d.give[r] == 0 || d.get[r] == 0), "a resource on both sides");
+        assert!(d.reversed().id().is_some());
     }
 }
 
 #[test]
-fn each_offer_is_built_by_exactly_one_path_from_cards_the_offerer_holds() {
-    let mut state = scenario_of(24, 3);
-    state.hands = seats(&[[2, 0, 1, 0, 0], [0, 4, 0, 4, 0], [0, 0, 4, 0, 4]]);
-    state.transition(Action::Offer);
-    let mut paths = Vec::new();
-    offer_paths(state, &mut paths);
-    let distinct: HashSet<_> = paths.iter().copied().collect();
-    assert_eq!(distinct.len(), paths.len(), "an offer reached twice");
-    for (give, get) in &paths {
-        assert!((0..5).all(|r| give[r] <= state.hands[0][r]), "{give:?} is more than the hand");
-        assert!((0..5).all(|r| give[r] == 0 || get[r] == 0), "a resource on both sides");
-        assert!(give.iter().sum::<u8>() >= 1 && get.iter().sum::<u8>() >= 1);
-        assert!(get.iter().sum::<u8>() <= MAX_OFFER_CARDS);
+fn a_player_offers_only_deals_they_can_pay_for_and_others_could_accept() {
+    let mut state = scenario_of(27, 3);
+    state.hands = seats(&[[2, 0, 1, 0, 0], [0, 1, 0, 0, 0], [0, 1, 0, 0, 2]]);
+    let offered = deals(&state);
+    assert!(!offered.is_empty());
+    for d in &offered {
+        assert!((0..5).all(|r| d.give[r] <= state.hands[0][r]), "{d:?} gives more than the hand");
+        assert!(d.get[3] == 0, "no one else can hold grain: {d:?}");
+        assert!(d.get.iter().sum::<u8>() <= 3, "no hand is bigger than three cards");
     }
-    let gives: HashSet<[u8; 5]> = paths.iter().map(|&(g, _)| g).collect();
-    assert_eq!(gives.len(), 5, "every non-empty part of [2, 0, 1, 0, 0]: 1 or 2 brick, with or without the wool, or the wool alone");
+    assert!(offered.contains(&Deal { give: [2, 0, 0, 0, 0], get: [0, 1, 0, 0, 1] }));
+    state.offers = MAX_OFFERS;
+    assert!(deals(&state).is_empty(), "{MAX_OFFERS} offers a turn");
+}
+
+#[test]
+fn no_one_is_asked_for_cards_everyone_can_see_they_lack() {
+    let mut state = scenario_of(27, 3);
+    state.hands = seats(&[[2, 0, 0, 0, 0], [0, 2, 0, 0, 0], [0, 0, 1, 1, 0]]);
+    state.known[0][1] = [0, 2, 0, 0, 0];
+    state.known[0][2] = [0, 0, 1, 0, 0];
+    state.known[1][0] = [2, 0, 0, 0, 0];
+    let wanted: HashSet<[u8; 5]> = deals(&state).iter().map(|d| d.get).collect();
+    assert!(wanted.contains(&[0, 2, 0, 0, 0]), "the second player is known to hold two lumber");
+    assert!(wanted.contains(&[0, 0, 1, 1, 0]), "the third player's unknown card could be grain");
+    assert!(!wanted.contains(&[0, 0, 0, 0, 1]), "every ore is in the bank");
+    assert!(!wanted.contains(&[0, 1, 1, 0, 0]), "no one could hold both lumber and wool");
+    assert!(!wanted.contains(&[0, 0, 0, 1, 1]), "the third holds only one unknown card");
+    state.transition(deal([1, 0, 0, 0, 0], [0, 1, 0, 0, 0]));
+    let countered: HashSet<[u8; 5]> = deals(&state).iter().map(|d| d.get).collect();
+    assert!(countered.iter().all(|get| get[0] == get.iter().sum::<u8>()), "everyone can see the first player holds only brick");
 }
 
 #[test]
 fn an_accepted_offer_trades_with_the_chosen_partner_and_everyone_sees_it() {
     let mut state = scenario_of(25, 4);
     state.hands = seats(&[[2, 0, 0, 0, 0], [0, 0, 0, 0, 1], [0; 5], [0, 0, 0, 0, 3]]);
-    state.transition(Action::Offer);
-    for action in [Action::Give(Resource::Brick), Action::Give(Resource::Brick), Action::Want(Resource::Ore), Action::Propose] {
-        assert!(state.legal_actions().contains(action), "{action:?}");
-        state.transition(action);
-    }
-    assert!(matches!(state.phase, Phase::Respond { responder: Player::Second, .. }));
+    state.transition(deal([2, 0, 0, 0, 0], [0, 0, 0, 0, 1]));
+    assert_eq!(state.known(Player::Third, Player::First)[0], 2, "offering shows you hold the brick");
     assert_eq!(state.actor(), Some(Actor::Player(Player::Second)));
     state.transition(Action::Accept);
     assert_eq!(state.known(Player::Third, Player::Second)[4], 1, "accepting shows you hold the ore");
-    assert_eq!(state.legal_actions().iter().collect::<Vec<_>>(), [Action::Decline], "the third player has no ore");
+    assert_eq!(state.legal_actions().iter().collect::<Vec<_>>(), [Action::Decline], "the third player has nothing to accept or counter with");
     state.transition(Action::Decline);
     state.transition(Action::Accept);
-    assert_eq!(state.legal_actions().iter().collect::<Vec<_>>(), [Action::Cancel, Action::TradeWith(1), Action::TradeWith(3)]);
+    assert_eq!(state.legal_actions().iter().collect::<Vec<_>>(), [Action::TradeWith(1), Action::TradeWith(3), Action::Cancel]);
     state.transition(Action::TradeWith(3));
     assert_eq!(state.hands, seats(&[[0, 0, 0, 0, 1], [0, 0, 0, 0, 1], [0; 5], [2, 0, 0, 0, 2]]));
     assert_eq!(state.phase, Phase::Turn { rolled: true });
@@ -796,36 +812,33 @@ fn an_accepted_offer_trades_with_the_chosen_partner_and_everyone_sees_it() {
 }
 
 #[test]
-fn offers_are_limited_per_turn_and_a_refused_offer_changes_nothing() {
-    let mut state = scenario_of(26, 2);
-    state.hands = seats(&[[1, 0, 0, 0, 0], [0; 5]]);
-    for _ in 0..MAX_OFFERS {
-        assert!(state.legal_actions().contains(Action::Offer));
-        state.transition(Action::Offer);
-        state.transition(Action::Give(Resource::Brick));
-        state.transition(Action::Want(Resource::Ore));
-        state.transition(Action::Propose);
-        assert_eq!(state.legal_actions().iter().collect::<Vec<_>>(), [Action::Decline], "no ore to accept with");
-        state.transition(Action::Decline);
-        assert_eq!(state.phase, Phase::Turn { rolled: true });
-    }
-    assert!(!state.legal_actions().contains(Action::Offer), "{MAX_OFFERS} offers a turn");
-    assert_eq!(state.hands[0], [1, 0, 0, 0, 0]);
-    state.transition(Action::EndTurn);
-    assert_eq!(state.offers, 0);
+fn a_counter_offer_can_be_taken_instead() {
+    let mut state = scenario_of(25, 3);
+    state.hands = seats(&[[1, 0, 0, 1, 0], [0, 2, 0, 0, 0], [0, 0, 0, 0, 1]]);
+    state.transition(deal([1, 0, 0, 0, 0], [0, 1, 0, 0, 0]));
+    let counters = deals(&state);
+    assert!(!counters.contains(&Deal { give: [0, 1, 0, 0, 0], get: [1, 0, 0, 0, 0] }), "countering with the same deal is accepting");
+    assert!(counters.iter().all(|d| d.give[1] == d.give.iter().sum::<u8>()), "the second player holds only lumber");
+    let counter = Deal { give: [0, 1, 0, 0, 0], get: [0, 0, 0, 1, 0] };
+    state.transition(deal(counter.give, counter.get));
+    assert_eq!(state.known(Player::Third, Player::Second)[1], 1, "countering shows you hold what you give");
+    state.transition(Action::Decline);
+    assert!(matches!(state.phase, Phase::Confirm { .. }));
+    state.validate().unwrap();
+    assert_eq!(state.legal_actions().iter().collect::<Vec<_>>(), [Action::TakeCounter(1), Action::Cancel]);
+    state.transition(Action::TakeCounter(1));
+    assert_eq!(state.hands, seats(&[[1, 1, 0, 0, 0], [0, 1, 0, 1, 0], [0, 0, 0, 0, 1]]));
+    state.validate().unwrap();
 }
 
 #[test]
-fn an_offer_never_asks_for_more_than_the_other_players_could_hold() {
-    let mut state = scenario_of(27, 3);
-    state.hands = seats(&[[2, 0, 0, 0, 0], [0, 1, 0, 0, 0], [0, 1, 0, 0, 2]]);
-    state.transition(Action::Offer);
-    state.transition(Action::Give(Resource::Brick));
-    state.transition(Action::Want(Resource::Lumber));
-    assert!(state.legal_actions().contains(Action::Want(Resource::Lumber)), "two lumber are out there");
-    state.transition(Action::Want(Resource::Lumber));
-    let wants: Vec<Action> = state.legal_actions().iter().filter(|a| matches!(a, Action::Want(_))).collect();
-    assert_eq!(wants, [Action::Want(Resource::Ore)], "no third lumber exists, and ore is the only other resource held");
-    state.transition(Action::Want(Resource::Ore));
-    assert!(!state.legal_actions().iter().any(|a| matches!(a, Action::Want(_))), "no hand is bigger than three cards");
+fn a_refused_offer_changes_nothing_but_the_count() {
+    let mut state = scenario_of(26, 2);
+    state.hands = seats(&[[1, 0, 0, 0, 0], [0, 1, 0, 0, 0]]);
+    state.transition(deal([1, 0, 0, 0, 0], [0, 1, 0, 0, 0]));
+    state.transition(Action::Decline);
+    assert_eq!(state.phase, Phase::Turn { rolled: true });
+    assert_eq!((state.hands[0], state.offers), ([1, 0, 0, 0, 0], 1));
+    state.transition(Action::EndTurn);
+    assert_eq!(state.offers, 0);
 }

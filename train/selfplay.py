@@ -18,6 +18,7 @@ from .model import Tokens, device
 from .search import Search
 
 HIDDEN = (SEATS - 1) * 10
+TRADED = np.isin(KINDS, (17, 18))
 DICE_SUMS = 11
 
 KIND_MATRIX = torch.from_numpy(np.eye(KIND_COUNT, dtype=np.float32)[KINDS])
@@ -138,7 +139,7 @@ class Rollout:
         rolls = torch.zeros(rounds, n, DICE_SUMS, device=at)
         done, ends = torch.zeros(rounds, n, dtype=torch.bool, device=at), torch.zeros(rounds, n, SEATS, device=at)
         rolled, expected = torch.zeros(rounds, n, dtype=torch.bool, device=at), torch.zeros(rounds, n, SEATS, device=at)
-        stats = {"won": 0, "truncated": 0, "first_won": 0, "searched": 0, "changed": 0}
+        stats = {"won": 0, "truncated": 0, "first_won": 0, "searched": 0, "changed": 0, "trades": 0}
         expert = []
 
         for t in range(rounds):
@@ -154,7 +155,9 @@ class Rollout:
             dist, v = self.evaluate(obs[t], masks[t], hidden[t] if self.privileged else None)
             a = dist.sample()
             actions[t], log_probs[t], values[t] = a, dist.log_prob(a), to_absolute(v, actors[t], self.players)
-            endings = self.buffer.step(a.cpu().numpy())
+            chosen = a.cpu().numpy()
+            stats["trades"] += int(TRADED[chosen].sum())
+            endings = self.buffer.step(chosen)
             rolls[t] = self.tensor(self.buffer.rolls().astype(np.float32))
             if self.average_dice:
                 games, value = self.expected_after_roll()
@@ -350,10 +353,19 @@ def main():
     say(f"{sum(p.numel() for p in model.parameters()) / 1e6:.2f}M parameters on {at}; "
         f"{args.games} games × {args.rounds} decisions = {args.games * args.rounds} per update")
 
-    decisions = 0
-    previous = None
+    decisions, first, previous = 0, 1, None
+    if (out / "latest.pt").exists():
+        saved = torch.load(out / "latest.pt", map_location=at)
+        model.load_state_dict(saved["model"])
+        critics.load_state_dict(saved["critics"])
+        if "optimizer" in saved:
+            optimizer.load_state_dict(saved["optimizer"])
+        first = saved["iteration"] + 1
+        decisions = saved["iteration"] * args.games * args.rounds
+        previous = copy.deepcopy(model).eval()
+        say(f"resuming after iteration {saved['iteration']}")
     start = time.time()
-    for iteration in range(1, args.iterations + 1):
+    for iteration in range(first, args.iterations + 1):
         model.eval()
         clock = time.time()
         batch, values, scoring, stats = rollout.collect(args.rounds)
@@ -373,6 +385,7 @@ def main():
         finished = stats["won"] + stats["truncated"]
         line = (f"iter {iteration:4d}  {decisions / 1e6:6.2f}M decisions  {time.time() - start:6.0f}s  "
                 f"games {finished:5d} ({stats['truncated']} cut)  first seat wins {stats['first_won'] / max(stats['won'], 1):.2f}  "
+                f"trades per 1k decisions {1000 * stats['trades'] / (args.games * args.rounds):.1f}  "
                 f"value {logs['value']:.3f}  kl→magnet {logs['kl_magnet']:.3f}  approx_kl {logs['approx_kl']:.4f}  "
                 f"clipped {logs['clipped']:.2f}  kept {logs['kept']:.2f}  lr {args.lr * scale:.1e}  "
                 f"play {collect_time:.1f}s learn {update_time:.1f}s")
@@ -390,7 +403,8 @@ def main():
                 result = play(player, opponent, games=args.eval_games, parallel=min(args.eval_games, 512),
                               seed=10_000 + iteration, players=args.players)
                 line += f"  vs {name} {result['win_rate']:.3f}"
-            checkpoint = {"model": model.state_dict(), "critics": critics.state_dict(), "args": vars(args), "iteration": iteration}
+            checkpoint = {"model": model.state_dict(), "critics": critics.state_dict(), "optimizer": optimizer.state_dict(),
+                          "args": vars(args), "iteration": iteration}
             torch.save(checkpoint, out / f"iter_{iteration:05d}.pt")
             torch.save(checkpoint, out / "latest.pt")
             previous = copy.deepcopy(model).eval()
