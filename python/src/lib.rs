@@ -83,6 +83,17 @@ impl Buffer {
         Ok(Worlds { inner: worlds })
     }
 
+    /// Each game's victory points by seat, hidden cards included (n, MAX_PLAYERS); seats past the player count are 0.
+    fn points<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<u8>> {
+        let rows: Vec<Vec<u8>> = (0..self.inner.len())
+            .map(|game| {
+                let state = self.inner.state(game);
+                (0..MAX_PLAYERS).map(|s| if s < state.players() { state.victory_points(Player::new(s)) } else { 0 }).collect()
+            })
+            .collect();
+        PyArray2::from_vec2(py, &rows).expect("rows of MAX_PLAYERS")
+    }
+
     fn rolls<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<u8>> {
         let n = self.inner.len();
         let mut counts = vec![vec![0u8; 11]; n];

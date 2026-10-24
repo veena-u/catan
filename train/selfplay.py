@@ -83,12 +83,13 @@ class Critics(nn.Module):
 
 class Rollout:
     def __init__(self, model, critics, buffer, at, autocast, players, average_dice=False, privileged=False,
-                 search=None, expert_games=0, expert_every=1, expert_scale=0.1, seed=0):
+                 search=None, expert_games=0, expert_every=1, expert_scale=0.1, seed=0, vp_reward=0.0):
         self.model, self.critics, self.buffer, self.at, self.autocast = model, critics, buffer, at, autocast
         self.games, self.players = len(buffer), players
         self.average_dice, self.privileged = average_dice, privileged
         self.search, self.expert_games, self.expert_every, self.expert_scale = search, expert_games, expert_every, expert_scale
         self.rng = np.random.default_rng(seed)
+        self.vp_reward = vp_reward
         buffer.track_dice(average_dice)
 
     def expert(self, o, m, p):
@@ -145,6 +146,7 @@ class Rollout:
         hidden = torch.zeros(rounds, n, SEATS - 1, 10, dtype=torch.uint8, device=at)
         rolls = torch.zeros(rounds, n, DICE_SUMS, device=at)
         done, ends = torch.zeros(rounds, n, dtype=torch.bool, device=at), torch.zeros(rounds, n, SEATS, device=at)
+        progress = torch.zeros(rounds, n, SEATS, device=at)
         rolled, expected = torch.zeros(rounds, n, dtype=torch.bool, device=at), torch.zeros(rounds, n, SEATS, device=at)
         stats = {"won": 0, "truncated": 0, "first_won": 0, "searched": 0, "changed": 0, "trades": 0}
         expert = []
@@ -164,7 +166,9 @@ class Rollout:
             actions[t], log_probs[t], values[t] = a, dist.log_prob(a), to_absolute(v, actors[t], self.players)
             chosen = a.cpu().numpy()
             stats["trades"] += int(TRADED[chosen].sum())
+            before = self.buffer.points()
             endings = self.buffer.step(chosen)
+            progress[t] = self.tensor((self.buffer.points().astype(np.float32) - before))
             rolls[t] = self.tensor(self.buffer.rolls().astype(np.float32))
             if self.average_dice:
                 games, value = self.expected_after_roll()
@@ -189,7 +193,8 @@ class Rollout:
         batch = dict(obs=obs, masks=masks, actions=actions, log_probs=log_probs, actors=actors, hidden=hidden, future=future)
         if expert:
             batch["expert"] = tuple(torch.cat(part) for part in zip(*expert))
-        return batch, values, (done, ends, rolled, expected, last), stats
+        shaped = self.vp_reward * relative(progress, self.players) * (~done)[..., None]
+        return batch, values, (done, ends, rolled, expected, last, shaped), stats
 
 
 def upcoming(rolls, done, decay=0.9):
@@ -209,13 +214,22 @@ def sync(at):
         torch.mps.synchronize()
 
 
-def advantages(values, done, ends, rolled, expected, last, lam):
+def relative(gains, players):
+    """Each seat's gain minus the average gain of the other seats, so progress rewards sum to zero."""
+    gains = gains[..., :players]
+    others = (gains.sum(-1, keepdim=True) - gains) / (players - 1)
+    out = torch.zeros(*gains.shape[:-1], SEATS, device=gains.device)
+    out[..., :players] = gains - others
+    return out
+
+
+def advantages(values, done, ends, rolled, expected, last, shaped, lam):
     result = torch.zeros_like(values)
     following = torch.zeros_like(last)
     for t in reversed(range(values.shape[0])):
         next_values = last if t == values.shape[0] - 1 else values[t + 1]
         target = torch.where(rolled[t, :, None], expected[t], next_values)
-        delta = torch.where(done[t, :, None], ends[t] - values[t], target - values[t])
+        delta = torch.where(done[t, :, None], ends[t] - values[t], shaped[t] + target - values[t])
         following = torch.where(done[t, :, None], delta, delta + lam * following)
         result[t] = following
     return result
@@ -323,7 +337,9 @@ def main():
     parser.add_argument("--expert-scale", type=float, default=0.1, help="how far search may move the target from the network")
     parser.add_argument("--save-every", type=int, default=250, help="keep a numbered checkpoint every this many iterations")
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
-    parser.add_argument("--max-decisions", type=int, default=5000)
+    parser.add_argument("--max-decisions", type=int, default=3000, help="training games are cut off (a loss for all) after this many")
+    parser.add_argument("--vp-reward", type=float, default=0.03,
+                        help="reward each victory point gained relative to the other players at once; 0 rewards winning alone")
     parser.add_argument("--eval-every", type=int, default=10)
     parser.add_argument("--eval-games", type=int, default=512)
     parser.add_argument("--seed", type=int, default=0)
@@ -345,7 +361,7 @@ def main():
     if args.expert:
         search = Search(model, at, args.expert_candidates, args.expert_samples, args.expert_depth, seed=args.seed)
     rollout = Rollout(model, critics, buffer, at, autocast, args.players, args.average_dice, args.privileged,
-                      search, args.expert_games, args.expert_every, args.expert_scale, args.seed)
+                      search, args.expert_games, args.expert_every, args.expert_scale, args.seed, args.vp_reward)
     log = open(out / "log.txt", "a")
 
     def say(line):
