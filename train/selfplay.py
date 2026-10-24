@@ -57,9 +57,12 @@ def to_relative(absolute, actors, players):
 
 
 def rewards(winner, players, seats=SEATS):
+    """+1 to the winner and -1/(players-1) to everyone else. A game cut off without a winner is a loss for everyone,
+    so stalling is never as good as playing to win."""
     reward = torch.zeros(seats)
     reward[:players] = -1.0 / (players - 1)
-    reward[winner] = 1.0
+    if winner is not None:
+        reward[winner] = 1.0
     return reward
 
 
@@ -167,20 +170,14 @@ class Rollout:
                 games, value = self.expected_after_roll()
                 if value is not None:
                     rolled[t, games], expected[t, games] = True, value
-            truncated = []
-            for game, winner, time_ in endings:
+            for game, winner, _ in endings:
                 done[t, game] = True
+                ends[t, game] = rewards(winner, self.players).to(at)
                 if winner is None:
-                    truncated.append((game, time_))
                     stats["truncated"] += 1
                 else:
-                    ends[t, game] = rewards(winner, self.players).to(at)
                     stats["won"] += 1
                     stats["first_won"] += winner == 0
-            if truncated:
-                games, times = zip(*truncated)
-                o, _, q = self.buffer.observe_at(list(games), list(times))
-                ends[t, list(games)] = self.value(self.tensor(o), self.tensor(q, np.int64))
 
         o, m, p = self.buffer.observe()
         if self.privileged:
