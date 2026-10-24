@@ -317,6 +317,8 @@ def main():
     parser.add_argument("--players", type=int, default=4, help="players per game, 2 to 4")
     parser.add_argument("--rounds", type=int, default=64, help="decisions per game between updates")
     parser.add_argument("--iterations", type=int, default=500)
+    parser.add_argument("--entities", action="store_true",
+                        help="one token per player, and trades scored from what they give and get")
     parser.add_argument("--width", type=int, default=128)
     parser.add_argument("--depth", type=int, default=4)
     parser.add_argument("--lr", type=float, default=3e-4)
@@ -354,6 +356,8 @@ def main():
     parser.add_argument("--bot-games", type=float, default=0.25,
                         help="share of training games with the hand-written bot in two seats; only the network's own moves are learned from")
     parser.add_argument("--max-decisions", type=int, default=3000, help="training games are cut off (a loss for all) after this many")
+    parser.add_argument("--vp-fade", type=float, default=0,
+                        help="fade the victory-point reward linearly to nothing over this many iterations, so later only winning counts; 0 keeps it")
     parser.add_argument("--vp-reward", type=float, default=0.03,
                         help="reward each victory point gained relative to the other players at once; 0 rewards winning alone")
     parser.add_argument("--eval-every", type=int, default=10)
@@ -369,7 +373,7 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     (out / "args.json").write_text(json.dumps(vars(args), indent=2))
 
-    model = Tokens(args.width, args.depth).to(at)
+    model = Tokens(args.width, args.depth, entities=args.entities).to(at)
     critics = Critics(args.width).to(at)
     optimizer = torch.optim.AdamW([*model.parameters(), *critics.parameters()], lr=args.lr)
     buffer = catan.Buffer(args.games, history=64, max_decisions=args.max_decisions, seed=args.seed, players=args.players)
@@ -403,6 +407,7 @@ def main():
     for iteration in range(first, args.iterations + 1):
         model.eval()
         clock = time.time()
+        rollout.vp_reward = args.vp_reward * max(0.0, 1 - (iteration - 1) / args.vp_fade) if args.vp_fade else args.vp_reward
         batch, values, scoring, stats = rollout.collect(args.rounds)
         sync(at)
         collect_time, clock = time.time() - clock, time.time()

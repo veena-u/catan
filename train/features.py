@@ -117,6 +117,63 @@ def decode(obs, symmetry=None):
     return hexes, vertices, edges, globals_
 
 
+PLAYER_FEATURES = 34
+
+
+def players(obs):
+    """One row per seat, me first, the same features for everyone: (n, SEATS, PLAYER_FEATURES)."""
+    o = obs.long()
+    n, seat = len(o), torch.arange(SEATS, device=obs.device)
+    others = lambda at, step: torch.stack([o[:, at + step * k] for k in range(SEATS - 1)], 1)
+    others_cards = torch.stack([o[:, 232 + 7 * k:237 + 7 * k] for k in range(SEATS - 1)], 1)
+    mine = o[:, 222:227] + o[:, 227:232]
+    cards = torch.cat([mine[:, None], others_cards], 1)
+    size = torch.cat([mine.sum(1, keepdim=True), others(237, 7)], 1)
+    aside = torch.cat([o[:, 227:232].sum(1, keepdim=True), others(238, 7)], 1)
+    devs = torch.cat([o[:, 258:263].sum(1, keepdim=True), others(268, 2)], 1)
+    bought = torch.cat([o[:, 263:268].sum(1, keepdim=True), others(269, 2)], 1)
+    my_devs = torch.zeros(n, SEATS, 5, device=obs.device)
+    my_devs[:, 0] = o[:, 258:263].float()
+    counters = torch.zeros(n, SEATS, 10, device=obs.device)
+    counters[:, 1:] = o[:, 314:344].view(n, SEATS - 1, 10).float()
+    flag = lambda column, value: (o[:, column:column + 1] == value).float()
+    rows = [
+        (seat == 0).float().expand(n, SEATS)[..., None],
+        seats_present(obs)[..., None],
+        cards.float() / 10,
+        size[..., None].float() / 10,
+        aside[..., None].float() / 10,
+        devs[..., None].float() / 5,
+        my_devs / 5,
+        bought[..., None].float(),
+        o[:, 280:284, None].float() / 5,
+        o[:, 284:288, None].float() / 15,
+        o[:, 288:292, None].float() / 10,
+        flag(294, seat)[..., None],
+        flag(292, seat + 1)[..., None],
+        flag(293, seat + 1)[..., None],
+        ((o[:, 312:313] >> seat) & 1).float()[..., None],
+        counters / 2,
+        flag(299, seat)[..., None],
+    ]
+    return torch.cat(rows, -1)
+
+
+def entity_relations():
+    """The board's relations with four player tokens placed right after the summary token."""
+    base, p = relations(), SEATS
+    kinds = torch.full((TOKENS + p, TOKENS + p), 8, dtype=torch.long)
+    kinds[0, 0] = base[0, 0]
+    kinds[0, 1 + p:], kinds[1 + p:, 0], kinds[1 + p:, 1 + p:] = base[0, 1:], base[1:, 0], base[1:, 1:]
+    kinds[0, 1:1 + p] = kinds[1:1 + p, 0] = 1
+    kinds[1:1 + p, 1:1 + p] = 7
+    kinds[torch.arange(TOKENS + p), torch.arange(TOKENS + p)] = 6
+    return kinds
+
+
+ENTITY_RELATIONS = 9
+
+
 def flat(obs, symmetry=None):
     hexes, vertices, edges, globals_ = decode(obs, symmetry)
     return torch.cat([hexes.flatten(1), vertices.flatten(1), edges.flatten(1), globals_], -1)
