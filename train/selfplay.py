@@ -304,6 +304,8 @@ def main():
     parser.add_argument("--anneal-power", type=float, default=0.0,
                         help="shrink the learning rate and magnet weight as (1 + iteration / anneal-steps) ** -power; 0 is off")
     parser.add_argument("--anneal-steps", type=float, default=20.0)
+    parser.add_argument("--magnet-anneal-steps", type=float, default=None,
+                        help="shrink the magnet weight on its own schedule; defaults to --anneal-steps")
     parser.add_argument("--keep", type=float, default=1.0,
                         help="train the policy only on this fraction of moves, those with the largest advantage magnitude")
     parser.add_argument("--average-dice", action="store_true",
@@ -378,10 +380,11 @@ def main():
         adv = advantages(values, *scoring, args.lam)
         returns = adv + values
         scale = (1 + (iteration - 1) / args.anneal_steps) ** -args.anneal_power
+        pull = (1 + (iteration - 1) / (args.magnet_anneal_steps or args.anneal_steps)) ** -args.anneal_power
         for group in optimizer.param_groups:
             group["lr"] = args.lr * scale
         model.train()
-        logs = update(model, critics, optimizer, batch, adv, returns, args.players, args, autocast, args.magnet * scale)
+        logs = update(model, critics, optimizer, batch, adv, returns, args.players, args, autocast, args.magnet * pull)
         sync(at)
         update_time = time.time() - clock
         decisions += args.games * args.rounds

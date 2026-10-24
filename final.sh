@@ -15,7 +15,7 @@ FLAGS=${FLAGS:-""}
 ITERATIONS=${ITERATIONS:-6000}
 SEED=${SEED:-0}
 SIZE=${SIZE:-"--width 192 --depth 6"}
-BASE="--games 2048 --rounds 64 --minibatch 2048 --eval-every 50 --save-every 250 --anneal-power 0.5 --anneal-steps 200 --players $PLAYERS $SIZE"
+BASE="--games 2048 --rounds 64 --minibatch 2048 --eval-every 50 --save-every 250 --anneal-power 0.5 --anneal-steps 200 --magnet-anneal-steps 20 --players $PLAYERS $SIZE"
 RUN=runs/$NAME
 
 once() {
