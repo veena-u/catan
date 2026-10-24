@@ -83,13 +83,16 @@ class Critics(nn.Module):
 
 class Rollout:
     def __init__(self, model, critics, buffer, at, autocast, players, average_dice=False, privileged=False,
-                 search=None, expert_games=0, expert_every=1, expert_scale=0.1, seed=0, vp_reward=0.0):
+                 search=None, expert_games=0, expert_every=1, expert_scale=0.1, seed=0, vp_reward=0.0, bot_games=0.0):
         self.model, self.critics, self.buffer, self.at, self.autocast = model, critics, buffer, at, autocast
         self.games, self.players = len(buffer), players
         self.average_dice, self.privileged = average_dice, privileged
         self.search, self.expert_games, self.expert_every, self.expert_scale = search, expert_games, expert_every, expert_scale
         self.rng = np.random.default_rng(seed)
         self.vp_reward = vp_reward
+        self.bot = Bot()
+        mixed = np.arange(self.games) < round(bot_games * self.games)
+        self.bot_seats = mixed[:, None] & ((np.arange(SEATS)[None, :] + np.arange(self.games)[:, None]) % 2 == 0)
         buffer.track_dice(average_dice)
 
     def expert(self, o, m, p):
@@ -148,7 +151,9 @@ class Rollout:
         done, ends = torch.zeros(rounds, n, dtype=torch.bool, device=at), torch.zeros(rounds, n, SEATS, device=at)
         progress = torch.zeros(rounds, n, SEATS, device=at)
         rolled, expected = torch.zeros(rounds, n, dtype=torch.bool, device=at), torch.zeros(rounds, n, SEATS, device=at)
-        stats = {"won": 0, "truncated": 0, "first_won": 0, "searched": 0, "changed": 0, "trades": 0}
+        stats = {"won": 0, "truncated": 0, "first_won": 0, "searched": 0, "changed": 0, "trades": 0,
+                 "mixed": 0, "mixed_network_won": 0}
+        learn = torch.ones(rounds, n, dtype=torch.bool, device=at)
         expert = []
 
         for t in range(rounds):
@@ -165,6 +170,11 @@ class Rollout:
             a = dist.sample()
             actions[t], log_probs[t], values[t] = a, dist.log_prob(a), to_absolute(v, actors[t], self.players)
             chosen = a.cpu().numpy()
+            bot_turn = self.bot_seats[np.arange(n), p]
+            if bot_turn.any():
+                chosen[bot_turn] = self.bot(o[bot_turn], m[bot_turn])
+                actions[t] = self.tensor(chosen, np.int64)
+                learn[t] = self.tensor(~bot_turn)
             stats["trades"] += int(TRADED[chosen].sum())
             before = self.buffer.points()
             endings = self.buffer.step(chosen)
@@ -182,6 +192,9 @@ class Rollout:
                 else:
                     stats["won"] += 1
                     stats["first_won"] += winner == 0
+                if self.bot_seats[game].any():
+                    stats["mixed"] += 1
+                    stats["mixed_network_won"] += winner is not None and not self.bot_seats[game, winner]
 
         o, m, p = self.buffer.observe()
         if self.privileged:
@@ -190,7 +203,8 @@ class Rollout:
         else:
             last = self.value(self.tensor(o), self.tensor(p, np.int64))
         future = upcoming(rolls, done)
-        batch = dict(obs=obs, masks=masks, actions=actions, log_probs=log_probs, actors=actors, hidden=hidden, future=future)
+        batch = dict(obs=obs, masks=masks, actions=actions, log_probs=log_probs, actors=actors, hidden=hidden, future=future,
+                     learn=learn)
         if expert:
             batch["expert"] = tuple(torch.cat(part) for part in zip(*expert))
         shaped = self.vp_reward * relative(progress, self.players) * (~done)[..., None]
@@ -266,11 +280,11 @@ def update(model, critics, optimizer, batch, adv, returns, players, args, autoca
                 baseline = critics.with_future(summary, flat["future"][pick])
                 value_loss = value_loss + nn.functional.mse_loss(baseline[:, seats], target[:, seats])
                 a = target[:, 0] - baseline[:, 0].detach()
-            kept = informative[pick]
+            kept = informative[pick] & flat["learn"][pick]
             ratio, a = ratio[kept], a[kept]
             a = (a - a.mean()) / (a.std() + 1e-8)
             policy_loss = -torch.min(ratio * a, ratio.clamp(1 - args.clip, 1 + args.clip) * a).mean()
-            magnet = kl_to_magnet(log_probs, masks).mean()
+            magnet = kl_to_magnet(log_probs, masks)[flat["learn"][pick]].mean()
             loss = policy_loss + args.value_coef * value_loss + magnet_weight * magnet
             if expert is not None:
                 e_obs, e_masks, e_target = expert
@@ -337,6 +351,8 @@ def main():
     parser.add_argument("--expert-scale", type=float, default=0.1, help="how far search may move the target from the network")
     parser.add_argument("--save-every", type=int, default=250, help="keep a numbered checkpoint every this many iterations")
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
+    parser.add_argument("--bot-games", type=float, default=0.25,
+                        help="share of training games with the hand-written bot in two seats; only the network's own moves are learned from")
     parser.add_argument("--max-decisions", type=int, default=3000, help="training games are cut off (a loss for all) after this many")
     parser.add_argument("--vp-reward", type=float, default=0.03,
                         help="reward each victory point gained relative to the other players at once; 0 rewards winning alone")
@@ -361,7 +377,7 @@ def main():
     if args.expert:
         search = Search(model, at, args.expert_candidates, args.expert_samples, args.expert_depth, seed=args.seed)
     rollout = Rollout(model, critics, buffer, at, autocast, args.players, args.average_dice, args.privileged,
-                      search, args.expert_games, args.expert_every, args.expert_scale, args.seed, args.vp_reward)
+                      search, args.expert_games, args.expert_every, args.expert_scale, args.seed, args.vp_reward, args.bot_games)
     log = open(out / "log.txt", "a")
 
     def say(line):
@@ -406,6 +422,7 @@ def main():
         line = (f"iter {iteration:4d}  {decisions / 1e6:6.2f}M decisions  {time.time() - start:6.0f}s  "
                 f"games {finished:5d} ({stats['truncated']} cut)  first seat wins {stats['first_won'] / max(stats['won'], 1):.2f}  "
                 f"trades per 1k decisions {1000 * stats['trades'] / (args.games * args.rounds):.1f}  "
+                f"network seats win vs bots {stats['mixed_network_won'] / max(stats['mixed'], 1):.2f} (fair 0.50)  "
                 f"value {logs['value']:.3f}  kl→magnet {logs['kl_magnet']:.3f}  approx_kl {logs['approx_kl']:.4f}  "
                 f"clipped {logs['clipped']:.2f}  kept {logs['kept']:.2f}  lr {args.lr * scale:.1e}  "
                 f"play {collect_time:.1f}s learn {update_time:.1f}s")
