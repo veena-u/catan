@@ -8,7 +8,7 @@ import catan
 
 from .agents import Network, Random
 from .insight import card_values, forecast
-from .model import Tokens, device, load
+from .model import Tokens, device, grown, load
 from .search import Search, search_game
 from .selfplay import SEATS, advantages, improved_policy, relative, rewards, to_absolute, to_relative
 
@@ -100,6 +100,26 @@ def check_search_training():
     print("search training and planning tools: all checks passed")
 
 
+def check_growing_a_network():
+    """An older network that read fewer inputs loads with the new inputs at zero weight, so it plays exactly as before."""
+    torch.manual_seed(0)
+    model = Tokens(32, 1, entities=True).eval()
+    older = {k: (v[:, :162].clone() if k == "embed.0.weight" else v.clone()) for k, v in model.state_dict().items()}
+    fitted, grew = grown(older, model)
+    model.load_state_dict(fitted)
+    buffer, agent = catan.Buffer(8, seed=1), Random(0, kinds=True)
+    for _ in range(300):
+        obs, masks, _ = buffer.observe()
+        buffer.step(agent(obs, masks))
+    obs = torch.from_numpy(buffer.observe()[0])
+    noisy = obs.clone()
+    noisy[:, 344:357] = torch.randint(0, 3, noisy[:, 344:357].shape).to(torch.uint8)
+    with torch.no_grad():
+        (l1, v1, _), (l2, v2, _) = model(obs), model(noisy)
+    assert grew and torch.allclose(l1, l2) and torch.allclose(v1, v2), "new inputs start with no effect"
+    print("growing a network: all checks passed")
+
+
 @torch.no_grad()
 def check_values(path, games, positions, seed=0, steps=20_000):
     """Does the network's value head pick the eventual winner more often than chance, and more so near the end?"""
@@ -139,6 +159,7 @@ def main():
     args = parser.parse_args()
     check_learning_math()
     check_search_training()
+    check_growing_a_network()
     if args.checkpoint:
         check_values(args.checkpoint, args.games, args.positions)
 

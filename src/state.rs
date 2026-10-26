@@ -72,6 +72,15 @@ pub enum Phase {
     },
 }
 
+/// How the current player's latest offer this turn ended. Offers are public, so everyone remembers this.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct LastOffer {
+    pub deal: u8, // which deal, as the current player gives and gets
+    pub accepted: u8, // bit p set: player p accepted
+    pub countered: u8, // bit p set: player p countered
+    pub traded: bool, // whether a trade came of it
+}
+
 type PerPlayer<T> = [T; MAX_PLAYERS];
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -91,6 +100,7 @@ pub struct State { // most fields are indexed by player; seats past `players` st
     bought: [u8; 5],
     card_played: bool,
     offers: u8, // trade offers made this turn
+    last_offer: Option<LastOffer>, // how the latest of them ended
     knights: PerPlayer<u8>,
     longest_road: Option<Player>,
     largest_army: Option<Player>,
@@ -117,6 +127,7 @@ impl State {
             bought: [0; 5],
             card_played: false,
             offers: 0,
+            last_offer: None,
             knights: [0; MAX_PLAYERS],
             longest_road: None,
             largest_army: None,
@@ -223,6 +234,10 @@ impl State {
 
     pub fn card_played(&self) -> bool {
         self.card_played
+    }
+
+    pub fn last_offer(&self) -> Option<LastOffer> {
+        self.last_offer
     }
 
     pub fn offers(&self) -> u8 {

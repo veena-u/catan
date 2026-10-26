@@ -1308,6 +1308,11 @@ fn decode(b: &View) -> Vec<(String, usize, usize, String)> {
         let at = 314 + 10 * (s - 1);
         row(&format!("counter from {}", SEATS[s]), at, 10, format!("gives {}, gets {}", resources(at), resources(at + 5)));
     }
+    let who = |bits: u8| join((0..players).filter(|s| bits >> s & 1 == 1).map(|s| SEATS[s].to_string()).collect());
+    row("last offer this turn", 344, 10, format!("gives {}, gets {}", resources(344), resources(349)));
+    row("last offer: accepted by", 354, 1, who(b[354]));
+    row("last offer: countered by", 355, 1, who(b[355]));
+    row("last offer: traded", 356, 1, flag(b[356]));
     rows
 }
 

@@ -845,6 +845,35 @@ fn a_counter_gives_some_of_what_was_asked_for() {
 }
 
 #[test]
+fn everyone_remembers_how_this_turns_last_offer_ended() {
+    let mut state = scenario_of(26, 3);
+    state.hands = seats(&[[6, 0, 0, 0, 0], [0, 0, 0, 0, 1], [0; 5]]);
+    let offer = Deal { give: [1, 0, 0, 0, 0], get: [0, 0, 0, 0, 1] };
+    state.transition(deal(offer.give, offer.get));
+    state.transition(Action::Decline);
+    state.transition(Action::Decline);
+    let declined = state.last_offer().expect("the offer is remembered");
+    assert_eq!((Deal::from_id(declined.deal), declined.accepted, declined.countered, declined.traded), (offer, 0, 0, false));
+    let mut seen = [0; OBSERVATION_BYTES];
+    observe(&state, Player::Second, &mut seen);
+    assert_eq!(&seen[344..354], &[1, 0, 0, 0, 0, 0, 0, 0, 0, 1], "the other players see it too");
+    state.validate().unwrap();
+
+    state.transition(deal(offer.give, offer.get));
+    state.transition(Action::Accept);
+    state.transition(Action::Decline);
+    state.transition(Action::TradeWith(1));
+    let traded = state.last_offer().unwrap();
+    assert_eq!((traded.accepted, traded.traded), (0b010, true));
+    observe(&state, Player::Third, &mut seen);
+    assert_eq!(seen[354], 1 << 2, "Second accepted, two seats after Third");
+    state.validate().unwrap();
+
+    state.transition(Action::EndTurn);
+    assert_eq!(state.last_offer(), None, "a new turn starts with a clean slate");
+}
+
+#[test]
 fn a_refused_offer_changes_nothing_but_the_count() {
     let mut state = scenario_of(26, 2);
     state.hands = seats(&[[1, 0, 0, 0, 0], [0, 1, 0, 0, 0]]);

@@ -9,7 +9,7 @@ TOKENS = 1 + HEXES + VERTICES + EDGES
 HEX_FEATURES = 6 + 13 + 1 + 1 + 2 * SEATS
 VERTEX_FEATURES = 2 * SEATS + 7 + 1 + 5 + 2 * SEATS + SEATS
 EDGE_FEATURES = SEATS + 2 * SEATS + SEATS
-GLOBAL_FEATURES = 162
+GLOBAL_FEATURES = 181
 FLAT_FEATURES = HEXES * HEX_FEATURES + VERTICES * VERTEX_FEATURES + EDGES * EDGE_FEATURES + GLOBAL_FEATURES
 
 NONE = 255
@@ -108,6 +108,10 @@ def decode(obs, symmetry=None):
         bits(obs, 312, 1, SEATS),
         obs[:, 313:314].float() / 3,
         obs[:, 314:344].float() / 2,
+        obs[:, 344:354].float() / 2,
+        bits(obs, 354, 1, SEATS),
+        bits(obs, 355, 1, SEATS),
+        obs[:, 356:357].float(),
     ], -1)
     if symmetry is not None:
         hex_inverse, vertex_inverse, edge_inverse, _ = symmetry_tables(obs.device)

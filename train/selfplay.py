@@ -14,7 +14,7 @@ from .agents import KIND_COUNT, KINDS, Network, Random
 from .bot import Bot
 from .evaluate import play
 from .features import SEATS, SYMMETRIES
-from .model import Tokens, device, load
+from .model import Tokens, device, grown, load
 from .search import Search
 
 HIDDEN = (SEATS - 1) * 10
@@ -412,10 +412,13 @@ def main():
     decisions, first, previous = 0, 1, None
     if (out / "latest.pt").exists():
         saved = torch.load(out / "latest.pt", map_location=at)
-        model.load_state_dict(saved["model"])
+        weights, grew = grown(saved["model"], model)
+        model.load_state_dict(weights)
         critics.load_state_dict(saved["critics"])
-        if "optimizer" in saved:
+        if "optimizer" in saved and not grew:
             optimizer.load_state_dict(saved["optimizer"])
+        if grew:
+            say("the network reads new inputs; they start at zero weight, and the optimizer starts afresh")
         first = saved["iteration"] + 1
         decisions = saved["iteration"] * args.games * args.rounds
         previous = copy.deepcopy(model).eval()

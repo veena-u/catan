@@ -9,13 +9,14 @@ from .agents import Network
 from .bot import Bot
 from .model import device, load
 
+DEALS = catan.deals()
 KINDS = [("settlement", 0, 54), ("city", 54, 108), ("road", 108, 180), ("robber", 180, 199),
          ("resource pick", 199, 204), ("trade 2:1", 204, 224), ("trade 3:1", 224, 244), ("trade 4:1", 244, 264),
          ("roll", 264, 265), ("end turn", 265, 266), ("buy dev card", 266, 267), ("play knight", 267, 268),
          ("play road building", 268, 269), ("play year of plenty", 269, 270), ("play monopoly", 270, 271),
          ("rob a player", 271, 274), ("offer a trade", 274, 504), ("accept an offer", 504, 505),
          ("decline an offer", 505, 506), ("trade with an accepter", 506, 509), ("take a counter-offer", 509, 512),
-         ("cancel a trade", 512, 513), ("counter an offer", None, None)]
+         ("cancel a trade", 512, 513), ("counter an offer", None, None), ("repeat the last offer", None, None)]
 PHASE_RESPOND = 13
 
 
@@ -52,6 +53,8 @@ def main():
                 offered[name][label] += bool(mask[low:high].any())
             code = int(agent(obs[None], mask[None])[0])
             moves[name][kind(code, obs[296])] += 1
+            if 274 <= code < 504 and obs[296] == 2 and obs[313] > 0 and (DEALS[code - 274] == obs[344:354]).all():
+                moves[name]["repeat the last offer"] += 1
             last[name] = obs
             game.step(code)
             game.settle()

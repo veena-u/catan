@@ -5,13 +5,15 @@
 # the same command again resumes.
 #   start an arm (inside tmux):   ARM=plain bash experiment.sh      or      ARM=search bash experiment.sh
 #   search-turn imagines each future through every other player's turn, until the searcher moves again
+#   memory is plain training on rules that remember this turn's last offer; start it from a later network with
+#   START=runs/plain-latest.pt ARM=memory bash experiment.sh (the anchor stays the reference for every arm)
 #   see how the arms are doing:   bash experiment.sh status
 set -uo pipefail
 if [ -f /venv/main/bin/activate ]; then source /venv/main/bin/activate; fi
 cd "$(dirname "$0")"
 
 if [ "${1:-}" = status ]; then
-  for arm in plain search search-turn; do
+  for arm in plain search search-turn memory; do
     [ -f "runs/$arm.out" ] || continue
     echo "== $arm  (hours count from the latest start)"
     grep "(eval" "runs/$arm.out" | awk '{
@@ -34,14 +36,16 @@ case $ARM in
   plain) EXTRA="" ;;
   search) EXTRA="--expert" ;;
   search-turn) EXTRA="--expert --expert-depth 0 --expert-games 16" ;;
-  *) echo "ARM is plain, search or search-turn"; exit 1 ;;
+  memory) EXTRA="" ;;
+  *) echo "ARM is plain, search, search-turn or memory"; exit 1 ;;
 esac
+START=${START:-runs/anchor.pt}
 [ -f runs/anchor.pt ] || { echo "put the starting network at runs/anchor.pt first"; exit 1; }
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 python -m pip install --quiet ./python
 mkdir -p "runs/$ARM"
-[ -f "runs/$ARM/latest.pt" ] || cp runs/anchor.pt "runs/$ARM/latest.pt"
-echo "=== $ARM, continuing from runs/anchor.pt ($(date))" | tee -a "runs/$ARM.out"
+[ -f "runs/$ARM/latest.pt" ] || cp "$START" "runs/$ARM/latest.pt"
+echo "=== $ARM, continuing from $START ($(date))" | tee -a "runs/$ARM.out"
 SIZE=$(python -c "import torch; a = torch.load('runs/anchor.pt', map_location='cpu')['args']; \
 print(f\"--width {a['width']} --depth {a['depth']}\" + (' --entities' if a.get('entities') else ''))")
 python -u -m train.selfplay --games "${GAMES:-2048}" --rounds "${ROUNDS:-64}" --minibatch "${MINIBATCH:-4096}" \

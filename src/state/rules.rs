@@ -10,7 +10,7 @@ use crate::rng::Rng;
 use crate::symmetry::Symmetry;
 use crate::topology::topology;
 
-use super::{Actor, Phase, State};
+use super::{Actor, LastOffer, Phase, State};
 
 pub const ACTIONS: usize = 513;
 pub const MASK_WORDS: usize = ACTIONS.div_ceil(64);
@@ -582,25 +582,32 @@ impl State {
                 } else if accepted != 0 || counters.iter().any(Option::is_some) {
                     Phase::Confirm { deal, accepted, counters }
                 } else {
+                    self.last_offer = Some(LastOffer { deal, accepted: 0, countered: 0, traded: false });
                     Phase::Turn { rolled: true }
                 };
             }
-            (Phase::Confirm { deal, .. }, Action::TradeWith(offset)) => {
-                self.exchange(player, player.after(usize::from(offset), self.players()), Deal::from_id(deal));
+            (Phase::Confirm { deal, accepted, counters }, Action::TradeWith(_) | Action::TakeCounter(_) | Action::Cancel) => {
+                match action {
+                    Action::TradeWith(offset) => {
+                        self.exchange(player, player.after(usize::from(offset), self.players()), Deal::from_id(deal));
+                    }
+                    Action::TakeCounter(offset) => {
+                        let partner = player.after(usize::from(offset), self.players());
+                        let counter = counters[partner.index()].expect("a counter-offer to take");
+                        self.exchange(partner, player, Deal::from_id(counter));
+                    }
+                    _ => {}
+                }
+                let countered = counters.iter().enumerate().filter(|(_, c)| c.is_some()).fold(0u8, |bits, (p, _)| bits | 1 << p);
+                self.last_offer = Some(LastOffer { deal, accepted, countered, traded: action != Action::Cancel });
                 self.phase = Phase::Turn { rolled: true };
             }
-            (Phase::Confirm { counters, .. }, Action::TakeCounter(offset)) => {
-                let partner = player.after(usize::from(offset), self.players());
-                let counter = counters[partner.index()].expect("a counter-offer to take");
-                self.exchange(partner, player, Deal::from_id(counter));
-                self.phase = Phase::Turn { rolled: true };
-            }
-            (Phase::Confirm { .. }, Action::Cancel) => self.phase = Phase::Turn { rolled: true },
             (Phase::Turn { rolled: true }, Action::EndTurn) => {
                 self.current = self.next(player);
                 self.bought = [0; 5];
                 self.card_played = false;
                 self.offers = 0;
+                self.last_offer = None;
                 self.phase = Phase::Turn { rolled: false };
                 self.finish_if_won();
             }

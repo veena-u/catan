@@ -124,9 +124,23 @@ def device():
     return torch.device("cpu")
 
 
+def grown(saved, model):
+    """An older network's weights fitted to `model`, which may read more inputs: the new inputs get zero weights, so the
+    network behaves exactly as before until training teaches it to use them. Also says whether anything grew."""
+    own, fitted, grew = model.state_dict(), {}, False
+    for name, weights in saved.items():
+        target = own.get(name)
+        if target is not None and weights.dim() == 2 and weights.shape[0] == target.shape[0] and weights.shape[1] < target.shape[1]:
+            padded = torch.zeros_like(target)
+            padded[:, :weights.shape[1]] = weights
+            weights, grew = padded, True
+        fitted[name] = weights
+    return fitted, grew
+
+
 def load(path, at):
     checkpoint = torch.load(path, map_location=at)
     args = checkpoint["args"]
     model = Tokens(args["width"], args["depth"], entities=args.get("entities", False)).to(at)
-    model.load_state_dict(checkpoint["model"])
+    model.load_state_dict(grown(checkpoint["model"], model)[0])
     return model.eval()

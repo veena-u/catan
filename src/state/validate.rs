@@ -231,6 +231,10 @@ impl State {
         }
         ensure(!fresh_turn || bought == 0, || "cards bought before the roll".into())?;
         ensure(self.offers <= MAX_OFFERS, || "more offers than allowed".into())?;
+        if let Some(last) = self.last_offer {
+            ensure(self.offers >= 1 && usize::from(last.deal) < DEALS, || "a remembered offer that was never made".into())?;
+            ensure(last.accepted >> self.current.index() & 1 == 0, || "the offerer accepted their own offer".into())?;
+        }
         let before_roll = match self.phase {
             Phase::PlaceSettlement | Phase::PlaceRoad { .. } | Phase::Dice => true,
             Phase::Turn { rolled }

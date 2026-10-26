@@ -5,7 +5,7 @@ use crate::player::{Player, MAX_PLAYERS};
 use crate::resource::Resource;
 use crate::state::{Deal, Phase, State};
 
-pub const OBSERVATION_BYTES: usize = 344;
+pub const OBSERVATION_BYTES: usize = 357;
 
 pub const PHASES: [&str; 15] = [
     "PlaceSettlement",
@@ -121,6 +121,14 @@ pub fn observe(state: &State, observer: Player, out: &mut [u8; OBSERVATION_BYTES
     for s in 1..MAX_PLAYERS {
         put(&sides(seat(s).and_then(|p| counters[p.index()])).concat());
     }
+    let last = state.last_offer();
+    let relative_bits = |bits: u8| (0..n).filter(|&p| bits >> p & 1 == 1).fold(0u8, |acc, p| acc | 1 << relative(Player::new(p)));
+    put(&sides(last.map(|l| l.deal)).concat());
+    put(&[
+        last.map_or(0, |l| relative_bits(l.accepted)),
+        last.map_or(0, |l| relative_bits(l.countered)),
+        last.map_or(0, |l| u8::from(l.traded)),
+    ]);
     debug_assert_eq!(at, OBSERVATION_BYTES);
 }
 
