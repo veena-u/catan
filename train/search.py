@@ -38,38 +38,26 @@ class Search:
         logits, _ = self.evaluate(obs, masks)
         return torch.multinomial(logits.softmax(1), 1, generator=self.generator).squeeze(1).numpy()
 
-    def improve(self, obs, masks, buffer, games, players, gumbel=False):
-        """Search a few moves at each position: (choices, q, prior, value), where q is what search found each choice
-        worth, prior the network's log-probabilities for every move, and value its own estimate of the position.
-        The choices are the network's top moves, or with `gumbel` a sample of them without replacement."""
-        logits, values = self.evaluate(obs, masks)
-        prior = logits.log_softmax(1)
-        k = min(self.candidates, prior.shape[1])
-        noise = -torch.empty_like(prior).exponential_(generator=self.generator).log() if gumbel else 0.0
-        _, choices = (prior + noise).topk(k, dim=1)
-        top = prior.gather(1, choices)
-        valid = torch.isfinite(top)
-        rows, ranks = valid.nonzero(as_tuple=True)
-        pair_games = games[rows.numpy()]
-        pair_actions = choices[rows, ranks].numpy()
-
+    def imagine(self, obs, buffer, games, players, rows, actions):
+        """For each (position row, move) pair, play the move in `samples` re-dealt worlds, let the network play on for
+        `depth` decisions, and return the mover's average outcome."""
         self.seed += 1
         deals = None
         if self.belief is not None:
-            deals = self.belief.deals(np.repeat(obs[rows.numpy()], self.samples, axis=0), self.generator).reshape(-1)
-        worlds = buffer.worlds(pair_games, pair_actions, self.samples, self.seed, deals)
+            deals = self.belief.deals(np.repeat(obs[rows], self.samples, axis=0), self.generator).reshape(-1)
+        worlds = buffer.worlds(games[rows], actions, self.samples, self.seed, deals)
         for _ in range(self.depth):
             o, m, p = worlds.observe()
             live = p >= 0
             if not live.any():
                 break
-            actions = np.zeros(len(p), np.int64)
-            actions[live] = self.sample(o[live], m[live])
-            worlds.step(actions)
+            moves = np.zeros(len(p), np.int64)
+            moves[live] = self.sample(o[live], m[live])
+            worlds.step(moves)
 
         o, m, p = worlds.observe()
         live, winners = p >= 0, worlds.winners()
-        root = np.repeat(players[rows.numpy()], self.samples)
+        root = np.repeat(players[rows], self.samples)
         seats = int(obs[0, 221])
         value = np.zeros(len(p), np.float32)
         if live.any():
@@ -78,13 +66,37 @@ class Search:
             value[live] = v.numpy()[np.arange(len(offset)), offset]
         over = winners >= 0
         value[over] = np.where(winners[over] == root[over], 1.0, -1.0 / (seats - 1))
+        return torch.from_numpy(value.reshape(-1, self.samples).mean(1))
 
-        q = torch.full((len(obs), k), float("-inf"))
-        q[rows, ranks] = torch.from_numpy(value.reshape(-1, self.samples).mean(1))
-        return choices, q, prior, values[:, 0]
+    def improve(self, obs, masks, buffer, games, players, gumbel=False, rounds=1):
+        """Search a few moves at each position: (choices, q, prior, value, visits). q is what search found each choice
+        worth, prior the network's log-probabilities for every move, value its own estimate of the position, visits the
+        imagined games behind each q. The choices are the network's top moves, or with `gumbel` a sample of them
+        without replacement. With several `rounds`, each round searches the surviving choices again and keeps the
+        better half (sequential halving), so the best moves get the most imagined games."""
+        logits, values = self.evaluate(obs, masks)
+        prior = logits.log_softmax(1)
+        k = min(self.candidates, prior.shape[1])
+        noise = -torch.empty_like(prior).exponential_(generator=self.generator).log() if gumbel else torch.zeros_like(prior)
+        _, choices = (prior + noise).topk(k, dim=1)
+        top, kicked = prior.gather(1, choices), noise.gather(1, choices)
+        alive = torch.isfinite(top)
+        total, visits = torch.zeros(len(obs), k), torch.zeros(len(obs), k)
+        for round_ in range(rounds):
+            rows, ranks = alive.nonzero(as_tuple=True)
+            if len(rows) == 0:
+                break
+            total[rows, ranks] += self.samples * self.imagine(obs, buffer, games, players, rows.numpy(), choices[rows, ranks].numpy())
+            visits[rows, ranks] += self.samples
+            if round_ < rounds - 1:
+                score = (kicked + top + self.eta * total / visits.clamp(min=1)).masked_fill(~alive, float("-inf"))
+                keep = (alive.sum(1, keepdim=True) + 1) // 2
+                alive &= score.argsort(1, descending=True).argsort(1) < keep
+        q = torch.where(visits > 0, total / visits.clamp(min=1), torch.tensor(float("-inf")))
+        return choices, q, prior, values[:, 0], visits
 
     def __call__(self, obs, masks, buffer, games, players):
-        choices, q, prior, _ = self.improve(obs, masks, buffer, games, players)
+        choices, q, prior, _, _ = self.improve(obs, masks, buffer, games, players)
         best = (prior.gather(1, choices) + self.eta * q).argmax(1)
         return choices[torch.arange(len(obs)), best].numpy()
 

@@ -83,11 +83,13 @@ class Critics(nn.Module):
 
 class Rollout:
     def __init__(self, model, critics, buffer, at, autocast, players, average_dice=False, privileged=False,
-                 search=None, expert_games=0, expert_every=1, expert_scale=0.1, seed=0, vp_reward=0.0, bot_games=0.0):
+                 search=None, expert_games=0, expert_every=1, expert_scale=0.1, seed=0, vp_reward=0.0, bot_games=0.0,
+                 expert_rounds=1):
         self.model, self.critics, self.buffer, self.at, self.autocast = model, critics, buffer, at, autocast
         self.games, self.players = len(buffer), players
         self.average_dice, self.privileged = average_dice, privileged
         self.search, self.expert_games, self.expert_every, self.expert_scale = search, expert_games, expert_every, expert_scale
+        self.expert_rounds = expert_rounds
         self.rng = np.random.default_rng(seed)
         self.vp_reward = vp_reward
         self.bot = Bot()
@@ -103,10 +105,12 @@ class Rollout:
         games = self.rng.choice(choosing, min(self.expert_games, len(choosing)), replace=False)
         if len(games) == 0:
             return None
-        choices, q, prior, value = self.search.improve(o[games], m[games], self.buffer, games, p[games], gumbel=True)
+        choices, q, prior, value, visits = self.search.improve(o[games], m[games], self.buffer, games, p[games],
+                                                               gumbel=True, rounds=self.expert_rounds)
         completed = value[:, None].expand_as(prior).clone()
         completed.scatter_(1, choices, torch.where(torch.isfinite(q), q, value[:, None]))
-        target = (prior + self.expert_scale * (EXPERT_VISITS + self.search.samples) * completed).softmax(1)
+        scale = self.expert_scale * (EXPERT_VISITS + visits.max(1, keepdim=True).values)
+        target = (prior + scale * completed).softmax(1)
         changed = (target.argmax(1) != prior.argmax(1)).float().sum().item()
         return self.tensor(o[games]), self.tensor(m[games]), target.to(self.at), changed
 
@@ -331,6 +335,8 @@ def main():
     parser.add_argument("--anneal-power", type=float, default=0.0,
                         help="shrink the learning rate and magnet weight as (1 + iteration / anneal-steps) ** -power; 0 is off")
     parser.add_argument("--anneal-steps", type=float, default=20.0)
+    parser.add_argument("--magnet-floor", type=float, default=0.0,
+                        help="never let the magnet weight fall below this, so the policy keeps some exploration")
     parser.add_argument("--magnet-anneal-steps", type=float, default=None,
                         help="shrink the magnet weight on its own schedule; defaults to --anneal-steps")
     parser.add_argument("--keep", type=float, default=1.0,
@@ -344,7 +350,9 @@ def main():
                         help="score moves against a baseline that also knows the dice rolled next (ICLR 2019)")
     parser.add_argument("--expert", action="store_true",
                         help="expert iteration (Gumbel AlphaZero): search a few positions and also train the policy toward what search finds")
-    parser.add_argument("--expert-games", type=int, default=128, help="positions searched each time")
+    parser.add_argument("--expert-games", type=int, default=64, help="positions searched each time")
+    parser.add_argument("--expert-rounds", type=int, default=3,
+                        help="sequential halving: each round searches the surviving moves again and keeps the better half")
     parser.add_argument("--expert-every", type=int, default=8, help="search every this many rounds")
     parser.add_argument("--expert-weight", type=float, default=1.0)
     parser.add_argument("--expert-candidates", type=int, default=8, help="moves searched at each position")
@@ -381,7 +389,7 @@ def main():
     if args.expert:
         search = Search(model, at, args.expert_candidates, args.expert_samples, args.expert_depth, seed=args.seed)
     rollout = Rollout(model, critics, buffer, at, autocast, args.players, args.average_dice, args.privileged,
-                      search, args.expert_games, args.expert_every, args.expert_scale, args.seed, args.vp_reward, args.bot_games)
+                      search, args.expert_games, args.expert_every, args.expert_scale, args.seed, args.vp_reward, args.bot_games, args.expert_rounds)
     log = open(out / "log.txt", "a")
 
     def say(line):
@@ -418,7 +426,7 @@ def main():
         for group in optimizer.param_groups:
             group["lr"] = args.lr * scale
         model.train()
-        logs = update(model, critics, optimizer, batch, adv, returns, args.players, args, autocast, args.magnet * pull)
+        logs = update(model, critics, optimizer, batch, adv, returns, args.players, args, autocast, max(args.magnet * pull, args.magnet_floor))
         sync(at)
         update_time = time.time() - clock
         decisions += args.games * args.rounds
