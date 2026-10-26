@@ -15,7 +15,7 @@ use super::{Actor, Phase, State};
 pub const ACTIONS: usize = 513;
 pub const MASK_WORDS: usize = ACTIONS.div_ceil(64);
 
-pub const MAX_OFFERS: u8 = 3;
+pub const MAX_OFFERS: u8 = 2;
 pub const DEALS: usize = 230;
 
 pub const WINNING_POINTS: u8 = 10;
@@ -356,7 +356,7 @@ impl State {
                     mask.insert(Action::Accept);
                 }
                 mask.insert(Action::Decline);
-                self.insert_deals(&mut mask, responder, std::iter::once(player), Some(offered.reversed()));
+                self.insert_deals(&mut mask, responder, std::iter::once(player), Some(offered));
             }
             Phase::Confirm { accepted, counters, .. } => {
                 for offset in 1..self.players() {
@@ -699,7 +699,8 @@ impl State {
     }
 
     /// Every deal `asker` holds the cards for, asking only for what one of `holders` might hold as far as `asker` can tell.
-    fn insert_deals(&self, mask: &mut Mask, asker: Player, holders: impl Iterator<Item = Player>, except: Option<Deal>) {
+    /// When `answering` an offer, a counter must give some of what was asked for, and must not simply accept it.
+    fn insert_deals(&self, mask: &mut Mask, asker: Player, holders: impl Iterator<Item = Player>, answering: Option<Deal>) {
         let a = asker.index();
         let out_there: [u8; 5] =
             std::array::from_fn(|r| RESOURCE_CARDS - self.bank(Resource::ALL[r]) - self.hands[a][r] - self.set_aside[a][r]);
@@ -715,7 +716,7 @@ impl State {
         for (id, &deal) in Deal::all().iter().enumerate() {
             let asked = deal.get.iter().sum::<u8>();
             let possible = ceilings.iter().any(|(c, size)| asked <= *size && (0..5).all(|r| deal.get[r] <= c[r]));
-            if possible && Some(deal) != except && self.can_pay(asker, deal.give) {
+            if possible && answering.is_none_or(|offer| responsive(deal, offer)) && self.can_pay(asker, deal.give) {
                 mask.insert(Action::Deal(id as u8));
             }
         }
@@ -937,6 +938,10 @@ impl State {
             self.phase = Phase::Over { winner: self.current };
         }
     }
+}
+
+pub(super) fn responsive(counter: Deal, offer: Deal) -> bool {
+    counter != offer.reversed() && (0..5).any(|r| counter.give[r] > 0 && offer.get[r] > 0)
 }
 
 pub(super) fn award(holder: Option<Player>, counts: &[u8], least: u8) -> Option<Player> {

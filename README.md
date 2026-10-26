@@ -31,6 +31,7 @@ python -m train.search runs/anneal/latest.pt --bot   # does search (imagine hidd
 python -m train.belief runs/base/latest.pt   # learn to guess other players' hidden cards; then search --belief runs/belief/belief.pt
 python -m train.search runs/base/latest.pt --deep   # deep search: a tree over the player's own moves, vs the network and vs plain search
 cargo run --release --example viewer -- --play runs/base/latest.pt --seat 0   # play against the network in the viewer
+cargo run --release --example viewer -- --think runs/long-small/latest.pt   # step through games and see what the network thinks
 ```
 
 every command takes `--players` (default 4). for the long run, `NAME=long FLAGS="..." bash final.sh` trains 1500 iterations on the current rules and tests the result: habits, an Elo curve over its checkpoints, search and deep search. on a rented GPU, `bash overnight.sh` trains a 4-player baseline, then a belief network and search on top of it, then an expert-iteration run, then one run per idea (symmetry, future-dice baseline, privileged critic, dice averaging) and all of them together for twice as long, comparing each against `runs/base` as it goes and packing everything into `results-overnight.tar.gz`
@@ -56,6 +57,6 @@ more flags: `--anneal-power 0.5` shrinks the learning rate and magnet weight ove
 
 - setup snakes out and back (1-2-3-4-4-3-2-1); the second settlement earns its resources
 - a 7: everyone over 7 cards discards half, one card at a time in resource order, face down until all are done; then the robber moves and its mover picks whom to rob among exposed players with cards
-- player trades are whole deals from a menu of 230: one or two cards a side, never the same resource on both, asking only for cards someone might hold, judging from what is public (production, building, trades, cards shown). every other player in turn accepts, declines, or counters with a deal of their own from the same menu; the offerer trades with someone who accepted, takes a counter-offer, or cancels. offering, accepting and countering each show the cards you would give. at most 3 offers a turn
+- player trades are whole deals from a menu of 230: one or two cards a side, never the same resource on both, asking only for cards someone might hold, judging from what is public (production, building, trades, cards shown). every other player in turn accepts, declines, or counters with a deal of their own from the same menu that gives some of what was asked for; the offerer trades with someone who accepted, takes a counter-offer, or cancels. offering, accepting and countering each show the cards you would give. at most 2 offers a turn
 - hands are partly hidden with 3+ players: each player tracks a lower bound on every other hand (production, trades and monopolies are public; a steal between two others only shows that a card moved)
 - a player who reaches 10 points off their turn (e.g. given the longest road by someone else's settlement) wins when their turn comes

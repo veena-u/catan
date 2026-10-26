@@ -6,7 +6,7 @@ use crate::player::{Player, MAX_PLAYERS};
 use crate::resource::{Resource, RESOURCE_CARDS};
 use crate::topology::topology;
 
-use super::rules::{award, longest_road, Deal, DEALS, MAX_OFFERS};
+use super::rules::{award, longest_road, responsive, Deal, DEALS, MAX_OFFERS};
 use super::{Actor, Phase, State, WINNING_POINTS};
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -324,7 +324,7 @@ impl State {
                     }
                     if let Some(counter) = counters[i] {
                         let counter = Deal::from_id(counter);
-                        ensure(counter != offered.reversed(), || format!("{p:?} countered with the same deal"))?;
+                        ensure(responsive(counter, offered), || format!("{p:?} countered without giving any of what was asked"))?;
                         ensure(self.can_pay(p, counter.give), || format!("{p:?} countered with cards they do not hold"))?;
                     }
                 }

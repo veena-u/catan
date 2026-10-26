@@ -832,6 +832,19 @@ fn a_counter_offer_can_be_taken_instead() {
 }
 
 #[test]
+fn a_counter_gives_some_of_what_was_asked_for() {
+    let mut state = scenario_of(25, 3);
+    state.hands = seats(&[[1, 0, 1, 1, 0], [0, 2, 1, 0, 1], [0, 0, 0, 0, 1]]);
+    let offer = Deal { give: [1, 0, 0, 0, 0], get: [0, 1, 0, 0, 0] };
+    state.transition(deal(offer.give, offer.get));
+    let counters = deals(&state);
+    assert!(!counters.is_empty());
+    assert!(counters.iter().all(|d| d.give[1] > 0), "every counter gives lumber, which was asked for: {counters:?}");
+    assert!(counters.contains(&Deal { give: [0, 1, 0, 0, 0], get: [0, 0, 1, 0, 0] }), "lumber for wool instead of brick");
+    assert!(!counters.contains(&Deal { give: [0, 0, 1, 0, 0], get: [1, 0, 0, 0, 0] }), "wool for brick ignores the request");
+}
+
+#[test]
 fn a_refused_offer_changes_nothing_but_the_count() {
     let mut state = scenario_of(26, 2);
     state.hands = seats(&[[1, 0, 0, 0, 0], [0, 1, 0, 0, 0]]);

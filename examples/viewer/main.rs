@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -51,15 +52,18 @@ fn main() -> eframe::Result {
     let number = |name: &str, default: usize| flag(name).and_then(|v| v.parse().ok()).unwrap_or(default);
     let players = number("--players", 4).clamp(2, MAX_PLAYERS);
     let mut viewer = Viewer::new(number("--seed", 1) as u64, players);
-    if let Some(checkpoint) = flag("--play") {
+    if let Some(checkpoint) = flag("--play").or_else(|| flag("--think")) {
         let python = flag("--python").unwrap_or_else(|| "python".into());
-        let human = Player::new(number("--seat", 0).min(players - 1));
-        match Play::spawn(&python, &checkpoint, human, args.iter().any(|a| a == "--greedy")) {
-            Ok(play) => viewer.play = Some(play),
+        match Brain::spawn(&python, &checkpoint, args.iter().any(|a| a == "--greedy")) {
+            Ok(brain) => viewer.brain = Some(brain),
             Err(e) => {
                 eprintln!("could not start the network: {e}");
                 std::process::exit(1);
             }
+        }
+        if flag("--play").is_some() {
+            let human = Player::new(number("--seat", 0).min(players - 1));
+            viewer.play = Some(Play { human, peek: false, last: Instant::now() });
         }
     }
     let options = eframe::NativeOptions {
@@ -69,17 +73,28 @@ fn main() -> eframe::Result {
     eframe::run_native("Catan rules viewer", options, Box::new(|_| Ok(Box::new(viewer))))
 }
 
-struct Play {
+/// The network, answering in a Python process: a move to play, or what it thinks of a position.
+struct Brain {
     child: Child,
     input: ChildStdin,
     output: BufReader<ChildStdout>,
+}
+
+struct Play {
     human: Player,
     peek: bool,
     last: Instant,
 }
 
-impl Play {
-    fn spawn(python: &str, checkpoint: &str, human: Player, greedy: bool) -> Result<Play, String> {
+/// What the network thinks at one moment: each player's chance of winning, and its favourite moves for whoever acts.
+#[derive(Clone)]
+struct Thoughts {
+    chances: [f32; MAX_PLAYERS],
+    top: Vec<(u16, f32)>,
+}
+
+impl Brain {
+    fn spawn(python: &str, checkpoint: &str, greedy: bool) -> Result<Brain, String> {
         let mut child = Command::new(python)
             .args(["-u", "-m", "train.serve", checkpoint])
             .args(greedy.then_some("--greedy"))
@@ -94,24 +109,49 @@ impl Play {
         if line.trim() != "ready" {
             return Err("train.serve did not start; is the checkpoint path right?".into());
         }
-        Ok(Play { child, input, output, human, peek: false, last: Instant::now() })
+        Ok(Brain { child, input, output })
     }
 
-    fn ask(&mut self, seen: &View, legal: &[u16]) -> Option<u16> {
+    fn send(&mut self, prefix: &str, seen: &View, legal: &[u16]) -> Option<String> {
         let join = |values: Vec<String>| values.join(",");
         let line = format!(
-            "{};{}\n",
+            "{prefix}{};{}\n",
             join(seen.iter().map(u8::to_string).collect()),
             join(legal.iter().map(u16::to_string).collect())
         );
         self.input.write_all(line.as_bytes()).ok()?;
         let mut answer = String::new();
         self.output.read_line(&mut answer).ok()?;
-        answer.trim().parse().ok()
+        Some(answer.trim().to_string())
+    }
+
+    fn ask(&mut self, seen: &View, legal: &[u16]) -> Option<u16> {
+        self.send("", seen, legal)?.parse().ok()
+    }
+
+    fn think(&mut self, state: &State) -> Option<Thoughts> {
+        let Some(Actor::Player(actor)) = state.actor() else { return None };
+        let legal: Vec<u16> = state.legal_actions().iter().map(Action::index).collect();
+        let answer = self.send("?", &view(state, actor), &legal)?;
+        let (values, moves) = answer.split_once('|')?;
+        let values: Vec<f32> = values.split(',').filter_map(|v| v.parse().ok()).collect();
+        let n = state.players();
+        let mut chances = [0.0; MAX_PLAYERS];
+        for (k, &v) in values.iter().take(n).enumerate() {
+            chances[actor.after(k, n).index()] = ((3.0 * v + 1.0) / 4.0).max(0.0);
+        }
+        let total: f32 = chances.iter().sum();
+        chances.iter_mut().for_each(|c| *c /= total.max(1e-6));
+        let top = moves
+            .split(',')
+            .filter_map(|m| m.split_once(':'))
+            .filter_map(|(c, p)| Some((c.parse().ok()?, p.parse().ok()?)))
+            .collect();
+        Some(Thoughts { chances, top })
     }
 }
 
-impl Drop for Play {
+impl Drop for Brain {
     fn drop(&mut self) {
         let _ = self.child.kill();
     }
@@ -140,7 +180,11 @@ struct Viewer {
     leak_free: Vec<Option<bool>>,
     message: Option<String>,
     play: Option<Play>,
+    brain: Option<Brain>,
+    thoughts: HashMap<usize, Option<Thoughts>>,
+    timeline: bool,
     draft: [[u8; 5]; 2],
+    discard: [u8; 5],
 }
 
 impl Viewer {
@@ -161,7 +205,11 @@ impl Viewer {
             leak_free: Vec::new(),
             message: None,
             play: None,
+            brain: None,
+            thoughts: HashMap::new(),
+            timeline: false,
             draft: [[0; 5]; 2],
+            discard: [0; 5],
         };
         viewer.refresh();
         viewer
@@ -177,12 +225,12 @@ impl Viewer {
     }
 
     fn load(&mut self, seed: u64, players: usize, codes: &[u16]) {
-        let (show_ids, tab, mut play) = (self.show_ids, self.tab, self.play.take());
+        let (show_ids, tab, mut play, brain) = (self.show_ids, self.tab, self.play.take(), self.brain.take());
         if let Some(play) = play.as_mut() {
             play.human = Player::new(play.human.index().min(players - 1));
         }
         *self = Viewer::new(seed, players);
-        (self.show_ids, self.tab, self.play) = (show_ids, tab, play);
+        (self.show_ids, self.tab, self.play, self.brain) = (show_ids, tab, play, brain);
         for (i, &code) in codes.iter().enumerate() {
             if !self.push(code) {
                 self.message = Some(format!("step {i} (code {code}) is not legal there; stopped before it"));
@@ -213,6 +261,7 @@ impl Viewer {
     }
 
     fn branch(&mut self) {
+        self.thoughts.retain(|&at, _| at <= self.at);
         self.before = Some(self.views());
         self.steps.truncate(self.at);
         self.states.truncate(self.at + 1);
@@ -261,14 +310,13 @@ impl Viewer {
         let code = match state.actor() {
             Some(Actor::Chance) => state.sample_outcome(&mut self.rng).index(),
             Some(Actor::Player(p)) if p != human => {
-                let play = self.play.as_mut().expect("playing");
-                let waited = play.last.elapsed();
+                let waited = self.play.as_ref().expect("playing").last.elapsed();
                 if waited < PAUSE {
                     ctx.request_repaint_after(PAUSE - waited);
                     return;
                 }
                 let legal: Vec<u16> = state.legal_actions().iter().map(Action::index).collect();
-                match play.ask(&view(&state, p), &legal) {
+                match self.brain.as_mut().and_then(|brain| brain.ask(&view(&state, p), &legal)) {
                     Some(code) if legal.contains(&code) => code,
                     _ => {
                         let code = legal[self.rng.below(legal.len())];
@@ -392,6 +440,7 @@ impl Viewer {
                 heading(ui, "Moves");
                 ui.colored_label(actor_color(actor), format!("{} is thinking…", actor_name(actor)));
             }
+            None if matches!(state.phase(), Phase::Discard { .. }) => self.discard_picker(ui, &state),
             None => {
                 if let Some(code) = moves(ui, &state) {
                     self.take(code);
@@ -401,10 +450,127 @@ impl Viewer {
                 }
             }
         }
+        self.thoughts_panel(ui);
         players(ui, &state, self.hiding());
         if let Some(at) = self.history(ui) {
             self.seek(at);
         }
+    }
+
+    /// Whether the network's view at step `at` may be shown: always, unless playing without peeking and it is not your move.
+    fn may_think(&self, at: usize) -> bool {
+        match self.hiding() {
+            None => true,
+            Some(human) => self.states[at].actor() == Some(Actor::Player(human)),
+        }
+    }
+
+    fn thoughts_at(&mut self, at: usize) -> Option<Thoughts> {
+        if !self.thoughts.contains_key(&at) {
+            let state = self.states[at];
+            let thought = self.brain.as_mut().and_then(|brain| brain.think(&state));
+            self.thoughts.insert(at, thought);
+        }
+        self.thoughts[&at].clone()
+    }
+
+    fn thoughts_panel(&mut self, ui: &mut egui::Ui) {
+        if self.brain.is_none() {
+            return;
+        }
+        heading(ui, "What the network thinks");
+        let state = self.state();
+        match self.may_think(self.at).then(|| self.thoughts_at(self.at)).flatten() {
+            None => {
+                ui.weak("Shown on your moves while playing (tick peek for every move), and not for dice or other chance events.");
+            }
+            Some(thought) => {
+                for p in state.seats() {
+                    ui.horizontal(|ui| {
+                        ui.colored_label(PLAYERS[p.index()], format!("{p:?}"));
+                        ui.add(egui::ProgressBar::new(thought.chances[p.index()]).text(format!("{:.0}% to win", 100.0 * thought.chances[p.index()])));
+                    });
+                }
+                ui.label(format!("{} would choose among:", actor_name(state.actor())));
+                for &(code, p) in &thought.top {
+                    ui.horizontal(|ui| {
+                        ui.add_sized([60.0, 16.0], egui::ProgressBar::new(p));
+                        ui.label(format!("{:.0}%  {}", 100.0 * p, step_label(&state, code)));
+                    });
+                }
+            }
+        }
+        ui.checkbox(&mut self.timeline, "chart everyone's chances over the game");
+        if self.timeline {
+            self.chart(ui);
+        }
+    }
+
+    fn chart(&mut self, ui: &mut egui::Ui) {
+        let shown: Vec<usize> = (0..=self.steps.len()).filter(|&at| self.may_think(at)).collect();
+        let points: Vec<(usize, [f32; MAX_PLAYERS])> =
+            shown.into_iter().filter_map(|at| self.thoughts_at(at).map(|t| (at, t.chances))).collect();
+        let (response, painter) = ui.allocate_painter(Vec2::new(ui.available_width(), 140.0), Sense::click());
+        let rect = response.rect;
+        painter.rect_filled(rect, 4.0, ui.visuals().extreme_bg_color);
+        let last = self.steps.len().max(1) as f32;
+        let at = |step: usize, chance: f32| Pos2::new(rect.left() + rect.width() * step as f32 / last, rect.bottom() - rect.height() * chance);
+        painter.line_segment([at(0, 0.25), at(self.steps.len(), 0.25)], Stroke::new(1.0, Color32::GRAY));
+        for p in self.state().seats() {
+            let line: Vec<Pos2> = points.iter().map(|&(step, c)| at(step, c[p.index()])).collect();
+            painter.add(Shape::line(line, Stroke::new(1.5, PLAYERS[p.index()])));
+        }
+        let x = at(self.at, 0.0).x;
+        painter.line_segment([Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())], Stroke::new(1.0, ACCENT));
+        if let Some(pointer) = response.interact_pointer_pos().filter(|_| response.clicked()) {
+            let step = ((pointer.x - rect.left()) / rect.width() * last).round() as usize;
+            self.seek(step);
+        }
+        ui.weak("Each player's chance to win as the network sees it at each move; the grey line is an even 25%. Click to jump there.");
+    }
+
+    fn discard_picker(&mut self, ui: &mut egui::Ui, state: &State) {
+        let Phase::Discard { player, owed, .. } = state.phase() else { return };
+        let hand = state.hand(player);
+        heading(ui, &format!("{player:?} discards {owed} more"));
+        egui::Grid::new("discard").num_columns(3).show(ui, |ui| {
+            for resource in Resource::ALL {
+                let r = resource.index();
+                self.discard[r] = self.discard[r].min(hand[r]);
+                ui.colored_label(resource_color(resource), resource_name(resource));
+                ui.label(format!("hold {}", hand[r]));
+                ui.horizontal(|ui| {
+                    if ui.small_button("−").clicked() {
+                        self.discard[r] = self.discard[r].saturating_sub(1);
+                    }
+                    ui.monospace(self.discard[r].to_string());
+                    if ui.add_enabled(self.discard[r] < hand[r], egui::Button::new("+").small()).clicked() {
+                        self.discard[r] += 1;
+                    }
+                });
+                ui.end_row();
+            }
+        });
+        let chosen: u8 = self.discard.iter().sum();
+        if ui.add_enabled(chosen == owed, egui::Button::new(format!("Discard {chosen} of {owed}"))).clicked() {
+            let codes: Vec<u16> = Resource::ALL
+                .iter()
+                .flat_map(|&r| std::iter::repeat_n(Action::Resource(r).index(), usize::from(self.discard[r.index()])))
+                .collect();
+            let mut trial = *state;
+            if codes.iter().all(|&c| trial.step(c).is_ok()) {
+                self.branch();
+                codes.iter().for_each(|&c| {
+                    self.push(c);
+                });
+                self.at = self.steps.len();
+                self.discard = [0; 5];
+                self.refresh();
+            } else {
+                self.message = Some("those cards cannot be discarded".into());
+            }
+        }
+        ui.weak("Pick any cards; they are discarded in resource order, which is how the game records them.");
     }
 
     fn offer_builder(&mut self, ui: &mut egui::Ui, state: &State) {
@@ -456,7 +622,7 @@ impl Viewer {
             "One or two cards on each side, never the same resource on both. You must hold what you give. \
              You can only ask for cards someone might hold, judging from everything public: \
              what they collected, built, traded and showed. \
-             A counter cannot simply reverse the offer: that is accepting it.",
+             A counter must give some of what was asked for, and cannot simply reverse the offer: that is accepting it.",
         );
     }
 
