@@ -38,17 +38,36 @@ class Search:
         logits, _ = self.evaluate(obs, masks)
         return torch.multinomial(logits.softmax(1), 1, generator=self.generator).squeeze(1).numpy()
 
-    def imagine(self, obs, buffer, games, players, rows, actions):
-        """For each (position row, move) pair, play the move in `samples` re-dealt worlds, let the network play on for
-        `depth` decisions, and return the mover's average outcome."""
+    def imagine(self, obs, buffer, games, players, rows, actions, until_turn_cap=400):
+        """For each (position row, move) pair, play the move in `samples` re-dealt worlds and let the network play on,
+        for `depth` decisions, or with depth 0 until the mover's next turn begins (through every other player's turn).
+        Returns the mover's average outcome, judged by the network where the imagining stops."""
         self.seed += 1
         deals = None
         if self.belief is not None:
             deals = self.belief.deals(np.repeat(obs[rows], self.samples, axis=0), self.generator).reshape(-1)
         worlds = buffer.worlds(games[rows], actions, self.samples, self.seed, deals)
-        for _ in range(self.depth):
+        root = np.repeat(players[rows], self.samples)
+        seats = int(obs[0, 221])
+        until_turn = self.depth <= 0
+        value = np.full(len(root), np.nan, np.float32)
+        away = np.zeros(len(root), bool)
+
+        def judge(o, p, which):
+            _, v = self.evaluate(o[which])
+            value[which] = v.numpy()[np.arange(int(which.sum())), (root[which] - p[which]) % seats]
+
+        for _ in range(until_turn_cap if until_turn else self.depth):
             o, m, p = worlds.observe()
             live = p >= 0
+            if until_turn:
+                current = (p + o[:, 294]) % seats
+                away |= live & (current != root)
+                back = live & away & (current == root) & np.isnan(value)
+                if back.any():
+                    judge(o, p, back)
+                if not (live & np.isnan(value)).any():
+                    break
             if not live.any():
                 break
             moves = np.zeros(len(p), np.int64)
@@ -56,16 +75,13 @@ class Search:
             worlds.step(moves)
 
         o, m, p = worlds.observe()
-        live, winners = p >= 0, worlds.winners()
-        root = np.repeat(players[rows], self.samples)
-        seats = int(obs[0, 221])
-        value = np.zeros(len(p), np.float32)
-        if live.any():
-            _, v = self.evaluate(o[live])
-            offset = (root[live] - p[live]) % seats
-            value[live] = v.numpy()[np.arange(len(offset)), offset]
-        over = winners >= 0
+        winners = worlds.winners()
+        open_ = np.isnan(value)
+        over = open_ & (winners >= 0)
         value[over] = np.where(winners[over] == root[over], 1.0, -1.0 / (seats - 1))
+        still = open_ & ~over & (p >= 0)
+        if still.any():
+            judge(o, p, still)
         return torch.from_numpy(value.reshape(-1, self.samples).mean(1))
 
     def improve(self, obs, masks, buffer, games, players, gumbel=False, rounds=1):
@@ -99,6 +115,39 @@ class Search:
         choices, q, prior, _, _ = self.improve(obs, masks, buffer, games, players)
         best = (prior.gather(1, choices) + self.eta * q).argmax(1)
         return choices[torch.arange(len(obs)), best].numpy()
+
+
+def search_game(model, at, game, candidates=8, samples=16, depth=16, eta=10.0, seed=0):
+    """Choose a move for whoever acts in `game` by thinking ahead: each of the network's top moves is played in `samples`
+    futures with the hidden cards re-dealt from the mover's own view, the network plays everyone for `depth` decisions,
+    and the move with the best mix of first instinct and imagined outcome wins."""
+    search = Search(model, at, candidates, samples, depth, eta, seed=seed)
+    obs, mask = game.observe()
+    logits, _ = search.evaluate(obs[None], mask[None])
+    prior = logits.log_softmax(1)[0]
+    k = min(candidates, int(mask.sum()))
+    top, choices = prior.topk(k)
+    me, seats = game.to_act(), int(obs[221])
+    worlds = game.imagine(k * samples, seed)
+    worlds.step(np.repeat(choices.numpy(), samples))
+    for _ in range(depth):
+        o, m, p = worlds.observe()
+        live = p >= 0
+        if not live.any():
+            break
+        moves = np.zeros(len(p), np.int64)
+        moves[live] = search.sample(o[live], m[live])
+        worlds.step(moves)
+    o, m, p = worlds.observe()
+    live, winners = p >= 0, worlds.winners()
+    value = np.zeros(len(p), np.float32)
+    if live.any():
+        _, v = search.evaluate(o[live])
+        value[live] = v.numpy()[np.arange(int(live.sum())), (me - p[live]) % seats]
+    over = winners >= 0
+    value[over] = np.where(winners[over] == me, 1.0, -1.0 / (seats - 1))
+    q = torch.from_numpy(value.reshape(k, samples).mean(1))
+    return int(choices[(top + eta * q).argmax()])
 
 
 class Node:

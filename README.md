@@ -32,6 +32,7 @@ python -m train.belief runs/base/latest.pt   # learn to guess other players' hid
 python -m train.search runs/base/latest.pt --deep   # deep search: a tree over the player's own moves, vs the network and vs plain search
 cargo run --release --example viewer -- --play runs/base/latest.pt --seat 0   # play against the network in the viewer
 cargo run --release --example viewer -- --think runs/long-small/latest.pt   # step through games and see what the network thinks
+cargo run --release --example viewer -- --play runs/anchor.pt --seat 0 --search   # play against the network thinking ahead
 python -m train.checks [checkpoint]   # quick checks of the learning signal, search training and planning tools
 ARM=plain bash experiment.sh          # one arm of the search-training experiment (or ARM=search); `bash experiment.sh status`
 ```

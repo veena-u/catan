@@ -40,9 +40,11 @@ def replay(record):
 
 
 @torch.no_grad()
-def forecast(model, at, record, samples=64, turns=2, limit=400, seed=0):
+def forecast(model, at, record, samples=64, turns=2, limit=None, seed=0):
     """What the player to act tends to do over their next `turns` turns, from `samples` imagined futures in which the
-    hidden cards are re-dealt from their own view and every player is played by the network."""
+    hidden cards are re-dealt from their own view and every player is played by the network. Returns a summary in words
+    and the plan on the board: for each spot, the share of futures in which they build a settlement, city or road there."""
+    limit = limit or 150 * turns
     game = replay(record)
     me = game.to_act()
     worlds = game.imagine(samples, seed)
@@ -51,6 +53,7 @@ def forecast(model, at, record, samples=64, turns=2, limit=400, seed=0):
     won = np.zeros(samples, bool)
     did = [collections.Counter() for _ in range(samples)]
     spots = {"settlement": collections.Counter(), "city": collections.Counter()}
+    built = [{"settlement": set(), "city": set(), "road": set()} for _ in range(samples)]
     for _ in range(limit):
         obs, masks, actors = worlds.observe()
         watching = (actors == me) & (ended < turns)
@@ -65,11 +68,14 @@ def forecast(model, at, record, samples=64, turns=2, limit=400, seed=0):
             if code < CITY:
                 did[w]["settlement"] += 1
                 spots["settlement"][f"v{code}"] += 1
+                built[w]["settlement"].add(code)
             elif code < ROAD:
                 did[w]["city"] += 1
                 spots["city"][f"v{code - CITY}"] += 1
+                built[w]["city"].add(code - CITY)
             elif code < ROAD + 72:
                 did[w]["road"] += 1
+                built[w]["road"].add(code - ROAD)
             elif BANK <= code < END_TURN - 1:
                 did[w]["bank or harbor trade"] += 1
             elif code == BUY_CARD:
@@ -97,4 +103,8 @@ def forecast(model, at, record, samples=64, turns=2, limit=400, seed=0):
             lines.append(f"{share:.0%} {name}{detail}")
     if won.any():
         lines.append(f"{won.mean():.0%} wins")
-    return lines
+    plan = {}
+    for kind in ("settlement", "city", "road"):
+        counts = collections.Counter(spot for b in built for spot in b[kind])
+        plan[kind] = {spot: n / samples for spot, n in counts.items()}
+    return lines, plan

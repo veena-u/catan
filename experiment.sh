@@ -4,13 +4,14 @@
 # checkup each arm plays the anchor, so their curves compare directly. Stop with Ctrl-C or tmux kill-session; running
 # the same command again resumes.
 #   start an arm (inside tmux):   ARM=plain bash experiment.sh      or      ARM=search bash experiment.sh
+#   search-turn imagines each future through every other player's turn, until the searcher moves again
 #   see how the arms are doing:   bash experiment.sh status
 set -uo pipefail
 if [ -f /venv/main/bin/activate ]; then source /venv/main/bin/activate; fi
 cd "$(dirname "$0")"
 
 if [ "${1:-}" = status ]; then
-  for arm in plain search; do
+  for arm in plain search search-turn; do
     [ -f "runs/$arm.out" ] || continue
     echo "== $arm  (hours count from the latest start)"
     grep "(eval" "runs/$arm.out" | awk '{
@@ -28,11 +29,12 @@ if [ "${1:-}" = status ]; then
   exit 0
 fi
 
-ARM=${ARM:?set ARM=plain or ARM=search}
+ARM=${ARM:?set ARM=plain, search or search-turn}
 case $ARM in
   plain) EXTRA="" ;;
   search) EXTRA="--expert" ;;
-  *) echo "ARM is plain or search"; exit 1 ;;
+  search-turn) EXTRA="--expert --expert-depth 0 --expert-games 16" ;;
+  *) echo "ARM is plain, search or search-turn"; exit 1 ;;
 esac
 [ -f runs/anchor.pt ] || { echo "put the starting network at runs/anchor.pt first"; exit 1; }
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True

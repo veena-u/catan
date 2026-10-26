@@ -54,7 +54,8 @@ fn main() -> eframe::Result {
     let mut viewer = Viewer::new(number("--seed", 1) as u64, players);
     if let Some(checkpoint) = flag("--play").or_else(|| flag("--think")) {
         let python = flag("--python").unwrap_or_else(|| "python".into());
-        match Brain::spawn(&python, &checkpoint, args.iter().any(|a| a == "--greedy")) {
+        let (greedy, search) = (args.iter().any(|a| a == "--greedy"), args.iter().any(|a| a == "--search"));
+        match Brain::spawn(&python, &checkpoint, greedy, search) {
             Ok(brain) => viewer.brain = Some(brain),
             Err(e) => {
                 eprintln!("could not start the network: {e}");
@@ -78,12 +79,22 @@ struct Brain {
     child: Child,
     input: ChildStdin,
     output: BufReader<ChildStdout>,
+    search: bool,
 }
 
 struct Play {
     human: Player,
     peek: bool,
     last: Instant,
+}
+
+/// What a player tends to do over their next turns in imagined futures, in words and as ghost pieces on the board.
+struct Forecast {
+    player: Player,
+    lines: Vec<String>,
+    settlements: Vec<(Vertex, f32)>,
+    cities: Vec<(Vertex, f32)>,
+    roads: Vec<(Edge, f32)>,
 }
 
 /// What the network thinks at one moment: each player's chance of winning, and its favourite moves for whoever acts.
@@ -95,10 +106,11 @@ struct Thoughts {
 }
 
 impl Brain {
-    fn spawn(python: &str, checkpoint: &str, greedy: bool) -> Result<Brain, String> {
+    fn spawn(python: &str, checkpoint: &str, greedy: bool, search: bool) -> Result<Brain, String> {
         let mut child = Command::new(python)
             .args(["-u", "-m", "train.serve", checkpoint])
             .args(greedy.then_some("--greedy"))
+            .args(search.then_some("--search"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
@@ -110,7 +122,7 @@ impl Brain {
         if line.trim() != "ready" {
             return Err("train.serve did not start; is the checkpoint path right?".into());
         }
-        Ok(Brain { child, input, output })
+        Ok(Brain { child, input, output, search })
     }
 
     fn send(&mut self, prefix: &str, seen: &View, legal: &[u16]) -> Option<String> {
@@ -128,6 +140,13 @@ impl Brain {
 
     fn ask(&mut self, seen: &View, legal: &[u16]) -> Option<u16> {
         self.send("", seen, legal)?.parse().ok()
+    }
+
+    fn ask_with_search(&mut self, record: &str) -> Option<u16> {
+        self.input.write_all(format!("*{record}\n").as_bytes()).ok()?;
+        let mut answer = String::new();
+        self.output.read_line(&mut answer).ok()?;
+        answer.trim().parse().ok()
     }
 
     fn think(&mut self, state: &State) -> Option<Thoughts> {
@@ -156,11 +175,31 @@ impl Brain {
         Some(Thoughts { chances, top, cards: worth })
     }
 
-    fn forecast(&mut self, record: &str) -> Option<Vec<String>> {
-        self.input.write_all(format!("!{record}\n").as_bytes()).ok()?;
+    fn forecast(&mut self, record: &str, turns: u8, player: Player) -> Option<Forecast> {
+        self.input.write_all(format!("!{turns}|{record}\n").as_bytes()).ok()?;
         let mut answer = String::new();
         self.output.read_line(&mut answer).ok()?;
-        Some(answer.trim_end().split('\t').map(str::to_string).collect())
+        let (words, spots) = answer.trim_end().split_once("##")?;
+        let mut forecast = Forecast {
+            player,
+            lines: words.split('\t').map(str::to_string).collect(),
+            settlements: Vec::new(),
+            cities: Vec::new(),
+            roads: Vec::new(),
+        };
+        for part in spots.split(';') {
+            let Some((kind, list)) = part.split_once(':') else { continue };
+            let pairs = list.split(',').filter_map(|p| p.split_once('=')).filter_map(|(i, s)| Some((i.parse::<usize>().ok()?, s.parse::<f32>().ok()?)));
+            for (i, share) in pairs {
+                match kind {
+                    "s" => forecast.settlements.push((Vertex::new(i), share)),
+                    "c" => forecast.cities.push((Vertex::new(i), share)),
+                    "r" => forecast.roads.push((Edge::new(i), share)),
+                    _ => {}
+                }
+            }
+        }
+        Some(forecast)
     }
 }
 
@@ -195,7 +234,9 @@ struct Viewer {
     play: Option<Play>,
     brain: Option<Brain>,
     thoughts: HashMap<usize, Option<Thoughts>>,
-    forecasts: HashMap<usize, Vec<String>>,
+    forecasts: HashMap<(usize, u8), Forecast>,
+    plan_turns: u8,
+    show_plan: bool,
     timeline: bool,
     draft: [[u8; 5]; 2],
     discard: [u8; 5],
@@ -222,6 +263,8 @@ impl Viewer {
             brain: None,
             thoughts: HashMap::new(),
             forecasts: HashMap::new(),
+            plan_turns: 3,
+            show_plan: true,
             timeline: false,
             draft: [[0; 5]; 2],
             discard: [0; 5],
@@ -277,7 +320,7 @@ impl Viewer {
 
     fn branch(&mut self) {
         self.thoughts.retain(|&at, _| at <= self.at);
-        self.forecasts.retain(|&at, _| at <= self.at);
+        self.forecasts.retain(|&(at, _), _| at <= self.at);
         self.before = Some(self.views());
         self.steps.truncate(self.at);
         self.states.truncate(self.at + 1);
@@ -332,7 +375,13 @@ impl Viewer {
                     return;
                 }
                 let legal: Vec<u16> = state.legal_actions().iter().map(Action::index).collect();
-                match self.brain.as_mut().and_then(|brain| brain.ask(&view(&state, p), &legal)) {
+                let codes: Vec<String> = self.steps.iter().map(u16::to_string).collect();
+                let record = format!("{};{};{}", self.players, self.seed, codes.join(","));
+                let answer = self.brain.as_mut().and_then(|brain| match brain.search {
+                    true => brain.ask_with_search(&record),
+                    false => brain.ask(&view(&state, p), &legal),
+                });
+                match answer {
                     Some(code) if legal.contains(&code) => code,
                     _ => {
                         let code = legal[self.rng.below(legal.len())];
@@ -389,6 +438,9 @@ impl Viewer {
             ui.separator();
             if let Some(play) = self.play.as_mut() {
                 ui.colored_label(PLAYERS[play.human.index()], format!("you are {:?}", play.human));
+                if self.brain.as_ref().is_some_and(|b| b.search) {
+                    ui.weak("opponents think ahead");
+                }
                 ui.checkbox(&mut play.peek, "peek");
             } else {
                 ui.label("random");
@@ -520,20 +572,29 @@ impl Viewer {
                         ui.colored_label(resource_color(r), format!("{} {:+.1}%", resource_name(r), worth));
                     }
                 });
-                match self.forecasts.get(&self.at) {
-                    Some(lines) => lines.iter().for_each(|line| {
+                heading(ui, "Its plan");
+                ui.horizontal(|ui| {
+                    ui.add(egui::Slider::new(&mut self.plan_turns, 1..=5).text("turns ahead"));
+                    ui.checkbox(&mut self.show_plan, "draw on board");
+                });
+                let key = (self.at, self.plan_turns);
+                match self.forecasts.get(&key) {
+                    Some(forecast) => forecast.lines.iter().for_each(|line| {
                         ui.label(line);
                     }),
                     None => {
-                        if ui.button("Forecast its next 2 turns").clicked() {
+                        let label = format!("Imagine 64 futures: what {} does in the next {} turns", actor_name(state.actor()), self.plan_turns);
+                        if let (true, Some(Actor::Player(player))) = (ui.button(label).clicked(), state.actor()) {
                             let codes: Vec<String> = self.steps[..self.at].iter().map(u16::to_string).collect();
                             let record = format!("{};{};{}", self.players, self.seed, codes.join(","));
-                            if let Some(lines) = self.brain.as_mut().and_then(|brain| brain.forecast(&record)) {
-                                self.forecasts.insert(self.at, lines);
+                            let turns = self.plan_turns;
+                            if let Some(forecast) = self.brain.as_mut().and_then(|brain| brain.forecast(&record, turns, player)) {
+                                self.forecasts.insert(key, forecast);
                             }
                         }
                     }
                 }
+                ui.weak("Ghost pieces on the board: the fainter, the fewer imagined futures in which it builds there.");
             }
         }
         ui.checkbox(&mut self.timeline, "chart everyone's chances over the game");
@@ -775,6 +836,28 @@ impl Viewer {
             }
         }
 
+        if let Some(forecast) = self.forecasts.get(&(self.at, self.plan_turns)).filter(|_| self.show_plan) {
+            let ghost = |share: f32| {
+                let c = PLAYERS[forecast.player.index()];
+                Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), (40.0 + 215.0 * share.clamp(0.0, 1.0)) as u8)
+            };
+            for &(e, share) in &forecast.roads {
+                let [a, b] = t.ends(e).map(vertex);
+                painter.line_segment([a, b], Stroke::new(0.12 * s, ghost(share)));
+            }
+            for &(v, share) in &forecast.settlements {
+                painter.circle(vertex(v), 0.17 * s, ghost(share), Stroke::new(2.0, Color32::WHITE.gamma_multiply(share)));
+            }
+            for &(v, share) in &forecast.cities {
+                let rect = egui::Rect::from_center_size(vertex(v), Vec2::splat(0.42 * s));
+                painter.rect(rect, 3.0, ghost(share), Stroke::new(2.0, Color32::WHITE.gamma_multiply(share)), egui::StrokeKind::Outside);
+            }
+            for (spots, kind) in [(&forecast.settlements, "settlement"), (&forecast.cities, "city")] {
+                for &(v, share) in spots.iter().filter(|(_, share)| *share >= 0.15) {
+                    painter.text(vertex(v) + Vec2::new(0.0, -0.32 * s), Align2::CENTER_BOTTOM, format!("{kind} {:.0}%", 100.0 * share), FontId::proportional(0.18 * s), Color32::WHITE);
+                }
+            }
+        }
         let legal: Vec<Action> = if self.may_move() { state.legal_actions().iter().collect() } else { Vec::new() };
         let highlight = Color32::from_rgba_unmultiplied(139, 92, 246, 70);
         for &action in &legal {

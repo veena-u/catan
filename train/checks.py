@@ -9,7 +9,7 @@ import catan
 from .agents import Network, Random
 from .insight import card_values, forecast
 from .model import Tokens, device, load
-from .search import Search
+from .search import Search, search_game
 from .selfplay import SEATS, advantages, improved_policy, relative, rewards, to_absolute, to_relative
 
 
@@ -76,6 +76,9 @@ def check_search_training():
     for row in visits:
         assert sorted(row.tolist(), reverse=True) == [6, 6, 4, 4, 2, 2, 2, 2], f"halving 8 -> 4 -> 2: {row.tolist()}"
     assert torch.isfinite(q).all() and masks[rows][np.arange(len(rows))[:, None], choices.numpy()].all()
+    turn = Search(model, at, candidates=4, samples=2, depth=0)
+    _, q, _, _, visits = turn.improve(obs[rows], masks[rows], buffer, rows, actors[rows], gumbel=True, rounds=2)
+    assert torch.isfinite(q[visits > 0]).all(), "imagining until the searcher's next turn gives a value for every move"
 
     game = catan.Game(5, 4)
     game.settle()
@@ -85,8 +88,15 @@ def check_search_training():
         game.settle()
     worth = card_values(model, at, game.observe()[0])
     assert len(worth) == 5 and all(np.isfinite(worth))
-    lines = forecast(model, at, game.record(), samples=8, limit=120)
+    lines, plan = forecast(model, at, game.record(), samples=8, turns=1)
     assert lines[0].startswith("over its next"), lines
+    assert set(plan) == {"settlement", "city", "road"} and all(0 < share <= 1 for shares in plan.values() for share in shares.values())
+    for _ in range(10):
+        obs, mask = game.observe()
+        move = search_game(model, at, game, candidates=4, samples=4, depth=6)
+        assert mask[move], "a searched move is legal"
+        game.step(move)
+        game.settle()
     print("search training and planning tools: all checks passed")
 
 

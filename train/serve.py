@@ -7,26 +7,38 @@ import torch
 import catan
 
 from .agents import Network
-from .insight import card_values, forecast
+from .insight import card_values, forecast, replay
 from .model import device, load, masked
+from .search import search_game
 
 
 def main():
     parser = argparse.ArgumentParser(description="Answer the viewer: each line in is one player's view and legal moves, each "
                                                  "line out a move. A line starting with ? asks what the network thinks; one "
-                                                 "starting with ! followed by a game record asks for a forecast.")
+                                                 "starting with !turns| followed by a game record asks for a forecast, and one "
+                                                 "starting with * followed by a game record asks for a move chosen by search.")
     parser.add_argument("checkpoint")
     parser.add_argument("--greedy", action="store_true", help="always play the network's top move")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--search", action="store_true", help="think ahead before each move; moves come from game records")
     args = parser.parse_args()
 
     at = device()
     model = load(args.checkpoint, at)
     network = Network(model, at, greedy=args.greedy, seed=args.seed)
     print("ready", flush=True)
+    moves = 0
     for line in sys.stdin:
+        if line.startswith("*"):
+            moves += 1
+            print(search_game(model, at, replay(line[1:].strip()), seed=args.seed + moves), flush=True)
+            continue
         if line.startswith("!"):
-            print("\t".join(forecast(model, at, line[1:].strip(), seed=args.seed)), flush=True)
+            turns, record = line[1:].strip().split("|", 1)
+            lines, plan = forecast(model, at, record, turns=int(turns), seed=args.seed)
+            spots = ";".join(f"{kind[0]}:" + ",".join(f"{spot}={share:.3f}" for spot, share in shares.items())
+                             for kind, shares in plan.items())
+            print("\t".join(lines) + "##" + spots, flush=True)
             continue
         explain = line.startswith("?")
         seen, legal = line.lstrip("?").strip().split(";")

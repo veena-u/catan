@@ -363,7 +363,8 @@ def main():
     parser.add_argument("--expert-weight", type=float, default=1.0)
     parser.add_argument("--expert-candidates", type=int, default=8, help="moves searched at each position")
     parser.add_argument("--expert-samples", type=int, default=8, help="deals of the hidden cards per move")
-    parser.add_argument("--expert-depth", type=int, default=16, help="decisions played forward")
+    parser.add_argument("--expert-depth", type=int, default=16,
+                        help="decisions played forward; 0 plays forward until the searcher's next turn begins")
     parser.add_argument("--expert-scale", type=float, default=0.1, help="how far search may move the target from the network")
     parser.add_argument("--save-every", type=int, default=250, help="keep a numbered checkpoint every this many iterations")
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
