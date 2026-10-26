@@ -91,6 +91,7 @@ struct Play {
 struct Thoughts {
     chances: [f32; MAX_PLAYERS],
     top: Vec<(u16, f32)>,
+    cards: [f32; 5],
 }
 
 impl Brain {
@@ -133,7 +134,8 @@ impl Brain {
         let Some(Actor::Player(actor)) = state.actor() else { return None };
         let legal: Vec<u16> = state.legal_actions().iter().map(Action::index).collect();
         let answer = self.send("?", &view(state, actor), &legal)?;
-        let (values, moves) = answer.split_once('|')?;
+        let mut parts = answer.split('|');
+        let (values, moves, cards) = (parts.next()?, parts.next()?, parts.next()?);
         let values: Vec<f32> = values.split(',').filter_map(|v| v.parse().ok()).collect();
         let n = state.players();
         let mut chances = [0.0; MAX_PLAYERS];
@@ -147,7 +149,18 @@ impl Brain {
             .filter_map(|m| m.split_once(':'))
             .filter_map(|(c, p)| Some((c.parse().ok()?, p.parse().ok()?)))
             .collect();
-        Some(Thoughts { chances, top })
+        let mut worth = [0.0; 5];
+        for (slot, v) in worth.iter_mut().zip(cards.split(',').filter_map(|v| v.parse().ok())) {
+            *slot = v;
+        }
+        Some(Thoughts { chances, top, cards: worth })
+    }
+
+    fn forecast(&mut self, record: &str) -> Option<Vec<String>> {
+        self.input.write_all(format!("!{record}\n").as_bytes()).ok()?;
+        let mut answer = String::new();
+        self.output.read_line(&mut answer).ok()?;
+        Some(answer.trim_end().split('\t').map(str::to_string).collect())
     }
 }
 
@@ -182,6 +195,7 @@ struct Viewer {
     play: Option<Play>,
     brain: Option<Brain>,
     thoughts: HashMap<usize, Option<Thoughts>>,
+    forecasts: HashMap<usize, Vec<String>>,
     timeline: bool,
     draft: [[u8; 5]; 2],
     discard: [u8; 5],
@@ -207,6 +221,7 @@ impl Viewer {
             play: None,
             brain: None,
             thoughts: HashMap::new(),
+            forecasts: HashMap::new(),
             timeline: false,
             draft: [[0; 5]; 2],
             discard: [0; 5],
@@ -262,6 +277,7 @@ impl Viewer {
 
     fn branch(&mut self) {
         self.thoughts.retain(|&at, _| at <= self.at);
+        self.forecasts.retain(|&at, _| at <= self.at);
         self.before = Some(self.views());
         self.steps.truncate(self.at);
         self.states.truncate(self.at + 1);
@@ -497,6 +513,26 @@ impl Viewer {
                         ui.add_sized([60.0, 16.0], egui::ProgressBar::new(p));
                         ui.label(format!("{:.0}%  {}", 100.0 * p, step_label(&state, code)));
                     });
+                }
+                ui.label(format!("What one more card would be worth to {}:", actor_name(state.actor())));
+                ui.horizontal_wrapped(|ui| {
+                    for (r, worth) in Resource::ALL.into_iter().zip(thought.cards) {
+                        ui.colored_label(resource_color(r), format!("{} {:+.1}%", resource_name(r), worth));
+                    }
+                });
+                match self.forecasts.get(&self.at) {
+                    Some(lines) => lines.iter().for_each(|line| {
+                        ui.label(line);
+                    }),
+                    None => {
+                        if ui.button("Forecast its next 2 turns").clicked() {
+                            let codes: Vec<String> = self.steps[..self.at].iter().map(u16::to_string).collect();
+                            let record = format!("{};{};{}", self.players, self.seed, codes.join(","));
+                            if let Some(lines) = self.brain.as_mut().and_then(|brain| brain.forecast(&record)) {
+                                self.forecasts.insert(self.at, lines);
+                            }
+                        }
+                    }
                 }
             }
         }

@@ -320,6 +320,15 @@ impl Game {
         Ok(())
     }
 
+    /// `samples` futures as the player to act could imagine them: hidden cards re-dealt from their view.
+    #[pyo3(signature = (samples, seed = 0))]
+    fn imagine(&self, samples: usize, seed: u64) -> PyResult<Worlds> {
+        let Some(Actor::Player(observer)) = self.state.actor() else {
+            return Err(PyValueError::new_err("only a player's turn can be imagined from"));
+        };
+        Ok(Worlds { inner: worlds::Worlds::imagine(&self.state, observer, samples, seed) })
+    }
+
     fn settle(&mut self) {
         while let Some(Actor::Chance) = self.state.actor() {
             let code = self.state.sample_outcome(&mut self.rng).index();

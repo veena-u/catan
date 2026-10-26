@@ -51,6 +51,20 @@ impl Worlds {
         Ok(Worlds { states, rngs, redealt })
     }
 
+    /// Futures as one player could imagine them: the hidden cards re-dealt from `observer`'s view, nothing else changed.
+    pub fn imagine(root: &State, observer: Player, samples: usize, seed: u64) -> Worlds {
+        let mut seeds = Rng::new(seed);
+        let (mut states, mut rngs) = (Vec::new(), Vec::new());
+        for _ in 0..samples {
+            let mut rng = seeds.fork();
+            let mut world = root.sample_hidden(observer, &mut rng);
+            settle(&mut world, &mut rng);
+            states.push(world);
+            rngs.push(rng);
+        }
+        Worlds { states, rngs, redealt: 0 }
+    }
+
     pub fn redealt(&self) -> usize {
         self.redealt
     }
@@ -110,6 +124,37 @@ fn settle(state: &mut State, rng: &mut Rng) {
 mod tests {
     use super::*;
     use crate::buffer::Config;
+
+    #[test]
+    fn imagined_futures_look_the_same_to_the_one_imagining() {
+        let mut buffer = Buffer::new(Config { games: 4, history: 64, max_decisions: 5_000, seed: 9, players: 4, paired: false });
+        let mut rng = Rng::new(2);
+        let mut endings = vec![None; buffer.len()];
+        for _ in 0..120 {
+            let actions: Vec<u16> = (0..buffer.len())
+                .map(|g| {
+                    let legal: Vec<Action> = buffer.mask(g).iter().collect();
+                    legal[rng.below(legal.len())].index()
+                })
+                .collect();
+            buffer.step(&actions, &mut endings).unwrap();
+        }
+        for game in 0..buffer.len() {
+            let root = buffer.state(game);
+            let Some(Actor::Player(me)) = root.actor() else { continue };
+            let mut seen = [0; OBSERVATION_BYTES];
+            observe(&root, me, &mut seen);
+            let worlds = Worlds::imagine(&root, me, 8, 4);
+            assert_eq!(worlds.len(), 8);
+            for w in 0..worlds.len() {
+                let world = worlds.state(w);
+                world.validate().unwrap();
+                let mut again = [0; OBSERVATION_BYTES];
+                observe(&world, me, &mut again);
+                assert_eq!(seen, again, "re-dealing changed what the imagining player sees");
+            }
+        }
+    }
 
     #[test]
     fn worlds_keep_what_the_searcher_sees_and_play_on_legally() {

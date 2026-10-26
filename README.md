@@ -32,6 +32,8 @@ python -m train.belief runs/base/latest.pt   # learn to guess other players' hid
 python -m train.search runs/base/latest.pt --deep   # deep search: a tree over the player's own moves, vs the network and vs plain search
 cargo run --release --example viewer -- --play runs/base/latest.pt --seat 0   # play against the network in the viewer
 cargo run --release --example viewer -- --think runs/long-small/latest.pt   # step through games and see what the network thinks
+python -m train.checks [checkpoint]   # quick checks of the learning signal, search training and planning tools
+ARM=plain bash experiment.sh          # one arm of the search-training experiment (or ARM=search); `bash experiment.sh status`
 ```
 
 every command takes `--players` (default 4). for the long run, `NAME=long FLAGS="..." bash final.sh` trains 1500 iterations on the current rules and tests the result: habits, an Elo curve over its checkpoints, search and deep search. on a rented GPU, `bash overnight.sh` trains a 4-player baseline, then a belief network and search on top of it, then an expert-iteration run, then one run per idea (symmetry, future-dice baseline, privileged critic, dice averaging) and all of them together for twice as long, comparing each against `runs/base` as it goes and packing everything into `results-overnight.tar.gz`
@@ -51,6 +53,8 @@ more flags: `--anneal-power 0.5` shrinks the learning rate and magnet weight ove
 - `habits.py` plays a saved network against the bot and reports what it does per game: builds, trades by rate, cards, harbor use
 - `search.py` thinks before moving: the network's top moves are each played forward in several random deals of the hidden cards, and the move with the best mix of prior and outcome is chosen; with `--belief` the hidden cards are dealt from the belief network
 - `serve.py` lets the viewer play against a network: one line in per move (the network's view and legal moves), one move out. In play mode the viewer hides other players' cards, moves and private chance results unless you tick peek
+- `insight.py` shows what a network plans: what one more card of each resource is worth to it, and a forecast of what it tends to do over its next turns, from futures imagined without peeking at hidden cards. The viewer shows both, with each player's chance to win, its favourite moves, and a chart of everyone's chances over the game
+- with `--expert`, `selfplay.py` also learns from Gumbel search: a sample of moves is searched in rounds of sequential halving, and the policy is trained toward the improved policy, which keeps the network's preference for every move and moves only the searched ones by what search found
 - `belief.py` trains a network to guess, from one player's view, the hand and development cards of every other player; it reports how surprised it is per unseen card next to a baseline that only counts which cards are left
 
 ## rules

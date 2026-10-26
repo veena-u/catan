@@ -6,9 +6,11 @@ import torch
 
 import catan
 
-from .agents import Network
-from .model import device, load
-from .selfplay import SEATS, advantages, relative, rewards, to_absolute, to_relative
+from .agents import Network, Random
+from .insight import card_values, forecast
+from .model import Tokens, device, load
+from .search import Search
+from .selfplay import SEATS, advantages, improved_policy, relative, rewards, to_absolute, to_relative
 
 
 def check_learning_math():
@@ -45,6 +47,47 @@ def check_learning_math():
         "credit flows back, fading by lambda"
     assert adv[3, 0, 1] == 0.25 and adv[3, 0, 0] == 0, "a new game starts clean, and progress counts at once"
     print("learning math: all checks passed")
+
+
+def check_search_training():
+    """The search target, sequential halving, and the planning tools, on a small untrained network."""
+    logits = torch.tensor([[2.0, 1.0, 0.0, -1.0, float("-inf")]])
+    prior = logits.log_softmax(1)
+    choices, value, visits = torch.tensor([[0, 2]]), torch.tensor([0.1]), torch.tensor([[8.0, 8.0]])
+    same = improved_policy(prior, choices, torch.tensor([[0.1, 0.1]]), value, visits, 0.1)
+    assert torch.allclose(same, prior.exp(), atol=1e-6), "when search finds nothing new, the target is the network itself"
+    better = improved_policy(prior, choices, torch.tensor([[0.1, 0.4]]), value, visits, 0.1)
+    assert better[0, 2] > prior.exp()[0, 2] and better[0, 0] < prior.exp()[0, 0], "a move search likes more gains"
+    assert torch.isclose(better[0, 1] / better[0, 3], prior.exp()[0, 1] / prior.exp()[0, 3]), "unsearched moves keep their ratio"
+    assert better[0, 4] == 0, "an illegal move stays impossible"
+
+    torch.manual_seed(0)
+    at = device()
+    model = Tokens(32, 1, entities=True).to(at).eval()
+    buffer, agent = catan.Buffer(16, seed=3), Random(0, kinds=True)
+    for _ in range(300):
+        obs, masks, _ = buffer.observe()
+        buffer.step(agent(obs, masks))
+    obs, masks, actors = buffer.observe()
+    rows = np.flatnonzero(masks.sum(1) >= 8)
+    assert len(rows), "some position with at least 8 moves"
+    search = Search(model, at, candidates=8, samples=2, depth=4)
+    choices, q, prior, value, visits = search.improve(obs[rows], masks[rows], buffer, rows, actors[rows], gumbel=True, rounds=3)
+    for row in visits:
+        assert sorted(row.tolist(), reverse=True) == [6, 6, 4, 4, 2, 2, 2, 2], f"halving 8 -> 4 -> 2: {row.tolist()}"
+    assert torch.isfinite(q).all() and masks[rows][np.arange(len(rows))[:, None], choices.numpy()].all()
+
+    game = catan.Game(5, 4)
+    game.settle()
+    for _ in range(150):
+        obs, mask = game.observe()
+        game.step(int(agent(obs[None], mask[None])[0]))
+        game.settle()
+    worth = card_values(model, at, game.observe()[0])
+    assert len(worth) == 5 and all(np.isfinite(worth))
+    lines = forecast(model, at, game.record(), samples=8, limit=120)
+    assert lines[0].startswith("over its next"), lines
+    print("search training and planning tools: all checks passed")
 
 
 @torch.no_grad()
@@ -85,6 +128,7 @@ def main():
     parser.add_argument("--positions", type=int, default=300, help="finished games to score")
     args = parser.parse_args()
     check_learning_math()
+    check_search_training()
     if args.checkpoint:
         check_values(args.checkpoint, args.games, args.positions)
 

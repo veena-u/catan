@@ -14,7 +14,7 @@ from .agents import KIND_COUNT, KINDS, Network, Random
 from .bot import Bot
 from .evaluate import play
 from .features import SEATS, SYMMETRIES
-from .model import Tokens, device
+from .model import Tokens, device, load
 from .search import Search
 
 HIDDEN = (SEATS - 1) * 10
@@ -107,10 +107,7 @@ class Rollout:
             return None
         choices, q, prior, value, visits = self.search.improve(o[games], m[games], self.buffer, games, p[games],
                                                                gumbel=True, rounds=self.expert_rounds)
-        completed = value[:, None].expand_as(prior).clone()
-        completed.scatter_(1, choices, torch.where(torch.isfinite(q), q, value[:, None]))
-        scale = self.expert_scale * (EXPERT_VISITS + visits.max(1, keepdim=True).values)
-        target = (prior + scale * completed).softmax(1)
+        target = improved_policy(prior, choices, q, value, visits, self.expert_scale)
         changed = (target.argmax(1) != prior.argmax(1)).float().sum().item()
         return self.tensor(o[games]), self.tensor(m[games]), target.to(self.at), changed
 
@@ -230,6 +227,15 @@ def sync(at):
         torch.cuda.synchronize()
     elif at.type == "mps":
         torch.mps.synchronize()
+
+
+def improved_policy(prior, choices, q, value, visits, scale):
+    """Gumbel AlphaZero's target: every move keeps the network's log-preference, plus a bonus growing with how much better
+    than the position's own value search found it. Moves search did not look at count as worth exactly that value."""
+    completed = value[:, None].expand_as(prior).clone()
+    completed.scatter_(1, choices, torch.where(torch.isfinite(q), q, value[:, None]))
+    weight = scale * (EXPERT_VISITS + visits.max(1, keepdim=True).values)
+    return (prior + weight * completed).softmax(1)
 
 
 def relative(gains, players):
@@ -370,6 +376,7 @@ def main():
                         help="reward each victory point gained relative to the other players at once; 0 rewards winning alone")
     parser.add_argument("--eval-every", type=int, default=10)
     parser.add_argument("--eval-games", type=int, default=512)
+    parser.add_argument("--anchor", help="also play this fixed network at every checkup, to compare runs that start from it")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--out", default="runs/selfplay")
     args = parser.parse_args()
@@ -400,6 +407,7 @@ def main():
     say(f"{sum(p.numel() for p in model.parameters()) / 1e6:.2f}M parameters on {at}; "
         f"{args.games} games × {args.rounds} decisions = {args.games * args.rounds} per update")
 
+    anchor = load(args.anchor, at) if args.anchor else None
     decisions, first, previous = 0, 1, None
     if (out / "latest.pt").exists():
         saved = torch.load(out / "latest.pt", map_location=at)
@@ -447,6 +455,8 @@ def main():
             clock = time.time()
             player = Network(model, at, seed=iteration)
             opponents = {"random": Random(iteration), "bot": Bot()}
+            if anchor is not None:
+                opponents["anchor"] = Network(anchor, at, seed=-2 * iteration)
             if previous is not None:
                 opponents["previous"] = Network(previous, at, seed=-iteration)
             for name, opponent in opponents.items():
