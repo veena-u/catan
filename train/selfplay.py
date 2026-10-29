@@ -14,13 +14,14 @@ from .agents import KIND_COUNT, KINDS, Network, Random
 from .bot import Bot
 from .evaluate import play
 from .features import SEATS, SYMMETRIES
-from .model import Tokens, device, grown, load
+from .model import Tokens, device, grown, load, masked
 from .search import Search
 
 HIDDEN = (SEATS - 1) * 10
 TRADED = np.isin(KINDS, (17, 18))
 EXPERT_VISITS = 50
 DICE_SUMS = 11
+KEY_PHASES = (0, 1, 5)  # setup settlement, setup road, moving the robber
 
 KIND_MATRIX = torch.from_numpy(np.eye(KIND_COUNT, dtype=np.float32)[KINDS])
 
@@ -81,35 +82,101 @@ class Critics(nn.Module):
         return torch.tanh(self.future(torch.cat([summary.float(), rolls.float()], -1)))
 
 
+class League:
+    """Earlier versions of the network, seated as opponents in some training games, so it keeps having to beat its old
+    selves and not only its latest habits. An opponent is drawn more often the more it still wins (prioritized
+    fictitious self-play); when the pool is full, a new version replaces the one most easily beaten, never the newest."""
+
+    def __init__(self, size, at, autocast, seed=0):
+        self.size, self.at, self.autocast = size, at, autocast
+        self.members, self.added = [], 0
+        self.rng = np.random.default_rng(seed)
+        self.generator = torch.Generator(device="cpu").manual_seed(seed)
+
+    def add(self, model, name):
+        member = {"name": name, "model": model.eval(), "games": 0, "won": 0, "added": self.added}
+        self.added += 1
+        if len(self.members) < self.size:
+            self.members.append(member)
+            return
+        newest = max(range(len(self.members)), key=lambda i: self.members[i]["added"])
+        easiest = max((i for i in range(len(self.members)) if i != newest), key=self.win_rate)
+        self.members[easiest] = member
+
+    def win_rate(self, i):
+        """The network's share of wins in games against this member, where it holds half the seats (fair 0.5)."""
+        m = self.members[i]
+        return (m["won"] + 1) / (m["games"] + 2)
+
+    def pick(self):
+        hardness = np.array([(1 - self.win_rate(i)) ** 2 for i in range(len(self.members))]) + 1e-3
+        return int(self.rng.choice(len(self.members), p=hardness / hardness.sum()))
+
+    def record(self, i, won):
+        self.members[i]["games"] += 1
+        self.members[i]["won"] += int(won)
+
+    @torch.no_grad()
+    def act(self, i, obs, masks):
+        with torch.autocast(self.at.type, dtype=torch.bfloat16, enabled=self.autocast):
+            logits, _, _ = self.members[i]["model"](torch.from_numpy(obs).to(self.at))
+        logits = masked(logits.float(), torch.from_numpy(masks).to(self.at)).cpu()
+        return torch.multinomial(logits.softmax(1), 1, generator=self.generator).squeeze(1).numpy()
+
+    def summary(self):
+        hardest = min(range(len(self.members)), key=self.win_rate)
+        return (f"{len(self.members)} in pool, hardest {self.members[hardest]['name']} "
+                f"(network wins {self.win_rate(hardest):.2f} vs it, fair 0.50)")
+
+
 class Rollout:
     def __init__(self, model, critics, buffer, at, autocast, players, average_dice=False, privileged=False,
                  search=None, expert_games=0, expert_every=1, expert_scale=0.1, seed=0, vp_reward=0.0, bot_games=0.0,
-                 expert_rounds=1):
+                 expert_rounds=1, league=None, league_games=0.0, key_search=None, key_games=0):
         self.model, self.critics, self.buffer, self.at, self.autocast = model, critics, buffer, at, autocast
         self.games, self.players = len(buffer), players
         self.average_dice, self.privileged = average_dice, privileged
         self.search, self.expert_games, self.expert_every, self.expert_scale = search, expert_games, expert_every, expert_scale
         self.expert_rounds = expert_rounds
+        self.key_search, self.key_games = key_search, key_games
         self.rng = np.random.default_rng(seed)
         self.vp_reward = vp_reward
         self.bot = Bot()
-        mixed = np.arange(self.games) < round(bot_games * self.games)
-        self.bot_seats = mixed[:, None] & ((np.arange(SEATS)[None, :] + np.arange(self.games)[:, None]) % 2 == 0)
+        game = np.arange(self.games)
+        alternate = (np.arange(SEATS)[None, :] + game[:, None]) % 2 == 0
+        bots = game < round(bot_games * self.games)
+        leagued = ~bots & (game < round((bot_games + league_games) * self.games))
+        self.bot_seats = bots[:, None] & alternate
+        self.league, self.league_seats = league, leagued[:, None] & alternate
+        self.opponent = np.full(self.games, -1)
         buffer.track_dice(average_dice)
+
+    def improve(self, search, o, m, p, games):
+        choices, q, prior, value, visits = search.improve(o[games], m[games], self.buffer, games, p[games],
+                                                          gumbel=True, rounds=self.expert_rounds)
+        return improved_policy(prior, choices, q, value, visits, self.expert_scale), prior
 
     def expert(self, o, m, p):
         """Gumbel AlphaZero's policy improvement on a few positions with a real choice. Search a sample of moves; every
         move keeps the network's preference, and each searched one moves up or down by how much better or worse search
-        found it than the network expected the position to be worth."""
-        choosing = np.flatnonzero(m.sum(1) > 1)
-        games = self.rng.choice(choosing, min(self.expert_games, len(choosing)), replace=False)
-        if len(games) == 0:
+        found it than the network expected the position to be worth. With a key search, a few setup placements and
+        robber moves are searched with many more candidates and imagined games, since they decide so much."""
+        choosing = m.sum(1) > 1
+        key = choosing & np.isin(o[:, 296], KEY_PHASES) if self.key_search is not None else np.zeros_like(choosing)
+        picks = []
+        if key.any():
+            picks.append((self.key_search, self.rng.choice(np.flatnonzero(key), min(self.key_games, key.sum()), replace=False)))
+        rest = np.flatnonzero(choosing & ~key)
+        if len(rest):
+            picks.append((self.search, self.rng.choice(rest, min(self.expert_games, len(rest)), replace=False)))
+        if not picks:
             return None
-        choices, q, prior, value, visits = self.search.improve(o[games], m[games], self.buffer, games, p[games],
-                                                               gumbel=True, rounds=self.expert_rounds)
-        target = improved_policy(prior, choices, q, value, visits, self.expert_scale)
+        games = np.concatenate([g for _, g in picks])
+        targets, priors = zip(*(self.improve(search, o, m, p, g) for search, g in picks))
+        target, prior = torch.cat(targets), torch.cat(priors)
         changed = (target.argmax(1) != prior.argmax(1)).float().sum().item()
-        return self.tensor(o[games]), self.tensor(m[games]), target.to(self.at), changed
+        keyed = len(picks[0][1]) if key.any() else 0
+        return self.tensor(o[games]), self.tensor(m[games]), target.to(self.at), changed, keyed
 
     @torch.no_grad()
     def evaluate(self, obs, masks, hidden=None):
@@ -152,10 +219,13 @@ class Rollout:
         done, ends = torch.zeros(rounds, n, dtype=torch.bool, device=at), torch.zeros(rounds, n, SEATS, device=at)
         progress = torch.zeros(rounds, n, SEATS, device=at)
         rolled, expected = torch.zeros(rounds, n, dtype=torch.bool, device=at), torch.zeros(rounds, n, SEATS, device=at)
-        stats = {"won": 0, "truncated": 0, "first_won": 0, "searched": 0, "changed": 0, "trades": 0,
-                 "mixed": 0, "mixed_network_won": 0}
+        stats = {"won": 0, "truncated": 0, "first_won": 0, "searched": 0, "changed": 0, "keyed": 0, "trades": 0,
+                 "mixed": 0, "mixed_network_won": 0, "league": 0, "league_network_won": 0}
         learn = torch.ones(rounds, n, dtype=torch.bool, device=at)
         expert = []
+        if self.league is not None:
+            unseated = self.league_seats.any(1) & (self.opponent < 0)
+            self.opponent[unseated] = [self.league.pick() for _ in range(unseated.sum())]
 
         for t in range(rounds):
             o, m, p = self.buffer.observe()
@@ -166,16 +236,23 @@ class Rollout:
                     expert.append(found[:3])
                     stats["searched"] += len(found[0])
                     stats["changed"] += found[3]
+                    stats["keyed"] += found[4]
             hidden[t] = self.tensor(self.buffer.hidden())
             dist, v = self.evaluate(obs[t], masks[t], hidden[t] if self.privileged else None)
             a = dist.sample()
             actions[t], log_probs[t], values[t] = a, dist.log_prob(a), to_absolute(v, actors[t], self.players)
             chosen = a.cpu().numpy()
             bot_turn = self.bot_seats[np.arange(n), p]
+            league_turn = self.league_seats[np.arange(n), p] & (self.opponent >= 0)
             if bot_turn.any():
                 chosen[bot_turn] = self.bot(o[bot_turn], m[bot_turn])
+            for k in np.unique(self.opponent[league_turn]):
+                rows = league_turn & (self.opponent == k)
+                chosen[rows] = self.league.act(k, o[rows], m[rows])
+            others = bot_turn | league_turn
+            if others.any():
                 actions[t] = self.tensor(chosen, np.int64)
-                learn[t] = self.tensor(~bot_turn)
+                learn[t] = self.tensor(~others)
             stats["trades"] += int(TRADED[chosen].sum())
             before = self.buffer.points()
             endings = self.buffer.step(chosen)
@@ -196,6 +273,12 @@ class Rollout:
                 if self.bot_seats[game].any():
                     stats["mixed"] += 1
                     stats["mixed_network_won"] += winner is not None and not self.bot_seats[game, winner]
+                if self.opponent[game] >= 0:
+                    won = winner is not None and not self.league_seats[game, winner]
+                    self.league.record(self.opponent[game], won)
+                    stats["league"] += 1
+                    stats["league_network_won"] += won
+                    self.opponent[game] = self.league.pick()
 
         o, m, p = self.buffer.observe()
         if self.privileged:
@@ -366,6 +449,18 @@ def main():
     parser.add_argument("--expert-depth", type=int, default=16,
                         help="decisions played forward; 0 plays forward until the searcher's next turn begins")
     parser.add_argument("--expert-scale", type=float, default=0.1, help="how far search may move the target from the network")
+    parser.add_argument("--key-games", type=int, default=0,
+                        help="with --expert, also search this many setup placements and robber moves each time, more deeply; 0 is off")
+    parser.add_argument("--key-candidates", type=int, default=16, help="moves searched at each key position")
+    parser.add_argument("--key-samples", type=int, default=16, help="deals of the hidden cards per move at key positions")
+    parser.add_argument("--league", type=float, default=0.0,
+                        help="share of training games with earlier versions of the network in half the seats; 0 is off")
+    parser.add_argument("--league-size", type=int, default=8, help="earlier versions kept in the pool")
+    parser.add_argument("--league-every", type=int, default=250, help="add the current network to the pool every this many iterations")
+    parser.add_argument("--league-from", nargs="*", default=[], help="saved networks to seed the pool with, e.g. other runs' checkpoints")
+    parser.add_argument("--league-watch", help="a folder checked at every checkup: any new .pt in it joins the pool, e.g. an exploiter")
+    parser.add_argument("--exploit", help="train an exploiter: every game puts this frozen network in half the seats, and "
+                                          "nothing else ever joins the pool, so learning goes only into beating it")
     parser.add_argument("--save-every", type=int, default=250, help="keep a numbered checkpoint every this many iterations")
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--bot-games", type=float, default=0.25,
@@ -381,6 +476,16 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--out", default="runs/selfplay")
     args = parser.parse_args()
+    if args.key_games and not args.expert:
+        parser.error("--key-games searches key positions as part of --expert; add --expert")
+    if args.exploit:
+        if args.league or args.league_from or args.league_watch:
+            parser.error("--exploit sets its own pool; drop --league, --league-from and --league-watch")
+        args.league, args.league_from = 1 - args.bot_games, [args.exploit]
+    if args.bot_games + args.league > 1:
+        parser.error("--bot-games and --league together are more than every game")
+    if args.league_watch and not args.league:
+        parser.error("--league-watch adds to the pool; add --league")
 
     torch.manual_seed(args.seed)
     at = device()
@@ -393,11 +498,15 @@ def main():
     critics = Critics(args.width).to(at)
     optimizer = torch.optim.AdamW([*model.parameters(), *critics.parameters()], lr=args.lr)
     buffer = catan.Buffer(args.games, history=64, max_decisions=args.max_decisions, seed=args.seed, players=args.players)
-    search = None
+    search = key_search = None
     if args.expert:
         search = Search(model, at, args.expert_candidates, args.expert_samples, args.expert_depth, seed=args.seed)
+    if args.key_games:
+        key_search = Search(model, at, args.key_candidates, args.key_samples, args.expert_depth, seed=args.seed + 1)
+    league = League(args.league_size, at, autocast, args.seed) if args.league else None
     rollout = Rollout(model, critics, buffer, at, autocast, args.players, args.average_dice, args.privileged,
-                      search, args.expert_games, args.expert_every, args.expert_scale, args.seed, args.vp_reward, args.bot_games, args.expert_rounds)
+                      search, args.expert_games, args.expert_every, args.expert_scale, args.seed, args.vp_reward, args.bot_games,
+                      args.expert_rounds, league, args.league, key_search, args.key_games)
     log = open(out / "log.txt", "a")
 
     def say(line):
@@ -423,6 +532,37 @@ def main():
         decisions = saved["iteration"] * args.games * args.rounds
         previous = copy.deepcopy(model).eval()
         say(f"resuming after iteration {saved['iteration']}")
+    watched = set()
+
+    def watch():
+        """Adds any network that has newly appeared in the watched folder. A file still being copied fails to load and is
+        tried again at the next checkup."""
+        for path in sorted(Path(args.league_watch).glob("*.pt")):
+            key = (path.name, path.stat().st_mtime)
+            if key in watched:
+                continue
+            try:
+                member = load(path, at)
+            except Exception as error:
+                say(f"league: could not load {path} yet ({type(error).__name__}); will retry")
+                continue
+            watched.add(key)
+            league.add(member, path.stem)
+            say(f"league: added {path}")
+
+    if league is not None:
+        for path in args.league_from:
+            league.add(load(path, at), path)
+        if not args.exploit:
+            saved = sorted(out.glob("iter_*.pt"))
+            room = max(args.league_size - len(league.members) - 1, 0)
+            if room and saved:
+                for i in np.unique(np.linspace(0, len(saved) - 1, min(room, len(saved))).round().astype(int)):
+                    league.add(load(saved[i], at), saved[i].stem)
+            league.add(copy.deepcopy(model).eval(), f"start {first - 1}")
+        if args.league_watch:
+            watch()
+        say(f"league: {', '.join(m['name'] for m in league.members)}")
     start = time.time()
     for iteration in range(first, args.iterations + 1):
         model.eval()
@@ -453,7 +593,11 @@ def main():
                 f"play {collect_time:.1f}s learn {update_time:.1f}s")
         if stats["searched"]:
             line += (f"  searched {stats['searched']} (search changed the top move {stats['changed'] / stats['searched']:.2f}, "
-                     f"expert loss {logs['expert']:.3f})")
+                     f"expert loss {logs['expert']:.3f}, {stats['keyed']} key positions)")
+        if league is not None:
+            line += f"  network seats win vs league {stats['league_network_won'] / max(stats['league'], 1):.2f} (fair 0.50)"
+            if iteration % args.league_every == 0 and not args.exploit:
+                league.add(copy.deepcopy(model).eval(), f"iter {iteration}")
         if iteration % args.eval_every == 0 or iteration == args.iterations:
             model.eval()
             clock = time.time()
@@ -473,6 +617,10 @@ def main():
             if iteration % args.save_every == 0 or iteration == args.iterations:
                 torch.save({k: v for k, v in checkpoint.items() if k != "optimizer"}, out / f"iter_{iteration:05d}.pt")
             previous = copy.deepcopy(model).eval()
+            if args.league_watch:
+                watch()
+            if league is not None:
+                line += f"  league: {league.summary()}"
             line += f"  (eval {time.time() - clock:.0f}s)"
         say(line)
 

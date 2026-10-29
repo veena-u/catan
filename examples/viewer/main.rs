@@ -65,6 +65,7 @@ fn main() -> eframe::Result {
         if flag("--play").is_some() {
             let human = Player::new(number("--seat", 0).min(players - 1));
             viewer.play = Some(Play { human, peek: false, last: Instant::now() });
+            viewer.tab = Tab::Table;
         }
     }
     let options = eframe::NativeOptions {
@@ -211,6 +212,7 @@ impl Drop for Brain {
 
 #[derive(Clone, Copy, PartialEq)]
 enum Tab {
+    Table,
     Views,
     Mask,
     Hidden,
@@ -650,12 +652,18 @@ impl Viewer {
         });
         let chosen: u8 = self.discard.iter().sum();
         if ui.add_enabled(chosen == owed, egui::Button::new(format!("Discard {chosen} of {owed}"))).clicked() {
-            let codes: Vec<u16> = Resource::ALL
-                .iter()
-                .flat_map(|&r| std::iter::repeat_n(Action::Resource(r).index(), usize::from(self.discard[r.index()])))
-                .collect();
+            let keep: [u8; 5] = std::array::from_fn(|r| hand[r] - self.discard[r]);
             let mut trial = *state;
-            if codes.iter().all(|&c| trial.step(c).is_ok()) {
+            let mut codes = Vec::new();
+            while matches!(trial.phase(), Phase::Discard { player: p, .. } if p == player) {
+                let Some(r) = Resource::ALL.into_iter().find(|r| trial.hand(player)[r.index()] > keep[r.index()]) else { break };
+                let code = Action::Resource(r).index();
+                if trial.step(code).is_err() {
+                    break;
+                }
+                codes.push(code);
+            }
+            if trial.hand(player) == keep {
                 self.branch();
                 codes.iter().for_each(|&c| {
                     self.push(c);
@@ -900,18 +908,26 @@ impl Viewer {
         }
     }
 
-    fn tabs(&mut self, ui: &mut egui::Ui) {
+    fn tab_strip(&mut self, ui: &mut egui::Ui) {
         if self.hiding().is_some() {
-            ui.weak("The views, action mask and hidden cards are hidden while you play; tick peek in the toolbar to see them.");
-            return;
+            self.tab = Tab::Table;
         }
         ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.tab, Tab::Table, "Table");
+            if self.hiding().is_some() {
+                ui.weak("the views, action mask and hidden cards are hidden while you play; tick peek to see them");
+                return;
+            }
             ui.selectable_value(&mut self.tab, Tab::Views, "What each player sees");
             ui.selectable_value(&mut self.tab, Tab::Mask, "Action mask");
             ui.selectable_value(&mut self.tab, Tab::Hidden, "Hidden information");
         });
         ui.add_space(6.0);
+    }
+
+    fn tabs(&mut self, ui: &mut egui::Ui) {
         match self.tab {
+            Tab::Table => {}
             Tab::Views => self.views_tab(ui),
             Tab::Mask => {
                 if let Some(code) = mask_tab(ui, &self.state()) {
@@ -920,6 +936,178 @@ impl Viewer {
             }
             Tab::Hidden => hidden_tab(ui, &self.state()),
         }
+    }
+
+    fn table(&mut self, ui: &mut egui::Ui) {
+        let state = self.state();
+        let me = self.play.as_ref().map(|p| p.human);
+        let hiding = self.hiding();
+        let mine = me.is_some() && self.may_move();
+        ui.add(egui::Label::new(RichText::new(banner(&state, me, mine)).size(17.0).strong().color(actor_color(state.actor()))).wrap());
+        if let Some(message) = &self.message {
+            ui.colored_label(BAD, message);
+        }
+        if mine || me.is_none() {
+            if let Some(code) = quick_moves(ui, &state) {
+                self.take(code);
+            }
+            if matches!(state.phase(), Phase::Discard { .. }) {
+                self.discard_picker(ui, &state);
+            } else if state.legal_actions().iter().any(|a| matches!(a, Action::Deal(_))) {
+                ui.collapsing(if matches!(state.phase(), Phase::Respond { .. }) { "Counter with your own terms" } else { "Offer a trade" }, |ui| {
+                    self.offer_builder(ui, &state);
+                });
+            }
+        }
+
+        let offer = match state.phase() {
+            Phase::Respond { deal, responder, accepted, counters } => Some((deal, Some(responder), accepted, counters)),
+            Phase::Confirm { deal, accepted, counters } => Some((deal, None, accepted, counters)),
+            _ => None,
+        };
+        if let Some((deal, responder, accepted, counters)) = offer {
+            heading(ui, "Offer on the table");
+            let Deal { give, get } = Deal::from_id(deal);
+            let proposer = state.current();
+            ui.horizontal_wrapped(|ui| {
+                ui.colored_label(PLAYERS[proposer.index()], RichText::new(who(proposer, me)).strong());
+                ui.label("gives");
+                chips(ui, give);
+                ui.label("for");
+                chips(ui, get);
+            });
+            let order: Vec<Player> = state.others(proposer).collect();
+            let turn = responder.and_then(|r| order.iter().position(|&p| p == r)).unwrap_or(order.len());
+            for (k, &p) in order.iter().enumerate() {
+                ui.horizontal_wrapped(|ui| {
+                    ui.colored_label(PLAYERS[p.index()], format!("  {}", who(p, me)));
+                    match counters[p.index()] {
+                        Some(id) => {
+                            let c = Deal::from_id(id);
+                            ui.label("countered: gives");
+                            chips(ui, c.give);
+                            ui.label("for");
+                            chips(ui, c.get);
+                        }
+                        None if accepted >> p.index() & 1 == 1 => {
+                            ui.colored_label(GOOD, "accepted");
+                        }
+                        None if k < turn => {
+                            ui.colored_label(BAD, "declined");
+                        }
+                        None if k == turn => {
+                            ui.weak("deciding…");
+                        }
+                        None => {
+                            ui.weak("waiting");
+                        }
+                    }
+                });
+            }
+            if responder == me && me.is_some() {
+                ui.weak("Accept or decline above, or counter with your own terms.");
+            }
+        } else if let Some(last) = state.last_offer() {
+            heading(ui, "Last offer this turn");
+            let Deal { give, get } = Deal::from_id(last.deal);
+            let proposer = state.current();
+            let names = |bits: u8| state.others(proposer).filter(|p| bits >> p.index() & 1 == 1).map(|p| who(p, me)).collect::<Vec<_>>().join(", ");
+            ui.horizontal_wrapped(|ui| {
+                ui.colored_label(PLAYERS[proposer.index()], who(proposer, me));
+                ui.label("offered");
+                chips(ui, give);
+                ui.label("for");
+                chips(ui, get);
+            });
+            let mut outcome = vec![if last.traded { "traded".to_string() } else { "no trade".to_string() }];
+            if last.accepted != 0 {
+                outcome.push(format!("accepted by {}", names(last.accepted)));
+            }
+            if last.countered != 0 {
+                outcome.push(format!("countered by {}", names(last.countered)));
+            }
+            ui.weak(outcome.join(" · "));
+        }
+
+        let holder = me.unwrap_or(state.current());
+        heading(ui, if me.is_some() { "Your hand" } else { "Hand of the player whose turn it is" });
+        ui.horizontal(|ui| {
+            for r in Resource::ALL {
+                card(ui, resource_color(r), state.hand(holder)[r.index()], resource_name(r));
+            }
+        });
+        let devs: Vec<String> = DevCard::ALL
+            .into_iter()
+            .filter(|&c| state.dev_cards(holder, c) > 0)
+            .map(|c| {
+                let new = if holder == state.current() { state.bought(c) } else { 0 };
+                let fresh = if new > 0 { format!(" ({new} new, playable next turn)") } else { String::new() };
+                format!("{} {}{fresh}", state.dev_cards(holder, c), card_name(c))
+            })
+            .collect();
+        ui.label(if devs.is_empty() { "no development cards".to_string() } else { devs.join(" · ") });
+
+        let rolls: Vec<(usize, u8)> = (0..self.at)
+            .filter_map(|i| match (self.states[i].actor(), self.states[i].outcome(self.steps[i])) {
+                (Some(Actor::Chance), Some(Outcome::Dice(sum))) => Some((i, sum)),
+                _ => None,
+            })
+            .collect();
+        heading(ui, "Dice");
+        match rolls.last() {
+            Some(&(i, sum)) => {
+                let roller = self.states[i].current();
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(sum.to_string()).size(30.0).strong().color(if sum == 7 { BAD } else { ui.visuals().strong_text_color() }));
+                    ui.colored_label(PLAYERS[roller.index()], format!("rolled by {}", who(roller, me)));
+                });
+            }
+            None => {
+                ui.weak("no rolls yet");
+            }
+        }
+        dice_chart(ui, &rolls.iter().map(|&(_, s)| s).collect::<Vec<_>>());
+
+        heading(ui, "Scores");
+        egui::Grid::new("scores").striped(true).num_columns(7).show(ui, |ui| {
+            for title in ["", "points", "cards", "dev", "knights", "road", ""] {
+                ui.weak(title);
+            }
+            ui.end_row();
+            for p in state.seats() {
+                let open = hiding.is_none_or(|h| h == p);
+                let name = RichText::new(who(p, me)).color(PLAYERS[p.index()]);
+                ui.label(if p == state.current() { name.strong() } else { name });
+                ui.label(if open { state.victory_points(p) } else { state.public_victory_points(p) }.to_string());
+                ui.label(state.hand_size(p).to_string());
+                ui.label(state.dev_card_count(p).to_string());
+                ui.label(state.knights(p).to_string());
+                ui.label(state.road_length(p).to_string());
+                let titles: Vec<&str> = [(state.longest_road(), "longest road"), (state.largest_army(), "largest army")]
+                    .iter()
+                    .filter(|(h, _)| *h == Some(p))
+                    .map(|(_, n)| *n)
+                    .collect();
+                ui.weak(titles.join(", "));
+                ui.end_row();
+            }
+        });
+
+        heading(ui, "Log");
+        let mut lines: Vec<(Color32, String, usize)> = Vec::new();
+        for i in 0..self.at {
+            let Some((color, text)) = event(&self.states[i], self.steps[i], &self.states[i + 1], me, hiding.is_some()) else { continue };
+            match lines.last_mut() {
+                Some(last) if last.1 == text => last.2 += 1,
+                _ => lines.push((color, text, 1)),
+            }
+        }
+        egui::ScrollArea::vertical().id_salt("log").max_height(300.0).stick_to_bottom(true).show(ui, |ui| {
+            for (color, text, n) in lines.iter().skip(lines.len().saturating_sub(200)) {
+                let text = if *n > 1 { format!("{text} ×{n}") } else { text.clone() };
+                ui.colored_label(*color, text);
+            }
+        });
     }
 
     fn views_tab(&self, ui: &mut egui::Ui) {
@@ -961,14 +1149,28 @@ impl eframe::App for Viewer {
             }
         }
         egui::Panel::top("toolbar").show(ui, |ui| self.toolbar(ui));
-        egui::Panel::right("side").resizable(true).default_size(440.0).show(ui, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| self.side(ui));
-        });
+        if self.tab != Tab::Table {
+            egui::Panel::right("side").resizable(true).default_size(440.0).show(ui, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| self.side(ui));
+            });
+        }
         egui::CentralPanel::default().show(ui, |ui| {
+            self.tab_strip(ui);
             egui::ScrollArea::vertical().show(ui, |ui| {
-                self.board(ui);
-                ui.separator();
-                self.tabs(ui);
+                if self.tab == Tab::Table {
+                    let width = (ui.available_width() * 0.6).min(780.0);
+                    ui.horizontal_top(|ui| {
+                        ui.vertical(|ui| {
+                            ui.set_width(width);
+                            self.board(ui);
+                        });
+                        ui.vertical(|ui| self.table(ui));
+                    });
+                } else {
+                    self.board(ui);
+                    ui.separator();
+                    self.tabs(ui);
+                }
             });
         });
     }
@@ -1052,6 +1254,206 @@ fn answers(ui: &mut egui::Ui, state: &State, accepted: u8, counters: [Option<u8>
         };
         ui.colored_label(PLAYERS[other.index()], format!("{other:?} {answer}"));
     }
+}
+
+fn who(p: Player, me: Option<Player>) -> String {
+    if Some(p) == me { "You".into() } else { format!("{p:?}") }
+}
+
+fn banner(state: &State, me: Option<Player>, mine: bool) -> String {
+    if let Some(winner) = state.winner() {
+        return format!("{} won", who(winner, me));
+    }
+    if !mine {
+        return match state.actor() {
+            Some(Actor::Player(p)) if me.is_some() => format!("{} is thinking…", who(p, me)),
+            _ => phase_label(state),
+        };
+    }
+    match state.phase() {
+        Phase::PlaceSettlement => "Place a settlement: click a highlighted corner".into(),
+        Phase::PlaceRoad { .. } => "Place a road next to it".into(),
+        Phase::Turn { rolled: false } => "Your turn: roll the dice".into(),
+        Phase::Turn { rolled: true } => "Your turn: build, trade, or end your turn".into(),
+        Phase::Discard { owed, .. } => format!("Discard {owed} cards: pick them below"),
+        Phase::MoveRobber { .. } => "Move the robber: click a highlighted hex".into(),
+        Phase::ChooseVictim { .. } => "Choose whom to rob".into(),
+        Phase::RoadBuilding { roads, .. } => format!("Place {roads} free road{}", if roads == 1 { "" } else { "s" }),
+        Phase::YearOfPlenty { picks, .. } => format!("Take {picks} resource{} from the bank", if picks == 1 { "" } else { "s" }),
+        Phase::Monopoly { .. } => "Name a resource: everyone gives you all of theirs".into(),
+        Phase::Respond { .. } => format!("{} offers you a trade", who(state.current(), me)),
+        Phase::Confirm { .. } => "Pick whom to trade with, or cancel".into(),
+        _ => phase_label(state),
+    }
+}
+
+/// Buttons for the moves that are not on the board and not a trade offer.
+fn quick_moves(ui: &mut egui::Ui, state: &State) -> Option<u16> {
+    let Some(Actor::Player(_)) = state.actor() else { return None };
+    let legal: Vec<Action> = state.legal_actions().iter().collect();
+    let (bank, rest): (Vec<Action>, Vec<Action>) = legal
+        .into_iter()
+        .filter(|a| !on_board(*a) && !matches!(a, Action::Deal(_)) && !matches!(state.phase(), Phase::Discard { .. }))
+        .partition(|a| matches!(a, Action::Trade { .. }));
+    let mut chosen = None;
+    ui.horizontal_wrapped(|ui| {
+        for a in rest {
+            let label = match a {
+                Action::Rob(offset) => format!("rob {:?}", state.current().after(usize::from(offset), state.players())),
+                _ => step_label(state, a.index()),
+            };
+            if ui.button(RichText::new(label).size(15.0)).clicked() {
+                chosen = Some(a.index());
+            }
+        }
+    });
+    if !bank.is_empty() {
+        ui.collapsing(format!("Trade with the bank or a harbor ({})", bank.len()), |ui| {
+            ui.horizontal_wrapped(|ui| {
+                for a in bank {
+                    if let Action::Trade { give, get, rate } = a {
+                        if ui.button(format!("{rate} {} → 1 {}", resource_name(give), resource_name(get))).clicked() {
+                            chosen = Some(a.index());
+                        }
+                    }
+                }
+            });
+        });
+    }
+    chosen
+}
+
+fn chips(ui: &mut egui::Ui, counts: [u8; 5]) {
+    for r in Resource::ALL.into_iter().filter(|r| counts[r.index()] > 0) {
+        let text = RichText::new(format!(" {} {} ", counts[r.index()], resource_name(r))).color(Color32::BLACK).background_color(resource_color(r));
+        ui.label(text);
+    }
+}
+
+fn card(ui: &mut egui::Ui, color: Color32, count: u8, name: &str) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(52.0, 72.0), Sense::hover());
+    let painter = ui.painter();
+    let fill = if count > 0 { color } else { color.gamma_multiply(0.25) };
+    painter.rect_filled(rect, 6.0, fill);
+    painter.text(rect.center() - Vec2::new(0.0, 8.0), Align2::CENTER_CENTER, count.to_string(), FontId::proportional(26.0), Color32::BLACK);
+    painter.text(rect.center_bottom() - Vec2::new(0.0, 10.0), Align2::CENTER_CENTER, name, FontId::proportional(11.0), Color32::BLACK);
+}
+
+/// How often each sum has come up, with the count to expect from that many rolls of fair dice as a line.
+fn dice_chart(ui: &mut egui::Ui, rolls: &[u8]) {
+    let mut counts = [0usize; 13];
+    rolls.iter().for_each(|&s| counts[usize::from(s)] += 1);
+    let expected = |s: usize| rolls.len() as f32 * (6 - (7 - s as i32).abs()) as f32 / 36.0;
+    let top = (2..=12).map(|s| (counts[s] as f32).max(expected(s))).fold(1.0, f32::max);
+    let width = ui.available_width().min(420.0);
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 110.0), Sense::hover());
+    let painter = ui.painter();
+    let slot = rect.width() / 11.0;
+    let base = rect.bottom() - 16.0;
+    let height = rect.height() - 34.0;
+    let last = rolls.last().map(|&s| usize::from(s));
+    let ink = ui.visuals().text_color();
+    for s in 2..=12 {
+        let x = rect.left() + (s - 2) as f32 * slot;
+        let bar = egui::Rect::from_min_max(Pos2::new(x + 3.0, base - height * counts[s] as f32 / top), Pos2::new(x + slot - 3.0, base));
+        painter.rect_filled(bar, 2.0, if Some(s) == last { ACCENT } else { ACCENT.gamma_multiply(0.45) });
+        let e = base - height * expected(s) / top;
+        painter.line_segment([Pos2::new(x + 1.0, e), Pos2::new(x + slot - 1.0, e)], Stroke::new(2.0, ink));
+        painter.text(Pos2::new(x + slot / 2.0, base + 8.0), Align2::CENTER_CENTER, s.to_string(), FontId::proportional(12.0), ink);
+        if counts[s] > 0 {
+            painter.text(Pos2::new(x + slot / 2.0, bar.top() - 7.0), Align2::CENTER_CENTER, counts[s].to_string(), FontId::proportional(11.0), ink);
+        }
+    }
+    ui.weak(format!("{} rolls; bars are how often each sum came up, lines what fair dice would give on average", rolls.len()));
+}
+
+/// One step of the game in words, as `me` is allowed to see it (everything, when not hiding).
+fn event(before: &State, code: u16, after: &State, me: Option<Player>, hiding: bool) -> Option<(Color32, String)> {
+    let current = before.current();
+    let sees = |p: Player| !hiding || Some(p) == me;
+    let name = |p: Player| who(p, me);
+    let color = |p: Player| PLAYERS[p.index()];
+    let gained = |p: Player| -> [u8; 5] { std::array::from_fn(|r| after.hand(p)[r].saturating_sub(before.hand(p)[r])) };
+    if before.actor() == Some(Actor::Chance) {
+        return match before.outcome(code)? {
+            Outcome::Dice(sum) => {
+                let mut text = format!("{} rolled {sum}", name(current));
+                for p in before.seats() {
+                    let got = gained(p);
+                    if got.iter().any(|&n| n > 0) {
+                        text += &format!(" · {} got {}", name(p), bundle(got));
+                    }
+                }
+                Some((color(current), text))
+            }
+            Outcome::Steal(r) => {
+                let Phase::Steal { victim, .. } = before.phase() else { return None };
+                let what = if sees(current) || sees(victim) { format!("1 {}", resource_name(r)) } else { "a card".into() };
+                Some((color(current), format!("{} stole {what} from {}", name(current), name(victim))))
+            }
+            Outcome::Draw(c) => sees(current).then(|| (color(current), format!("{} drew a {} card", name(current), card_name(c)))),
+        };
+    }
+    let Some(Actor::Player(p)) = before.actor() else { return None };
+    let action = Action::from_index(code)?;
+    let text = match (before.phase(), action) {
+        (_, Action::Roll) => return None,
+        (Phase::PlaceSettlement, Action::Settlement(_)) => "placed a settlement".into(),
+        (Phase::PlaceRoad { .. }, Action::Road(_)) => "placed a road".into(),
+        (Phase::RoadBuilding { .. }, Action::Road(_)) => "built a free road".into(),
+        (_, Action::Settlement(_)) => "built a settlement".into(),
+        (_, Action::City(_)) => "built a city".into(),
+        (_, Action::Road(_)) => "built a road".into(),
+        (_, Action::Robber(h)) => {
+            let board = before.board();
+            let token = board.token(h).map_or(String::new(), |t| format!(" {t}"));
+            format!("moved the robber to the {}{token}", terrain_name(board.terrain(h)))
+        }
+        (Phase::Discard { .. }, Action::Resource(r)) => match sees(p) {
+            true => format!("discarded 1 {}", resource_name(r)),
+            false => "discarded a card".into(),
+        },
+        (Phase::YearOfPlenty { .. }, Action::Resource(r)) => format!("took 1 {} with year of plenty", resource_name(r)),
+        (Phase::Monopoly { .. }, Action::Resource(r)) => {
+            let took = gained(p)[r.index()];
+            format!("named {} for monopoly and took {took}", resource_name(r))
+        }
+        (_, Action::Resource(r)) => format!("named {}", resource_name(r)),
+        (_, Action::Trade { give, get, rate }) => {
+            let with = if rate == 4 { "the bank" } else { "a harbor" };
+            format!("traded {rate} {} for 1 {} with {with}", resource_name(give), resource_name(get))
+        }
+        (_, Action::EndTurn) => "ended the turn".into(),
+        (_, Action::BuyCard) => "bought a development card".into(),
+        (_, Action::PlayKnight) => "played a knight".into(),
+        (_, Action::PlayRoadBuilding) => "played road building".into(),
+        (_, Action::PlayYearOfPlenty) => "played year of plenty".into(),
+        (_, Action::PlayMonopoly) => "played monopoly".into(),
+        (_, Action::Rob(offset)) => format!("chose to rob {}", name(p.after(usize::from(offset), before.players()))),
+        (Phase::Respond { .. }, Action::Deal(id)) => {
+            let deal = Deal::from_id(id);
+            format!("countered: gives {} for {}", bundle(deal.give), bundle(deal.get))
+        }
+        (_, Action::Deal(id)) => {
+            let deal = Deal::from_id(id);
+            format!("offered {} for {}", bundle(deal.give), bundle(deal.get))
+        }
+        (_, Action::Accept) => "accepted".into(),
+        (_, Action::Decline) => "declined".into(),
+        (Phase::Confirm { deal, .. }, Action::TradeWith(offset)) => {
+            let deal = Deal::from_id(deal);
+            let partner = current.after(usize::from(offset), before.players());
+            format!("traded with {}: gave {}, got {}", name(partner), bundle(deal.give), bundle(deal.get))
+        }
+        (Phase::Confirm { counters, .. }, Action::TakeCounter(offset)) => {
+            let partner = current.after(usize::from(offset), before.players());
+            let deal = Deal::from_id(counters[partner.index()]?);
+            format!("took {}'s counter: gave {}, got {}", name(partner), bundle(deal.get), bundle(deal.give))
+        }
+        (_, Action::Cancel) => "cancelled the offer".into(),
+        (_, action) => action_label(action),
+    };
+    Some((color(p), format!("{} {text}", name(p))))
 }
 
 fn players(ui: &mut egui::Ui, state: &State, hiding: Option<Player>) {

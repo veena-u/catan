@@ -7,13 +7,18 @@
 #   search-turn imagines each future through every other player's turn, until the searcher moves again
 #   memory is plain training on rules that remember this turn's last offer; start it from a later network with
 #   START=runs/plain-latest.pt ARM=memory bash experiment.sh (the anchor stays the reference for every arm)
+#   league learns from search, searches setup placements and robber moves more deeply, and plays half its games
+#   against earlier versions of itself; e.g. START=runs/best.pt ANCHOR=runs/best.pt ARM=league bash experiment.sh
+#   (LEAGUE_FROM adds other saved networks to its pool of opponents; any .pt copied into runs/inbox joins it at a checkup)
+#   exploit trains a network only to beat the frozen anchor, then feeds it to the league through runs/inbox:
+#   ANCHOR=runs/main.pt ARM=exploit bash experiment.sh
 #   see how the arms are doing:   bash experiment.sh status
 set -uo pipefail
 if [ -f /venv/main/bin/activate ]; then source /venv/main/bin/activate; fi
 cd "$(dirname "$0")"
 
 if [ "${1:-}" = status ]; then
-  for arm in plain search search-turn memory; do
+  for arm in plain search search-turn memory league exploit; do
     [ -f "runs/$arm.out" ] || continue
     echo "== $arm  (hours count from the latest start)"
     grep "(eval" "runs/$arm.out" | awk '{
@@ -31,25 +36,28 @@ if [ "${1:-}" = status ]; then
   exit 0
 fi
 
-ARM=${ARM:?set ARM=plain, search or search-turn}
+ARM=${ARM:?set ARM=plain, search, search-turn, memory or league}
+ANCHOR=${ANCHOR:-runs/anchor.pt}
 case $ARM in
   plain) EXTRA="" ;;
   search) EXTRA="--expert" ;;
   search-turn) EXTRA="--expert --expert-depth 0 --expert-games 16" ;;
   memory) EXTRA="" ;;
-  *) echo "ARM is plain, search, search-turn or memory"; exit 1 ;;
+  league) EXTRA="--expert --key-games 8 --league 0.5 --league-from $ANCHOR ${LEAGUE_FROM:-} --league-watch runs/inbox" ;;
+  exploit) EXTRA="--exploit $ANCHOR --bot-games 0" ;;
+  *) echo "ARM is plain, search, search-turn, memory, league or exploit"; exit 1 ;;
 esac
-START=${START:-runs/anchor.pt}
-[ -f runs/anchor.pt ] || { echo "put the starting network at runs/anchor.pt first"; exit 1; }
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+START=${START:-$ANCHOR}
+[ -f "$ANCHOR" ] || { echo "put the starting network at $ANCHOR first"; exit 1; }
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF-expandable_segments:True}
 python -m pip install --quiet ./python
 mkdir -p "runs/$ARM"
 [ -f "runs/$ARM/latest.pt" ] || cp "$START" "runs/$ARM/latest.pt"
 echo "=== $ARM, continuing from $START ($(date))" | tee -a "runs/$ARM.out"
-SIZE=$(python -c "import torch; a = torch.load('runs/anchor.pt', map_location='cpu')['args']; \
+SIZE=$(python -c "import torch; a = torch.load('$START', map_location='cpu')['args']; \
 print(f\"--width {a['width']} --depth {a['depth']}\" + (' --entities' if a.get('entities') else ''))")
 python -u -m train.selfplay --games "${GAMES:-2048}" --rounds "${ROUNDS:-64}" --minibatch "${MINIBATCH:-4096}" \
   --eval-every "${EVAL_EVERY:-50}" --eval-games "${EVAL_GAMES:-512}" --save-every 250 \
   --anneal-power 0.5 --anneal-steps 200 --magnet-anneal-steps 20 --players 4 $SIZE \
-  --symmetry --vp-fade 2000 --iterations "${ITERATIONS:-100000}" --anchor runs/anchor.pt $EXTRA ${MORE:-} \
+  --symmetry --vp-fade 2000 --iterations "${ITERATIONS:-100000}" --anchor "$ANCHOR" $EXTRA ${MORE:-} \
   --out "runs/$ARM" >> "runs/$ARM.out" 2>&1

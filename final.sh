@@ -34,17 +34,22 @@ once() {
   fi
 }
 
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF-expandable_segments:True}
+RETRIES=${RETRIES:-20}
 mkdir -p runs
 python -m pip install --quiet ./python
 echo "$NAME: flags ${FLAGS:-(none)}; $ITERATIONS iterations; seed $SEED"
 if [ ! -f "$RUN/iter_$(printf %05d "$ITERATIONS").pt" ]; then
-  echo "=== training $NAME ($(date))"
-  python -u -m train.selfplay $BASE --iterations "$ITERATIONS" --seed "$SEED" $FLAGS --out "$RUN" >> "$RUN.out" 2>&1 || {
-    echo "!!! $NAME failed; the last lines of $RUN.out:"
-    tail -5 "$RUN.out"
-    exit 1
-  }
+  for attempt in $(seq 1 "$RETRIES"); do
+    echo "=== training $NAME, attempt $attempt ($(date))"
+    if python -u -m train.selfplay $BASE --iterations "$ITERATIONS" --seed "$SEED" $FLAGS --out "$RUN" >> "$RUN.out" 2>&1; then
+      break
+    fi
+    echo "!!! $NAME stopped; the last lines of $RUN.out:"
+    tail -3 "$RUN.out"
+    [ "$attempt" -eq "$RETRIES" ] && exit 1
+    sleep 60
+  done
 fi
 once "$RUN/habits.txt" "$RUN/habits.out" python -m train.habits "$RUN/latest.pt" --players "$PLAYERS" --games 200
 once "$RUN/ladder.txt" "$RUN/ladder.out" python -m train.ladder "$RUN" --players "$PLAYERS" --checkpoints 8
