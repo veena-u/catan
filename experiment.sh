@@ -9,6 +9,9 @@
 #   START=runs/plain-latest.pt ARM=memory bash experiment.sh (the anchor stays the reference for every arm)
 #   league learns from search, searches setup placements and robber moves more deeply, and plays half its games
 #   against earlier versions of itself; e.g. START=runs/best.pt ANCHOR=runs/best.pt ARM=league bash experiment.sh
+#   league-plain is the same without search, so it runs at close to plain speed
+#   binding is memory's plain training under the rule that an accepted offer can't be cancelled; start it from
+#   memory's final network: START=runs/memory-final.pt ANCHOR=runs/memory-final.pt ARM=binding bash experiment.sh
 #   (LEAGUE_FROM adds other saved networks to its pool of opponents; any .pt copied into runs/inbox joins it at a checkup)
 #   exploit trains a network only to beat the frozen anchor, then feeds it to the league through runs/inbox:
 #   ANCHOR=runs/main.pt ARM=exploit bash experiment.sh
@@ -18,12 +21,12 @@ if [ -f /venv/main/bin/activate ]; then source /venv/main/bin/activate; fi
 cd "$(dirname "$0")"
 
 if [ "${1:-}" = status ]; then
-  for arm in plain search search-turn memory league exploit; do
+  for arm in plain search search-turn memory league league-plain binding exploit; do
     [ -f "runs/$arm.out" ] || continue
     echo "== $arm  (hours count from the latest start)"
     grep "(eval" "runs/$arm.out" | awk '{
       for (i = 1; i <= NF; i++) {
-        if ($i == "iter") it = $(i + 1)
+        if (i == 1 && $i == "iter") it = $(i + 1)
         if ($i ~ /^[0-9]+s$/ && !hours) hours = substr($i, 1, length($i) - 1) / 3600
         if ($i == "anchor") anchor = $(i + 1)
         if ($i == "bot" && $(i - 1) == "vs") bot = $(i + 1)
@@ -44,8 +47,10 @@ case $ARM in
   search-turn) EXTRA="--expert --expert-depth 0 --expert-games 16" ;;
   memory) EXTRA="" ;;
   league) EXTRA="--expert --key-games 8 --league 0.5 --league-from $ANCHOR ${LEAGUE_FROM:-} --league-watch runs/inbox" ;;
+  binding) EXTRA="" ;;
+  league-plain) EXTRA="--league 0.5 --league-from $ANCHOR ${LEAGUE_FROM:-} --league-watch runs/inbox" ;;
   exploit) EXTRA="--exploit $ANCHOR --bot-games 0" ;;
-  *) echo "ARM is plain, search, search-turn, memory, league or exploit"; exit 1 ;;
+  *) echo "ARM is plain, search, search-turn, memory, league, league-plain, binding or exploit"; exit 1 ;;
 esac
 START=${START:-$ANCHOR}
 [ -f "$ANCHOR" ] || { echo "put the starting network at $ANCHOR first"; exit 1; }

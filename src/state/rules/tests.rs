@@ -803,7 +803,7 @@ fn an_accepted_offer_trades_with_the_chosen_partner_and_everyone_sees_it() {
     assert_eq!(state.legal_actions().iter().collect::<Vec<_>>(), [Action::Decline], "the third player has nothing to accept or counter with");
     state.transition(Action::Decline);
     state.transition(Action::Accept);
-    assert_eq!(state.legal_actions().iter().collect::<Vec<_>>(), [Action::TradeWith(1), Action::TradeWith(3), Action::Cancel]);
+    assert_eq!(state.legal_actions().iter().collect::<Vec<_>>(), [Action::TradeWith(1), Action::TradeWith(3)], "an accepted offer is binding");
     state.transition(Action::TradeWith(3));
     assert_eq!(state.hands, seats(&[[0, 0, 0, 0, 1], [0, 0, 0, 0, 1], [0; 5], [2, 0, 0, 0, 2]]));
     assert_eq!(state.phase, Phase::Turn { rolled: true });

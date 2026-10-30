@@ -368,7 +368,10 @@ impl State {
                         mask.insert(Action::TakeCounter(offset as u8));
                     }
                 }
-                mask.insert(Action::Cancel);
+                // once someone accepts, the offer is binding: trade with an accepter (or take a counter)
+                if accepted == 0 {
+                    mask.insert(Action::Cancel);
+                }
             }
             Phase::Discard { player, owed, from } => {
                 let hand = &self.hands[player.index()];
