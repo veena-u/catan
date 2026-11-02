@@ -26,6 +26,8 @@ PHASES = [
 NAMES = ["Blue", "Red", "Orange", "Green"]
 BANK_PAIRS = [(give, get) for give in range(5) for get in range(5) if get != give]
 MAX_PROPOSED = 40
+PHASE_AT = 296
+END_TURN, OFFER, SEND, ACCEPT, DECLINE, COUNTER, TRADE_WITH, TAKE_COUNTER, CANCEL = 225, 234, 245, 247, 248, 249, 250, 253, 256
 HEXES, EDGE_ENDS = (a.tolist() for a in catan.topology())
 HEX_POINTS, VERTEX_POINTS, COAST = (a.tolist() for a in catan.geometry())
 GEOMETRY = {"hexes": HEX_POINTS, "vertices": VERTEX_POINTS, "edges": EDGE_ENDS, "corners": HEXES, "coast": COAST}
@@ -33,6 +35,9 @@ GEOMETRY = {"hexes": HEX_POINTS, "vertices": VERTEX_POINTS, "edges": EDGE_ENDS, 
 def bitset(raw, count):
     value = int.from_bytes(bytes(raw), "little")
     return [i for i in range(count) if value >> i & 1]
+
+def sides(counts):
+    return [max(-c, 0) for c in counts], [max(c, 0) for c in counts]
 
 def cards(counts):
     named = [f"{n} {RESOURCES[r]}" for r, n in enumerate(counts) if n]
@@ -51,14 +56,17 @@ class Session:
         self.game = catan.Game(self.seed, self.args.players, rules=self.rules)
         self.game.settle()
         self.events, self.read, self.last_roll, self.victim, self.mover = [], 0, None, None, 0
+        self.trade = None
 
     def absolute(self, relative):
         return (self.human + relative) % self.args.players
 
-    def act(self, code):
+    def act(self, code, deal=None):
         if self.game.to_act() != self.human or code not in self.game.legal():
             raise ValueError("that move is not yours to make now")
-        self.take(code)
+        if deal is not None and (code not in (OFFER, COUNTER) or len(deal) != 5):
+            raise ValueError("a deal goes with an offer or a counter-offer, as five counts")
+        self.take(code, None if deal is None else [int(c) for c in deal])
 
     def step(self):
         actor = self.game.to_act()
@@ -73,9 +81,73 @@ class Session:
         self.take(int(actions[0]), [int(c) for c in offers[0]])
 
     def take(self, code, deal=None):
+        actor, phase = self.game.to_act(), PHASES[self.game.observe_as(self.human)[PHASE_AT]]
+        self.track(actor, phase, code, deal, self.game.draft())
         self.game.step(code, deal)
         self.game.settle()
         self.narrate()
+        self.settled()
+
+    def say(self, seat, text):
+        self.events.append({"seat": seat, "text": text})
+
+    def track(self, actor, phase, code, deal, drafted):
+        n = self.args.players
+        if code == END_TURN:
+            self.trade = None
+        if code == OFFER and deal is not None:
+            self.open_offer(actor, *sides(deal))
+        elif phase == "draft" and code == SEND and drafted:
+            self.open_offer(actor, list(drafted[1]), list(drafted[2]))
+        elif phase == "respond" and self.trade:
+            if code == ACCEPT:
+                self.answer(actor, "accepted")
+            elif code == DECLINE:
+                self.answer(actor, "declined")
+            elif code == COUNTER and deal is not None:
+                self.answer(actor, "countered", *sides(deal))
+            elif code == SEND and drafted and drafted[0] == 2:
+                self.answer(actor, "countered", list(drafted[1]), list(drafted[2]))
+        elif phase == "confirm" and self.trade:
+            if TRADE_WITH <= code < TAKE_COUNTER:
+                partner = (actor + code - TRADE_WITH + 1) % n
+                self.close(f"traded with {NAMES[partner]}", partner)
+            elif TAKE_COUNTER <= code < CANCEL:
+                partner = (actor + code - TAKE_COUNTER + 1) % n
+                self.close(f"took {NAMES[partner]}'s counter-offer", partner)
+            elif code == CANCEL:
+                self.close("called off the trade")
+
+    def open_offer(self, proposer, give, get):
+        others = [(proposer + k) % self.args.players for k in range(1, self.args.players)]
+        self.trade = {"proposer": proposer, "give": give, "get": get, "result": None, "partner": None,
+                      "answers": {s: {"seat": s, "status": "waiting", "counter": None} for s in others}}
+        self.say(proposer, f"offered {cards(give)} for {cards(get)}")
+
+    def answer(self, seat, status, give=None, get=None):
+        entry = self.trade["answers"][seat]
+        entry["status"] = status
+        if give is not None:
+            entry["counter"] = {"give": give, "get": get}
+            self.say(seat, f"countered: gives {cards(give)} for {cards(get)}")
+        else:
+            self.say(seat, f"{status} the offer")
+
+    def close(self, text, partner=None):
+        self.trade["result"], self.trade["partner"] = text, partner
+        self.say(self.trade["proposer"], text)
+
+    def settled(self):
+        if not self.trade or self.trade["result"]:
+            return
+        phase = PHASES[self.game.observe_as(self.human)[PHASE_AT]]
+        if phase in ("draft", "respond", "confirm"):
+            return
+        for entry in self.trade["answers"].values():
+            if entry["status"] == "waiting":
+                entry["status"] = "declined"
+        countered = any(e["status"] == "countered" for e in self.trade["answers"].values())
+        self.close("couldn't take the counter-offer, so the trade fell through" if countered else "got no takers")
 
     def narrate(self):
         history = self.game.history()
@@ -127,19 +199,6 @@ class Session:
             return f"traded {RESOURCES[give]} for 1 {RESOURCES[get]} with the bank"
         if kind.startswith("play "):
             return f"played {kind[5:].title()}"
-        if kind == "send" and PHASES[phase] == "draft":
-            offer = seen[TRADE_AT:TRADE_AT + 10]
-            return f"offered {cards(offer[:5])} for {cards(offer[5:])}"
-        if kind == "send":
-            return "made a counter-offer"
-        if kind in ("accept", "decline"):
-            return f"{kind}d the offer"
-        if kind == "trade with":
-            return f"traded with {NAMES[(actor + i + 1) % n]}"
-        if kind == "take counter":
-            return f"took {NAMES[(actor + i + 1) % n]}'s counter-offer"
-        if kind == "cancel":
-            return "called off the trade"
         if kind == "end turn":
             return "ended their turn"
         return None
@@ -228,6 +287,8 @@ class Session:
             },
             "lastRoll": self.last_roll,
             "moves": self.moves(), "events": self.events[-60:], "record": self.game.record(),
+            "forbidden": self.game.forbidden() if self.game.to_act() == self.human else [],
+            "offerBoard": None if self.trade is None else {**self.trade, "answers": sorted(self.trade["answers"].values(), key=lambda e: e["seat"])},
         }
 
 class Handler(BaseHTTPRequestHandler):
@@ -262,7 +323,7 @@ class Handler(BaseHTTPRequestHandler):
                 if self.path == "/api/new":
                     session.new(body.get("seed"), body.get("seat"))
                 elif self.path == "/api/act":
-                    session.act(int(body["code"]))
+                    session.act(int(body["code"]), body.get("deal"))
                 elif self.path == "/api/step":
                     session.step()
                 else:

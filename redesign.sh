@@ -22,11 +22,12 @@ if [ "${1:-}" = status ]; then
   exit 0
 fi
 
-ARMS="baseline, one-pass, no-hands, no-answers, league, population or exploit"
+ARMS="baseline, no-trading, one-pass, no-hands, no-answers, league, population or exploit"
 ARM=${1:?name a run: $ARMS}
 SEED=${SEED:?set SEED, e.g. SEED=1}
 case $ARM in
   baseline) EXTRA="" ;;
+  no-trading) EXTRA="--no-trading --aux-answers 0" ;;
   one-pass) EXTRA="--epochs 1" ;;
   no-hands) EXTRA="--aux-hands 0" ;;
   no-answers) EXTRA="--aux-answers 0" ;;
@@ -40,7 +41,7 @@ export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF-expandable_segments:Tru
 python -m pip install --quiet ./python
 FLAGS="--players 2 --rules colonist-1v1 --games ${GAMES:-2048} --rounds 64 --minibatch ${MINIBATCH:-4096} \
   --width 128 --depth 4 --symmetry --vp-fade 2000 --opening-explore 0.1 --aux-hands 0.1 --aux-answers 0.1 \
-  --entropy 0.01 --entropy-floor 0.001 --max-decisions 8000 \
+  --entropy 0.01 --entropy-floor 0.001 --max-decisions 8000 --turn-budget 15 \
   --eval-every ${EVAL_EVERY:-200} --eval-games 512 --save-every 250 --checkpoint-every 50 \
   --anneal-power 0.5 --anneal-steps 200 --entropy-anneal-steps 20 --iterations ${ITERATIONS:-100000} --seed $SEED"
 if [ -n "${WANDB_PROJECT:-}" ]; then

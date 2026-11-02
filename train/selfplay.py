@@ -260,7 +260,8 @@ class Rollout:
         offered = torch.zeros(rounds, n, dtype=torch.bool, device=at)
         offer_choices = torch.full((rounds, n, deals.STEPS), -1, dtype=torch.long, device=at)
         offer_masks = torch.ones(rounds, n, deals.STEPS, deals.CHOICES, dtype=torch.bool, device=at)
-        stats = {"won": 0, "truncated": 0, "first_won": 0, "trades": 0, "league": 0, "league_network_won": 0, "explored": 0}
+        stats = {"won": 0, "truncated": 0, "first_won": 0, "trades": 0, "league": 0, "league_network_won": 0, "explored": 0,
+                 "offer_cards": 0, "offers_built": 0}
         habits = Habits()
         learn = torch.ones(rounds, n, dtype=torch.bool, device=at)
         pending, tally, trades = np.full((n, 3), -1), np.zeros(ANSWERS, np.int64), []
@@ -295,6 +296,8 @@ class Rollout:
                 offers[rows] = own_offers[rows]
                 at_rows = self.tensor(rows)
                 offered[t, at_rows], offer_choices[t, at_rows], offer_masks[t, at_rows] = True, sampled[0], sampled[1]
+                stats["offer_cards"] += int((sampled[0] > deals.STOP).sum())
+                stats["offers_built"] += len(rows)
                 with torch.no_grad(), torch.autocast(at.type, dtype=torch.bfloat16, enabled=self.autocast):
                     deal_lp, _ = self.model.deal_log_probs(summary[at_rows], goods[at_rows], self.tensor(mine[rows] == COUNTER),
                                                            sampled[0], sampled[1])
@@ -688,6 +691,10 @@ def main():
             line += f"  answers accept {share[0]:.2f} decline {share[1]:.2f} counter {share[2]:.2f}"
             metrics.update({"trade/answers": int(answered), "trade/accepted": share[0], "trade/declined": share[1],
                             "trade/countered": share[2]})
+        if stats["offers_built"]:
+            cards = stats["offer_cards"] / stats["offers_built"]
+            line += f"  cards per offer {cards:.1f}"
+            metrics["trade/cards_per_offer"] = cards
         advantage, counted = stats["trade_advantage"]
         if counted:
             line += f"  trade advantage {advantage:+.3f}"

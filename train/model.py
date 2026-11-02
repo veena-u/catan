@@ -150,7 +150,8 @@ class Model(nn.Module):
         taken = choices >= 0
         chosen = log_probs.gather(-1, choices.clamp(min=STOP)[..., None]).squeeze(-1)
         entropy = -(log_probs.exp() * log_probs).sum(-1)
-        return torch.where(taken, chosen, 0.0).sum(1), torch.where(taken, entropy, 0.0).sum(1)
+        steps_taken = taken.sum(1).clamp(min=1)
+        return torch.where(taken, chosen, 0.0).sum(1), torch.where(taken, entropy, 0.0).sum(1) / steps_taken
 
 KIND_MEMBERS = torch.from_numpy(np.eye(KIND_COUNT, dtype=np.float32)[KINDS])
 

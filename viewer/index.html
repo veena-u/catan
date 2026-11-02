@@ -92,6 +92,31 @@ button.tool .icon { font-size: 22px; }
 .chip.off { opacity: 0.3; cursor: default; }
 .answers { display: flex; flex-direction: column; gap: 6px; margin: 8px 0; }
 .answers .line { display: flex; align-items: center; gap: 8px; }
+#offer { position: absolute; top: 72px; left: 50%; transform: translateX(-50%); padding: 12px 14px; display: none; min-width: 360px; }
+#offer.done .responses, #offer.done .offer-head { filter: grayscale(0.35); }
+.offer-head { display: flex; align-items: center; gap: 12px; }
+.offer-side { display: flex; flex-direction: column; gap: 3px; }
+.offer-side small, .counter small { color: var(--muted); font-weight: 800; font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px; }
+.swap { font-size: 20px; color: var(--muted); font-weight: 900; }
+.tiles { display: flex; gap: 4px; }
+.tile { width: 30px; height: 40px; border-radius: 6px; display: grid; place-items: center; color: #fff; font-size: 15px; position: relative;
+  border: 2px solid rgba(255, 255, 255, 0.85); box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25); }
+.tile b { position: absolute; right: -5px; bottom: -6px; background: #1d2433; color: #fff; border-radius: 8px; font-size: 10px; padding: 0 4px; }
+.tile.any { width: auto; padding: 0 8px; background: #9aa3b5; font-size: 11px; font-weight: 800; }
+.responses { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line); }
+.response { display: flex; align-items: center; gap: 10px; }
+.mark { width: 30px; height: 30px; border-radius: 50%; display: grid; place-items: center; font-weight: 900; font-size: 16px; color: #fff; flex: none; }
+.mark.yes { background: #2e9d4f; } .mark.no { background: #d84339; } .mark.wait { background: #c3c9d4; } .mark.counter { background: #f0a020; }
+button.mark { padding: 0; cursor: pointer; box-shadow: 0 0 0 4px rgba(46, 157, 79, 0.3); animation: pulse 1.2s ease-in-out infinite; }
+.counter { display: flex; align-items: center; gap: 6px; }
+.choices { display: flex; gap: 10px; margin-top: 10px; align-items: center; }
+.choices button.mark { width: 40px; height: 40px; font-size: 20px; animation: none; box-shadow: none; }
+.result { margin-top: 8px; font-weight: 800; font-size: 13px; color: var(--muted); }
+.builder { display: flex; flex-direction: column; align-items: center; gap: 3px; }
+button.minus { padding: 0 9px; font-size: 14px; line-height: 18px; border-radius: 8px; }
+.minus-space { height: 18px; }
+.discarding { display: flex; flex-direction: column; gap: 6px; align-items: flex-start; margin-left: 8px; }
+.x { background: none; color: var(--muted); padding: 2px 6px; font-size: 16px; }
 #over { position: absolute; inset: 0; display: none; place-items: center; background: rgba(10, 20, 40, 0.55); }
 #over .panel { padding: 28px 36px; text-align: center; }
 #over h2 { margin: 0 0 14px; font-size: 30px; }
@@ -116,6 +141,7 @@ svg .pulse { animation: pulse 1.2s ease-in-out infinite; }
     <svg id="board" xmlns="http://www.w3.org/2000/svg"></svg>
     <div id="dice" class="panel"><span>🎲</span><span class="sum" id="roll">–</span></div>
     <div id="banner" class="panel"></div>
+    <div id="offer" class="panel"></div>
     <div id="trade" class="panel"></div>
     <div id="over"><div class="panel"><h2 id="winner"></h2><button class="primary" id="again">Play again</button></div></div>
   </div>
@@ -135,7 +161,8 @@ const DEV = [["knight", "⚔️", "play knight"], ["victory point", "⭐", null]
 const TERRAIN = { hills: "#c8643b", forest: "#2f7d32", pasture: "#8fd16a", fields: "#f2c94c", mountains: "#8e9aaf", desert: "#e8d39a" };
 const COLORS = ["#1e88e5", "#e53935", "#fb8c00", "#43a047"];
 const R = 52, XS = R * Math.sqrt(3) / 2, YS = R / 2;
-let view = null, mode = null, paused = false, timer = null, busy = false, bankGive = null;
+let give = [0, 0, 0, 0, 0], get = [0, 0, 0, 0, 0];
+let view = null, mode = null, paused = false, timer = null, busy = false, bankGive = null, dismissed = null, chosen = [0, 0, 0, 0, 0];
 
 const $ = (id) => document.getElementById(id);
 const el = (tag, attrs = {}, kids = []) => {
@@ -164,10 +191,10 @@ async function call(path, body) {
   return data;
 }
 
-async function act(code) {
+async function act(code, deal) {
   if (busy) return;
   busy = true;
-  try { view = await call("/api/act", { code }); mode = null; bankGive = null; render(); } catch (e) { console.warn(e); }
+  try { view = await call("/api/act", deal ? { code, deal } : { code }); mode = null; bankGive = null; render(); } catch (e) { console.warn(e); }
   busy = false;
   schedule();
 }
@@ -264,8 +291,6 @@ function drawPlayers() {
   const box = $("players");
   box.replaceChildren();
   for (const s of view.seats) {
-    const answer = s.answer && view.trade.offer ? el("div", { class: "answer", text: s.answer }) : null;
-    const counter = s.counter ? el("div", { class: "answer" }, ["counter: gives ", mini(s.counter.give), " for ", mini(s.counter.get)]) : null;
     box.append(el("div", { class: "player" + (s.seat === view.current ? " current" : "") }, [
       el("div", { class: "avatar", style: `background:${COLORS[s.seat]}`, text: s.you ? "You" : s.name[0] }),
       el("div", {}, [
@@ -277,7 +302,6 @@ function drawPlayers() {
           s.largestArmy ? el("span", { class: "badge", text: "Largest Army" }) : null,
           s.protected ? el("span", { class: "badge", text: "protected" }) : null,
         ]),
-        answer, counter,
       ]),
       el("div", { class: "vp", text: s.points }),
     ]));
@@ -296,12 +320,23 @@ function drawHand() {
   const box = $("hand");
   box.replaceChildren();
   const discard = yours() && view.phase === "discard";
+  if (!discard) chosen = [0, 0, 0, 0, 0];
+  const owed = discard ? view.count : 0, picked = chosen.reduce((a, b) => a + b, 0);
   view.hand.forEach((n, r) => {
-    const m = discard ? moveOf("pick resource", (x) => x.resource === RES[r]) : null;
-    box.append(el("div", { class: `card ${RES[r]}` + (m ? " clickable" : "") + (n ? "" : " faded"), on: m ? { click: () => act(m.code) } : {} }, [
-      el("div", { class: "icon", text: ICON[RES[r]] }), el("div", { class: "count", text: n }), el("div", { class: "label", text: RES[r] }),
+    const left = n - chosen[r], can = discard && left > 0 && picked < owed;
+    box.append(el("div", { class: `card ${RES[r]}` + (can ? " clickable" : "") + (left ? "" : " faded"),
+      on: can ? { click: () => { chosen[r] += 1; render(); } } : {} }, [
+      el("div", { class: "icon", text: ICON[RES[r]] }), el("div", { class: "count", text: left }), el("div", { class: "label", text: RES[r] }),
     ]));
   });
+  if (discard) {
+    box.append(el("div", { class: "discarding" }, [
+      el("div", { class: "result", style: "margin:0", text: `Discard ${owed}: ${picked} chosen` }),
+      el("div", { class: "tiles" }, chosen.flatMap((n, r) => (n ? [el("div", { class: `tile ${RES[r]}`, title: "put back", style: "cursor:pointer",
+        on: { click: () => { chosen[r] -= 1; render(); } } }, [el("span", { text: ICON[RES[r]] }), n > 1 ? el("b", { text: n }) : null])] : []))),
+      fix(el("button", { class: "primary", text: "Discard", on: { click: discardChosen } }), picked === owed),
+    ]));
+  }
   DEV.forEach(([label, icon, kind], c) => {
     const n = view.devCards[c];
     if (!n) return;
@@ -310,6 +345,17 @@ function drawHand() {
       el("div", { class: "icon", text: icon }), el("div", { class: "count", text: n }), el("div", { class: "label", text: label.split(" ")[0] }),
     ]));
   });
+}
+
+async function discardChosen() {
+  const target = view.hand.map((n, r) => n - chosen[r]);
+  chosen = [0, 0, 0, 0, 0];
+  while (view.toAct === view.human && view.phase === "discard") {
+    const r = view.hand.findIndex((n, i) => n > target[i]);
+    const m = r >= 0 ? moveOf("pick resource", (x) => x.resource === RES[r]) : null;
+    if (!m) break;
+    await act(m.code);
+  }
 }
 
 function fix(button, enabled) { button.disabled = !enabled; return button; }
@@ -327,7 +373,7 @@ function drawActions() {
   const toggle = (kind) => () => { mode = mode === kind ? null : kind; render(); };
   const one = (kind) => () => { const m = moveOf(kind); if (m) act(m.code); };
   const buttons = [
-    tool("🤝", "Trade", "offer", one("offer")),
+    tool("🤝", "Trade", "offer", () => { mode = mode === "offer" ? null : "offer"; give = [0, 0, 0, 0, 0]; get = [0, 0, 0, 0, 0]; render(); }, mode === "offer"),
     tool("🏦", "Bank", "bank trade", () => { mode = mode === "bank" ? null : "bank"; bankGive = null; render(); }, mode === "bank"),
     tool("🛣️", "Road", "road", toggle("road"), mode === "road"),
     tool("🏠", "Settlement", "settlement", toggle("settlement"), mode === "settlement"),
@@ -342,54 +388,37 @@ function drawActions() {
   box.append(main);
 }
 
-function chipRow(label, counts, kind) {
-  return el("div", { class: "row" }, [el("span", { class: "what", text: label }), ...RES.map((r, i) => {
-    const m = moveOf(kind, (x) => x.resource === r);
-    return el("div", { class: `chip ${r}` + (m ? "" : " off"), title: r, on: m ? { click: () => act(m.code) } : {} }, [
-      el("span", { text: ICON[r] }), el("span", { class: "n", text: counts[i] || "" }),
-    ]);
-  })]);
-}
-
 function drawTrade() {
   const box = $("trade"), t = view.trade;
   box.replaceChildren();
   let show = false;
-  const current = view.current, me = view.human;
-  if (yours() && (view.phase === "draft" || (view.phase === "respond" && t.drafting === "counter"))) {
+  const building = yours() && ((mode === "offer" && moveOf("offer")) || (mode === "counter" && moveOf("counter")));
+  if (building) {
     show = true;
-    box.append(el("h3", { text: view.phase === "draft" ? "Make an offer" : "Your counter-offer" }));
-    box.append(chipRow("You give", t.draft.give, "give"), chipRow("You get", t.draft.get, "ask"));
-    const send = moveOf("send"), close = moveOf("abandon");
+    const counter = mode === "counter", start = moveOf(mode);
+    box.append(el("h3", { text: counter ? "Your counter-offer" : "Make an offer" }));
+    const row = (label, counts, other, limit) => el("div", { class: "row" }, [el("span", { class: "what", text: label }), ...RES.map((r, i) => {
+      const can = counts[i] < limit(i);
+      return el("div", { class: "builder" }, [
+        el("div", { class: `chip ${r}` + (can ? "" : " off"), title: `add ${r}`, on: can ? { click: () => { counts[i] += 1; other[i] = 0; render(); } } : {} }, [
+          el("span", { text: ICON[r] }), el("span", { class: "n", text: counts[i] || "" }),
+        ]),
+        counts[i] ? el("button", { class: "minus", title: `remove ${r}`, text: "−", on: { click: () => { counts[i] -= 1; render(); } } }) : el("span", { class: "minus-space" }),
+      ]);
+    })]);
+    box.append(row("You give", give, get, (i) => view.hand[i]), row("You get", get, give, (i) => 19 - view.hand[i]));
+    const signed = RES.map((_, i) => get[i] - give[i]);
+    const gives = give.some((n) => n), asks = get.some((n) => n);
+    const repeat = view.forbidden.some((f) => f.every((n, i) => n === signed[i]));
+    const ready = (counter ? gives && asks : gives || asks) && !repeat;
+    const why = repeat ? (counter ? "That just accepts the offer" : "You already made that offer this turn")
+      : counter && !(gives && asks) ? "A counter-offer gives and asks for something" : !ready ? "Add cards to give or to get" : "";
     box.append(el("div", { class: "row" }, [
-      fix(el("button", { class: "primary", text: "Send", on: { click: () => send && act(send.code) } }), !!send),
-      fix(el("button", { text: "Close", on: { click: () => close && act(close.code) } }), !!close),
-      el("span", { style: "color:var(--muted);font-size:13px", text: view.phase === "draft" ? `${t.budgetLeft} moves left this turn` : "" }),
+      fix(el("button", { class: "primary", text: counter ? "Send counter" : "Propose", on: { click: () => act(start.code, signed) } }), ready),
+      el("button", { text: "Clear", on: { click: () => { give.fill(0); get.fill(0); render(); } } }),
+      el("button", { text: "Close", on: { click: () => { mode = null; render(); } } }),
+      el("span", { style: "color:var(--muted);font-size:13px", text: why || (counter ? "" : `${view.trade.budgetLeft} moves left this turn`) }),
     ]));
-  } else if (t.offer && (view.phase === "respond" || view.phase === "confirm")) {
-    show = true;
-    const from = current === me ? "You offer" : `${who(current)} offers`;
-    box.append(el("h3", {}, [from, " ", mini(t.offer.give), " for ", mini(t.offer.get)]));
-    const lines = el("div", { class: "answers" });
-    for (const s of view.seats) {
-      if (s.seat === current) continue;
-      const parts = [el("span", { class: "pname", style: `color:${COLORS[s.seat]}`, text: who(s.seat) }), el("span", { class: "answer", text: s.answer })];
-      if (s.counter) parts.push(el("span", {}, [" wants ", mini(s.counter.get), " for ", mini(s.counter.give)]));
-      const take = yours() && view.phase === "confirm" ? moveOf("trade with", (m) => m.seat === s.seat) : null;
-      const counter = yours() && view.phase === "confirm" ? moveOf("take counter", (m) => m.seat === s.seat) : null;
-      if (take) parts.push(el("button", { class: "primary", text: `Trade with ${who(s.seat)}`, on: { click: () => act(take.code) } }));
-      if (counter) parts.push(el("button", { class: "primary", text: "Accept counter", on: { click: () => act(counter.code) } }));
-      lines.append(el("div", { class: "line" }, parts));
-    }
-    box.append(lines);
-    if (yours()) {
-      const row = el("div", { class: "row" });
-      for (const [kind, label] of [["accept", "Accept"], ["decline", "Decline"], ["counter", "Counter"], ["cancel", "Cancel trade"]]) {
-        const m = moveOf(kind);
-        if (m) row.append(el("button", { class: kind === "accept" ? "primary" : "", text: label, on: { click: () => act(m.code) } }));
-      }
-      box.append(row);
-    }
   } else if (mode === "bank" && yours()) {
     show = true;
     const pairs = movesOf("bank trade");
@@ -407,6 +436,70 @@ function drawTrade() {
   box.style.display = show ? "block" : "none";
 }
 
+function tiles(counts) {
+  if (!counts.some((n) => n)) return el("div", { class: "tiles" }, [el("div", { class: "tile any", text: "anything" })]);
+  return el("div", { class: "tiles" }, counts.flatMap((n, r) => (n ? [el("div", { class: `tile ${RES[r]}`, title: RES[r] }, [
+    el("span", { text: ICON[RES[r]] }), n > 1 ? el("b", { text: n }) : null,
+  ])] : [])));
+}
+
+function avatar(seat, size) {
+  return el("div", { class: "avatar", style: `background:${COLORS[seat]};width:${size}px;height:${size}px;font-size:${size / 2.6}px`,
+    text: seat === view.human ? "You" : who(seat)[0] });
+}
+
+function drawOffer() {
+  const box = $("offer"), b = view.offerBoard;
+  box.replaceChildren();
+  const key = b && JSON.stringify([b.proposer, b.give, b.get]);
+  if (!b || dismissed === key) { box.style.display = "none"; return; }
+  const mine = b.proposer === view.human, live = !b.result, confirming = live && yours() && view.phase === "confirm";
+  const cancel = confirming ? moveOf("cancel") : null;
+  box.className = "panel" + (live ? "" : " done");
+  box.append(el("div", { class: "offer-head" }, [
+    avatar(b.proposer, 36),
+    el("div", { class: "offer-side" }, [el("small", { text: mine ? "You give" : `${who(b.proposer)} gives` }), tiles(b.give)]),
+    el("div", { class: "swap", text: "⇄" }),
+    el("div", { class: "offer-side" }, [el("small", { text: mine ? "You get" : `${who(b.proposer)} wants` }), tiles(b.get)]),
+    el("span", { class: "grow", style: "flex:1" }),
+    cancel ? el("button", { class: "x", title: "Call off the trade", text: "✕", on: { click: () => act(cancel.code) } })
+      : !live ? el("button", { class: "x", title: "Close", text: "✕", on: { click: () => { dismissed = key; render(); } } }) : null,
+  ]));
+  const list = el("div", { class: "responses" });
+  for (const a of b.answers) {
+    const trade = confirming ? moveOf("trade with", (m) => m.seat === a.seat) : null;
+    const take = confirming ? moveOf("take counter", (m) => m.seat === a.seat) : null;
+    const done = b.partner === a.seat;
+    let mark;
+    if (a.status === "accepted" && trade) mark = el("button", { class: "mark yes", title: `Trade with ${who(a.seat)}`, text: "✓", on: { click: () => act(trade.code) } });
+    else if (a.status === "accepted") mark = el("div", { class: "mark yes", title: done ? "traded" : "accepted", text: "✓" });
+    else if (a.status === "declined") mark = el("div", { class: "mark no", title: "declined", text: "✕" });
+    else if (a.status === "countered") mark = el("div", { class: "mark counter", title: "counter-offer", text: "⇄" });
+    else mark = el("div", { class: "mark wait", title: "thinking", text: "…" });
+    const counter = a.counter ? el("div", { class: "counter" }, [
+      el("small", { text: a.seat === view.human ? "You give" : `${who(a.seat)} gives` }), tiles(a.counter.give),
+      el("small", { text: "for" }), tiles(a.counter.get),
+      take ? el("button", { class: "mark yes", title: "Take this counter-offer", text: "✓", on: { click: () => act(take.code) } }) : null,
+    ]) : null;
+    list.append(el("div", { class: "response" }, [avatar(a.seat, 30), mark, counter]));
+  }
+  box.append(list);
+  if (live && yours() && view.phase === "respond" && mode !== "counter") {
+    const pick = (kind) => moveOf(kind);
+    const [accept, decline, counter] = [pick("accept"), pick("decline"), pick("counter")];
+    const open = !b.give.some((n) => n) || !b.get.some((n) => n);
+    const why = accept ? null : open ? "An open offer — counter to name your side" : "You don't have the cards to accept";
+    box.append(el("div", { class: "choices" }, [
+      accept ? el("button", { class: "mark yes", title: "Accept", text: "✓", on: { click: () => act(accept.code) } }) : null,
+      decline ? el("button", { class: "mark no", title: "Decline", text: "✕", on: { click: () => act(decline.code) } }) : null,
+      counter ? el("button", { text: "Counter", on: { click: () => { mode = "counter"; give = [0, 0, 0, 0, 0]; get = [0, 0, 0, 0, 0]; render(); } } }) : null,
+      why ? el("span", { class: "result", style: "margin:0", text: why }) : null,
+    ]));
+  }
+  if (b.result) box.append(el("div", { class: "result", text: `${who(b.proposer)} ${b.result}` }));
+  box.style.display = "block";
+}
+
 function drawBanner() {
   const box = $("banner");
   box.replaceChildren();
@@ -416,7 +509,7 @@ function drawBanner() {
     const phase = view.phase;
     text = {
       "place settlement": "Place a settlement", "place road": "Place a road", "move robber": "Move the robber",
-      "road building": "Place a free road", "discard": `Discard ${view.count} more — click cards in your hand`,
+      "road building": "Place a free road", "discard": `Choose ${view.count} cards to discard`,
       "year of plenty": "Take a resource from the bank", "monopoly": "Name a resource to monopolize",
       "choose victim": "Choose whom to rob",
     }[phase] || (mode ? `Choose where to build a ${mode}` : null);
@@ -434,7 +527,7 @@ function render() {
   const r = view.rules;
   $("rules").textContent = `${r.points} points · discard over ${r.discardLimit}` + (r.friendlyRobber ? " · friendly robber" : "") + (r.balancedDice ? " · balanced dice" : "") + (r.trading ? "" : " · no trading");
   $("roll").textContent = view.lastRoll ?? "–";
-  drawBoard(); drawPlayers(); drawLog(); drawHand(); drawActions(); drawTrade(); drawBanner();
+  drawBoard(); drawPlayers(); drawLog(); drawHand(); drawActions(); drawTrade(); drawOffer(); drawBanner();
   if (view.winner != null) {
     $("winner").textContent = view.winner === view.human ? "You won!" : `${who(view.winner)} won`;
     $("over").style.display = "grid";
