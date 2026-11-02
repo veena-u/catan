@@ -6,8 +6,8 @@ use crate::player::{Player, MAX_PLAYERS};
 use crate::resource::{Resource, RESOURCE_CARDS};
 use crate::topology::topology;
 
-use super::rules::{award, longest_road, responsive, Deal, DEALS, MAX_OFFERS};
-use super::{Actor, Phase, State, WINNING_POINTS};
+use super::rules::{award, longest_road, Deal, MAX_PROPOSED};
+use super::{Actor, Phase, State};
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Violation(pub String);
@@ -26,6 +26,7 @@ fn ensure(condition: bool, message: impl FnOnce() -> String) -> Result<(), Viola
 
 impl State {
     pub fn validate(&self) -> Result<(), Violation> {
+        self.rules.check()?;
         self.validate_seats()?;
         self.validate_board()?;
         self.validate_cards()?;
@@ -230,11 +231,25 @@ impl State {
             }
         }
         ensure(!fresh_turn || bought == 0, || "cards bought before the roll".into())?;
-        ensure(self.offers <= MAX_OFFERS, || "more offers than allowed".into())?;
+        let proposed = usize::from(self.proposed);
+        ensure(proposed <= MAX_PROPOSED, || "more offers than a turn can hold".into())?;
+        ensure(
+            self.proposals[proposed..].iter().all(|&d| d == Deal::EMPTY),
+            || "an offer remembered beyond those made".into(),
+        )?;
+        for (i, deal) in self.proposals[..proposed].iter().enumerate() {
+            ensure(deal.gives() + deal.asks() > 0 && disjoint(*deal), || "an empty or self-cancelling offer was made".into())?;
+            ensure(!self.proposals[..i].contains(deal), || "the same offer was made twice in a turn".into())?;
+        }
         if let Some(last) = self.last_offer {
-            ensure(self.offers >= 1 && usize::from(last.deal) < DEALS, || "a remembered offer that was never made".into())?;
+            ensure(self.proposals[..proposed].contains(&last.deal), || "a remembered offer that was never made".into())?;
             ensure(last.accepted >> self.current.index() & 1 == 0, || "the offerer accepted their own offer".into())?;
         }
+        ensure(self.moves <= self.rules.turn_budget, || "a turn past its budget".into())?;
+        ensure(
+            !matches!(self.phase, Phase::Turn { rolled: false }) || self.moves == 0,
+            || "decisions counted before the roll".into(),
+        )?;
         let before_roll = match self.phase {
             Phase::PlaceSettlement | Phase::PlaceRoad { .. } | Phase::Dice => true,
             Phase::Turn { rolled }
@@ -246,7 +261,7 @@ impl State {
             | Phase::Monopoly { rolled } => !rolled,
             _ => false,
         };
-        ensure(!before_roll || self.offers == 0, || "offers made before the roll".into())?;
+        ensure(!before_roll || self.proposed == 0, || "offers made before the roll".into())?;
         match self.phase {
             Phase::PlaceRoad { settlement } => {
                 ensure(
@@ -262,10 +277,11 @@ impl State {
                 let highest = (0..5).rev().find(|&r| aside[r] > 0).unwrap_or(0);
                 ensure(from == Resource::ALL[highest], || "the discard order is out of step".into())?;
                 let mut q = self.current;
+                let limit = self.rules.discard_limit;
                 while q != player {
                     let pre = self.hand_size(q) + self.set_aside[q.index()].iter().sum::<u8>();
-                    let discarded = pre > 7 && self.set_aside[q.index()].iter().sum::<u8>() == pre / 2;
-                    ensure(discarded || pre <= 7, || format!("{q:?} skipped their discard"))?;
+                    let discarded = pre > limit && self.set_aside[q.index()].iter().sum::<u8>() == pre / 2;
+                    ensure(discarded || pre <= limit, || format!("{q:?} skipped their discard"))?;
                     q = self.next(q);
                 }
             }
@@ -293,15 +309,25 @@ impl State {
                 ensure(self.can_rob(victim), || "a steal from someone who cannot be robbed".into())?;
             }
             Phase::Draw => ensure(self.deck_size() > 0, || "a draw from an empty deck".into())?,
-            Phase::Respond { deal, accepted, counters, .. } | Phase::Confirm { deal, accepted, counters } => {
-                let known = |id: u8| usize::from(id) < DEALS;
-                ensure(known(deal) && counters.iter().flatten().all(|&c| known(c)), || "a deal not on the menu".into())?;
-                let offered = Deal::from_id(deal);
+            Phase::Draft { deal } => {
+                ensure(self.rules.trading, || "an offer drafted with trading off".into())?;
+                self.validate_draft(self.current, deal)?;
+                ensure(self.moves <= self.rules.turn_budget, || "a draft past the turn's budget".into())?;
+            }
+            Phase::Respond { deal: offered, accepted, counters, .. } | Phase::Confirm { deal: offered, accepted, counters } => {
                 ensure(self.can_pay(self.current, offered.give), || "an offer of cards the offerer does not hold".into())?;
-                ensure(self.offers >= 1 && self.offers <= MAX_OFFERS, || "an offer beyond the limit".into())?;
+                ensure(
+                    self.proposed >= 1 && self.proposals[usize::from(self.proposed) - 1] == offered,
+                    || "an offer on the table that was not the turn's latest".into(),
+                )?;
                 let asked = match self.phase {
-                    Phase::Respond { responder, .. } => {
+                    Phase::Respond { responder, draft, clicks, closed, .. } => {
                         ensure(responder != self.current, || "the offerer answers their own offer".into())?;
+                        if let Some(draft) = draft {
+                            self.validate_draft(responder, draft)?;
+                            ensure(!closed, || "a counter-offer drafted after one was dropped".into())?;
+                        }
+                        ensure(clicks <= self.rules.turn_budget, || "a counter-offer past the turn's budget".into())?;
                         let mut q = self.next(self.current);
                         let mut asked = 0u8;
                         while q != responder {
@@ -324,11 +350,14 @@ impl State {
                     let i = p.index();
                     if accepted >> i & 1 == 1 {
                         ensure(counters[i].is_none(), || format!("{p:?} both accepted and countered"))?;
+                        ensure(offered.complete(), || format!("{p:?} accepted an open offer"))?;
                         ensure(self.can_pay(p, offered.get), || format!("{p:?} accepted without the cards"))?;
                     }
                     if let Some(counter) = counters[i] {
-                        let counter = Deal::from_id(counter);
-                        ensure(responsive(counter, offered), || format!("{p:?} countered without giving any of what was asked"))?;
+                        ensure(
+                            counter.complete() && disjoint(counter) && counter != offered.reversed(),
+                            || format!("{p:?} countered with something other than a new trade"),
+                        )?;
                         ensure(self.can_pay(p, counter.give), || format!("{p:?} countered with cards they do not hold"))?;
                     }
                 }
@@ -338,25 +367,23 @@ impl State {
         if !matches!(self.phase, Phase::Discard { .. }) {
             ensure(set_aside == 0, || "cards set aside outside the discards".into())?;
         }
+        let goal = self.rules.points;
         match self.phase {
             Phase::Over { winner } => {
                 ensure(winner == self.current, || "a player won outside their turn".into())?;
-                ensure(
-                    self.victory_points(winner) >= WINNING_POINTS,
-                    || "a winner without 10 points".into(),
-                )?;
+                ensure(self.victory_points(winner) >= goal, || format!("a winner without {goal} points"))?;
             }
             _ => {
                 ensure(
-                    self.victory_points(self.current) < WINNING_POINTS,
+                    self.victory_points(self.current) < goal,
                     || format!("{:?} has won on their turn but play goes on", self.current),
                 )?;
                 for player in self.others(self.current) {
                     let points = self.victory_points(player);
-                    let waiting = self.longest_road == Some(player) && points - 2 < WINNING_POINTS;
+                    let waiting = self.longest_road == Some(player) && points - 2 < goal;
                     ensure(
-                        points < WINNING_POINTS || waiting,
-                        || format!("{player:?} has 10 points without having gained the last one off their turn"),
+                        points < goal || waiting,
+                        || format!("{player:?} has {goal} points without having gained the last one off their turn"),
                     )?;
                 }
             }
@@ -370,6 +397,22 @@ impl State {
         }
         Ok(())
     }
+}
+
+impl State {
+    fn validate_draft(&self, drafter: Player, draft: Deal) -> Result<(), Violation> {
+        ensure(disjoint(draft), || "a draft with a resource on both sides".into())?;
+        ensure(self.can_pay(drafter, draft.give), || "a draft giving cards the drafter does not hold".into())?;
+        let hand = self.hands[drafter.index()];
+        ensure(
+            (0..5).all(|r| draft.get[r] <= RESOURCE_CARDS - hand[r]),
+            || "a draft asking for more cards than exist outside the drafter's hand".into(),
+        )
+    }
+}
+
+fn disjoint(deal: Deal) -> bool {
+    (0..5).all(|r| deal.give[r] == 0 || deal.get[r] == 0)
 }
 
 fn leader(counts: &[u8]) -> bool {

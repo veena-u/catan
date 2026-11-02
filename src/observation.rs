@@ -5,9 +5,12 @@ use crate::player::{Player, MAX_PLAYERS};
 use crate::resource::Resource;
 use crate::state::{Deal, Phase, State};
 
-pub const OBSERVATION_BYTES: usize = 357;
+pub const OBSERVATION_BYTES: usize = 369;
 
-pub const PHASES: [&str; 15] = [
+pub const TRADE_AT: usize = 302;
+pub const PHASE_AT: usize = 296;
+
+pub const PHASES: [&str; 16] = [
     "PlaceSettlement",
     "PlaceRoad",
     "Turn",
@@ -23,6 +26,7 @@ pub const PHASES: [&str; 15] = [
     "ChooseVictim",
     "Respond",
     "Confirm",
+    "Draft",
 ];
 
 pub fn observe(state: &State, observer: Player, out: &mut [u8; OBSERVATION_BYTES]) {
@@ -107,28 +111,51 @@ pub fn observe(state: &State, observer: Player, out: &mut [u8; OBSERVATION_BYTES
         Phase::ChooseVictim { rolled } => (12, rolled, 0, none, none, none),
         Phase::Respond { responder, .. } => (13, true, 0, relative(responder), none, none),
         Phase::Confirm { .. } => (14, true, 0, none, none, none),
+        Phase::Draft { .. } => (15, true, 0, none, none, none),
     };
     put(&[kind, u8::from(rolled), count, player, vertex, from]);
 
-    let (deal, accepted, counters) = match state.phase() {
-        Phase::Respond { deal, accepted, counters, .. } | Phase::Confirm { deal, accepted, counters } => (Some(deal), accepted, counters),
-        _ => (None, 0, [None; MAX_PLAYERS]),
+    let sides = |deal: Option<Deal>| deal.map_or([0; 10], |d| std::array::from_fn(|i| if i < 5 { d.give[i] } else { d.get[i - 5] }));
+    let (offer, accepted, counters, responder) = match state.phase() {
+        Phase::Respond { deal, accepted, counters, responder, .. } => (Some(deal), accepted, counters, Some(responder)),
+        Phase::Confirm { deal, accepted, counters } => (Some(deal), accepted, counters, None),
+        _ => (None, 0, [None; MAX_PLAYERS], None),
     };
-    let sides = |deal: Option<u8>| deal.map_or([[0; 5]; 2], |id| [Deal::from_id(id).give, Deal::from_id(id).get]);
-    let accepted_relative = (0..n).filter(|&p| accepted >> p & 1 == 1).fold(0u8, |bits, p| bits | 1 << relative(Player::new(p)));
-    put(&sides(deal).concat());
-    put(&[accepted_relative, state.offers()]);
+    put(&sides(offer));
     for s in 1..MAX_PLAYERS {
-        put(&sides(seat(s).and_then(|p| counters[p.index()])).concat());
+        let status = match (offer, seat(s)) {
+            (Some(_), Some(p)) if p != state.current() => {
+                let answered = match responder {
+                    Some(r) => p.offset_from(state.current(), n) < r.offset_from(state.current(), n),
+                    None => true,
+                };
+                match (answered, accepted >> p.index() & 1 == 1, counters[p.index()]) {
+                    (false, _, _) => 1,
+                    (true, true, _) => 2,
+                    (true, false, Some(_)) => 4,
+                    (true, false, None) => 3,
+                }
+            }
+            _ => 0,
+        };
+        put(&[status]);
+        put(&sides(seat(s).and_then(|p| counters[p.index()])));
     }
+    let clicks = match state.phase() {
+        Phase::Respond { clicks, .. } => clicks,
+        _ => 0,
+    };
+    put(&[state.offers(), state.rules().turn_budget.saturating_sub(state.moves().max(clicks))]);
     let last = state.last_offer();
     let relative_bits = |bits: u8| (0..n).filter(|&p| bits >> p & 1 == 1).fold(0u8, |acc, p| acc | 1 << relative(Player::new(p)));
-    put(&sides(last.map(|l| l.deal)).concat());
+    put(&sides(last.map(|l| l.deal)));
     put(&[
         last.map_or(0, |l| relative_bits(l.accepted)),
         last.map_or(0, |l| relative_bits(l.countered)),
         last.map_or(0, |l| u8::from(l.traded)),
     ]);
+    put(&Resource::ALL.map(|r| state.rate(observer, r)));
+    put(&per_seat(&|p| u8::from(state.protected(p))));
     debug_assert_eq!(at, OBSERVATION_BYTES);
 }
 

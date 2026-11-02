@@ -1,28 +1,18 @@
 import numpy as np
 import torch
 
-import catan
+from . import deals
+from .model import KIND_COUNT, KINDS
 
-from .model import masked
-
-KINDS = np.array(
-    [0] * 54 + [1] * 54 + [2] * 72 + [3] * 19 + [4] * 5 + [5] * 60 + list(range(6, 13))
-    + [13] * 3 + [14] * catan.DEALS + [15, 16] + [17] * 3 + [18] * 3 + [19]
-)
-KIND_COUNT = 20
-assert len(KINDS) == catan.ACTIONS
 _ONE_HOT = np.eye(KIND_COUNT)[KINDS]
-
 
 def sample(probabilities, rng):
     cumulative = probabilities.cumsum(1)
     draws = rng.random((len(probabilities), 1)) * cumulative[:, -1:]
     return (cumulative < draws).sum(1)
 
-
 def uniform(masks):
     return masks / masks.sum(1, keepdims=True)
-
 
 def by_kind(masks):
     counts = masks @ _ONE_HOT
@@ -30,25 +20,37 @@ def by_kind(masks):
     per_action = np.take_along_axis(counts, np.broadcast_to(KINDS, masks.shape), 1)
     return np.where(masks, 1 / (kinds * np.maximum(per_action, 1)), 0)
 
-
 class Random:
     def __init__(self, seed=0, kinds=False):
         self.rng = np.random.default_rng(seed)
         self.kinds = kinds
 
-    def __call__(self, obs, masks):
-        return sample(by_kind(masks) if self.kinds else uniform(masks), self.rng)
-
+    def __call__(self, obs, masks, forbidden, counts):
+        actions = sample(by_kind(masks) if self.kinds else uniform(masks), self.rng)
+        generator = torch.Generator().manual_seed(int(self.rng.integers(1 << 62)))
+        offers, _, _ = deals.choose(actions, obs, forbidden, counts,
+                                    lambda rows, counts: (torch.zeros(len(rows)), torch.zeros(len(rows), deals.CHOICES - 1)),
+                                    "cpu", generator=generator)
+        return actions, offers
 
 class Network:
-    def __init__(self, model, device, greedy=False, seed=0):
-        self.model, self.device, self.greedy = model, device, greedy
+
+    def __init__(self, model, device, greedy=False, seed=0, temperature=1.0):
+        self.model, self.device, self.greedy, self.temperature = model, device, greedy, temperature
         self.generator = torch.Generator(device="cpu").manual_seed(seed)
 
     @torch.no_grad()
-    def __call__(self, obs, masks):
-        logits, _, _ = self.model(torch.from_numpy(obs).to(self.device))
-        logits = masked(logits, torch.from_numpy(masks).to(self.device)).float().cpu()
+    def __call__(self, obs, masks, forbidden, counts):
+        log_probs, _, summary, goods = self.model(torch.from_numpy(obs).to(self.device), torch.from_numpy(masks).to(self.device),
+                                                  with_goods=True)
+        log_probs = log_probs.float().cpu()
         if self.greedy:
-            return logits.argmax(1).numpy()
-        return torch.multinomial(logits.softmax(1), 1, generator=self.generator).squeeze(1).numpy()
+            actions = log_probs.argmax(1).numpy()
+        else:
+            actions = torch.multinomial((log_probs / self.temperature).softmax(1), 1, generator=self.generator).squeeze(1).numpy()
+        def logits_for(rows, counts):
+            at = torch.from_numpy(rows).to(self.device)
+            return self.model.deal_scores(summary[at], goods[at], torch.from_numpy(actions[rows] == deals.COUNTER).to(self.device), counts)
+        offers, _, _ = deals.choose(actions, obs, forbidden, counts, logits_for, self.device, greedy=self.greedy,
+                                    temperature=self.temperature, generator=self.generator)
+        return actions, offers

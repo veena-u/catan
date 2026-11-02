@@ -1,37 +1,53 @@
 import math
 
+import numpy as np
 import torch
 from torch import nn
 
 import catan
 
+from .deals import MAX_CARDS, STOP, replay, step_log_probs
 from .features import (
-    EDGE_FEATURES, EDGES, ENTITY_RELATIONS, FLAT_FEATURES, GLOBAL_FEATURES, HEX_FEATURES, HEXES, PLAYER_FEATURES,
-    RELATIONS, SEATS, TOKENS, VERTEX_FEATURES, VERTICES, decode, entity_relations, flat, players, relations,
-    symmetry_tables,
+    EDGE_FEATURES, EDGES, GLOBAL_FEATURES, HEX_FEATURES, HEXES, PLAYER_FEATURES, RESOURCE_FEATURES, RESOURCES, SEATS,
+    TOKEN_RELATIONS, TOKENS, VERTEX_FEATURES, VERTICES, decode, players, resources, symmetry_tables, token_relations,
 )
 
 ACTIONS = catan.ACTIONS
-OTHER = ACTIONS - 2 * VERTICES - EDGES - HEXES
-FIRST_DEAL = 274 - (2 * VERTICES + EDGES + HEXES)
+UNLIKELY = -1e9
 
+KIND_RUNS = [
+    ("settlement", 0, VERTICES, "corner"),
+    ("city", 54, VERTICES, "corner"),
+    ("road", 108, EDGES, "edge"),
+    ("robber", 180, HEXES, "hex"),
+    ("pick resource", 199, RESOURCES, "resource"),
+    ("bank trade", 204, 20, "resource pair"),
+    ("roll", 224, 1, None),
+    ("end turn", 225, 1, None),
+    ("buy card", 226, 1, None),
+    ("play knight", 227, 1, None),
+    ("play road building", 228, 1, None),
+    ("play year of plenty", 229, 1, None),
+    ("play monopoly", 230, 1, None),
+    ("rob", 231, SEATS - 1, "player"),
+    ("offer", 234, 1, None),
+    ("give", 235, RESOURCES, "resource"),
+    ("ask", 240, RESOURCES, "resource"),
+    ("send", 245, 1, None),
+    ("abandon", 246, 1, None),
+    ("accept", 247, 1, None),
+    ("decline", 248, 1, None),
+    ("counter", 249, 1, None),
+    ("trade with", 250, SEATS - 1, "player"),
+    ("take counter", 253, SEATS - 1, "player"),
+    ("cancel", 256, 1, None),
+]
+KIND_COUNT = len(KIND_RUNS)
+KINDS = np.concatenate([np.full(count, k) for k, (_, _, count, _) in enumerate(KIND_RUNS)])
+assert len(KINDS) == ACTIONS and all(start == sum(c for _, _, c, _ in KIND_RUNS[:k]) for k, (_, start, _, _) in enumerate(KIND_RUNS))
+POINTED = [k for k, run in enumerate(KIND_RUNS) if run[3] is not None]
 
-class Flat(nn.Module):
-    def __init__(self, width=512, depth=3):
-        super().__init__()
-        layers, size = [], FLAT_FEATURES
-        for _ in range(depth):
-            layers += [nn.Linear(size, width), nn.ReLU()]
-            size = width
-        self.trunk = nn.Sequential(*layers)
-        self.policy = nn.Linear(width, ACTIONS)
-        self.value = nn.Linear(width, SEATS)
-        self.width = width
-
-    def forward(self, obs, symmetry=None):
-        summary = self.trunk(flat(obs, symmetry))
-        return untwist(self.policy(summary), symmetry), torch.tanh(self.value(summary)), summary
-
+_BANK = [(give, get) for give in range(RESOURCES) for get in range(RESOURCES) if get != give]
 
 class Block(nn.Module):
     def __init__(self, width, heads):
@@ -48,73 +64,114 @@ class Block(nn.Module):
         x = x + self.out(attended.transpose(1, 2).reshape(b, t, d))
         return x + self.feed(self.feed_norm(x))
 
+class Model(nn.Module):
 
-class Tokens(nn.Module):
-    """A transformer over the board's hexes, corners and edges plus one summary token. With `entities`, also one
-    token per player, and trades scored from what they give and get rather than each learned separately."""
-
-    def __init__(self, width=128, depth=4, heads=4, entities=False):
+    def __init__(self, width=128, depth=4, heads=4):
         super().__init__()
-        self.entities = entities
-        self.embed = nn.ModuleList(nn.Linear(n, width) for n in (GLOBAL_FEATURES, HEX_FEATURES, VERTEX_FEATURES, EDGE_FEATURES))
+        self.width = width
+        self.embed_global = nn.Linear(GLOBAL_FEATURES, width)
+        self.embed_hex, self.embed_vertex, self.embed_edge = (nn.Linear(n, width) for n in (HEX_FEATURES, VERTEX_FEATURES, EDGE_FEATURES))
+        self.embed_player, self.embed_resource = nn.Linear(PLAYER_FEATURES, width), nn.Linear(RESOURCE_FEATURES, width)
         self.position = nn.Parameter(torch.randn(TOKENS, width) * 0.02)
-        self.register_buffer("relations", entity_relations() if entities else relations(), persistent=False)
-        self.relation_bias = nn.Parameter(torch.zeros(depth, heads, ENTITY_RELATIONS if entities else RELATIONS))
+        self.seat = nn.Parameter(torch.randn(SEATS, width) * 0.02)
+        self.register_buffer("relations", token_relations(), persistent=False)
+        self.relation_bias = nn.Parameter(torch.zeros(depth, heads, TOKEN_RELATIONS))
         with torch.no_grad():
             self.relation_bias[:, :, 0] = -2.0
         self.blocks = nn.ModuleList(Block(width, heads) for _ in range(depth))
         self.norm = nn.LayerNorm(width)
-        self.queries = nn.Linear(width, 4 * width)
+        self.kind = nn.Linear(width, KIND_COUNT)
+        questions = len(POINTED) + 1
+        self.questions = nn.Linear(width, questions * width)
+        self.gates = nn.Parameter(torch.zeros(questions, width))
         self.keys = nn.Linear(width, width)
-        self.other = nn.Linear(width, OTHER - catan.DEALS if entities else OTHER)
         self.value = nn.Linear(width, SEATS)
-        self.width = width
-        if entities:
-            self.embed_player = nn.Linear(PLAYER_FEATURES, width)
-            self.seat = nn.Parameter(torch.randn(SEATS, width) * 0.02)
-            self.register_buffer("deals", torch.from_numpy(catan.deals()).float() / 2, persistent=False)
-            self.embed_deal = nn.Sequential(nn.Linear(10, width), nn.GELU(), nn.Linear(width, width))
-            self.deal_query = nn.Linear(width, width)
+        self.deal_query = nn.Linear(width, 2 * width)
+        self.count_embed = nn.Parameter(torch.randn(RESOURCES, 2 * MAX_CARDS + 1, width) * 0.02)
+        self.stop_hidden, self.stop_out = nn.Linear(width, width), nn.Linear(width, 1)
+        self.card_hidden, self.card_out = nn.Linear(2 * width, width), nn.Linear(width, 2)
+        self.register_buffer("kind_of", torch.from_numpy(KINDS), persistent=False)
 
-    def forward(self, obs, symmetry=None):
+    def forward(self, obs, masks=None, symmetry=None, with_goods=False):
         hexes, vertices, edges, globals_ = decode(obs, symmetry)
-        board = torch.cat([self.embed[1](hexes), self.embed[2](vertices), self.embed[3](edges)], 1) + self.position[1:]
-        parts = [(self.embed[0](globals_) + self.position[0]).unsqueeze(1)]
-        if self.entities:
-            parts.append(self.embed_player(players(obs)) + self.seat)
-        x = torch.cat([*parts, board], 1)
+        board = torch.cat([self.embed_hex(hexes), self.embed_vertex(vertices), self.embed_edge(edges)], 1) + self.position[1:]
+        summary = (self.embed_global(globals_) + self.position[0]).unsqueeze(1)
+        people = self.embed_player(players(obs)) + self.seat
+        goods = self.embed_resource(resources(obs))
+        x = torch.cat([summary, people, goods, board], 1)
         for block, bias in zip(self.blocks, self.relation_bias):
-            x = block(x, bias[:, self.relations].unsqueeze(0))
+            x = block(x, bias[:, self.relations].unsqueeze(0).to(x.dtype))
         x = self.norm(x)
         summary = x[:, 0]
-        keys = self.keys(x[:, -(HEXES + VERTICES + EDGES):])
-        hex_keys, vertex_keys, edge_keys = keys.split([HEXES, VERTICES, EDGES], 1)
-        settle, city, road, robber = self.queries(summary).view(-1, 4, self.width).unbind(1)
-        score = lambda k, q: torch.einsum("bnd,bd->bn", k, q) / math.sqrt(self.width)
-        other = self.other(summary)
-        if self.entities:
-            deals = self.embed_deal(self.deals)
-            dealt = torch.einsum("nd,bd->bn", deals, self.deal_query(summary)) / math.sqrt(self.width)
-            other = torch.cat([other[:, :FIRST_DEAL], dealt, other[:, FIRST_DEAL:]], -1)
-        logits = torch.cat([
-            score(vertex_keys, settle),
-            score(vertex_keys, city),
-            score(edge_keys, road),
-            score(hex_keys, robber),
-            other,
-        ], -1)
-        return untwist(logits, symmetry), torch.tanh(self.value(summary)), summary
+        values = torch.tanh(self.value(summary))
+        log_probs = None if masks is None else self.policy(x, summary, masks, symmetry)
+        if with_goods:
+            return log_probs, values, summary, x[:, 1 + SEATS:1 + SEATS + RESOURCES]
+        return log_probs, values, summary
 
+    def policy(self, x, summary, masks, symmetry):
+        n, d = len(x), self.width
+        people, goods = x[:, 1:1 + SEATS], x[:, 1 + SEATS:1 + SEATS + RESOURCES]
+        board = x[:, 1 + SEATS + RESOURCES:]
+        hexes, corners, edges = board.split([HEXES, VERTICES, EDGES], 1)
+        targets = {"corner": corners, "edge": edges, "hex": hexes, "resource": goods, "player": people[:, 1:]}
+        keys = {name: self.keys(rows) for name, rows in targets.items()}
+        questions = self.questions(summary).view(n, -1, d)
+        gates = torch.sigmoid(self.gates)
+        point = lambda q, target: torch.einsum("ntd,nd->nt", keys[target] * gates[q], questions[:, q]) / math.sqrt(d)
+        scores = torch.zeros(n, ACTIONS, device=x.device, dtype=summary.dtype)
+        for q, k in enumerate(POINTED):
+            _, start, count, target = KIND_RUNS[k]
+            if target == "resource pair":
+                give, get = point(q, "resource"), point(len(POINTED), "resource")
+                pairs = torch.tensor(_BANK, device=x.device)
+                scores[:, start:start + count] = give[:, pairs[:, 0]] + get[:, pairs[:, 1]]
+            else:
+                scores[:, start:start + count] = point(q, target)
+        scores = untwist(scores, symmetry)
+        return factored(self.kind(summary), scores, masks, self.kind_of)
 
-def untwist(logits, symmetry):
+    def deal_scores(self, summary, goods, counter, counts):
+        n, d = len(summary), self.width
+        query = self.deal_query(summary).view(n, 2, d)[torch.arange(n, device=summary.device), counter.long()]
+        shape = counts.shape[:-1]
+        query = query.view(n, *([1] * (len(shape) - 1)), d)
+        h = query + self.count_embed[torch.arange(RESOURCES, device=counts.device), counts + MAX_CARDS].sum(-2)
+        stop = self.stop_out(nn.functional.gelu(self.stop_hidden(h))).squeeze(-1)
+        rows = goods.view(n, *([1] * (len(shape) - 1)), RESOURCES, d).expand(*shape, RESOURCES, d)
+        both = torch.cat([h.unsqueeze(-2).expand(*shape, RESOURCES, d), rows], -1)
+        cards = self.card_out(nn.functional.gelu(self.card_hidden(both)))
+        return stop, torch.cat([cards[..., 0], cards[..., 1]], -1)
+
+    def deal_log_probs(self, summary, goods, counter, choices, masks):
+        stop, cards = self.deal_scores(summary, goods, counter, replay(choices))
+        n, steps = choices.shape
+        log_probs = step_log_probs(stop.reshape(-1), cards.reshape(n * steps, -1), masks.reshape(n * steps, -1)).view(n, steps, -1)
+        taken = choices >= 0
+        chosen = log_probs.gather(-1, choices.clamp(min=STOP)[..., None]).squeeze(-1)
+        entropy = -(log_probs.exp() * log_probs).sum(-1)
+        return torch.where(taken, chosen, 0.0).sum(1), torch.where(taken, entropy, 0.0).sum(1)
+
+KIND_MEMBERS = torch.from_numpy(np.eye(KIND_COUNT, dtype=np.float32)[KINDS])
+
+def factored(kind_logits, scores, masks, kind_of):
+    kind_logits, scores = kind_logits.float(), scores.float().masked_fill(~masks, UNLIKELY)
+    kind_legal = masks.float() @ KIND_MEMBERS.to(masks.device) > 0
+    kind_log = kind_logits.masked_fill(~kind_legal, UNLIKELY).log_softmax(-1)
+    within = torch.empty_like(scores)
+    for _, start, count, _ in KIND_RUNS:
+        run = scores[:, start:start + count]
+        within[:, start:start + count] = run - run.logsumexp(1, keepdim=True)
+    log_probs = kind_log.gather(1, kind_of.expand_as(masks)) + within
+    return log_probs.masked_fill(~masks, UNLIKELY)
+
+def untwist(scores, symmetry):
     if symmetry is None:
-        return logits
-    return logits.gather(1, symmetry_tables(logits.device)[3][symmetry])
-
+        return scores
+    return scores.gather(1, symmetry_tables(scores.device)[3][symmetry])
 
 def masked(logits, mask):
     return logits.masked_fill(~mask, float("-inf"))
-
 
 def device():
     if torch.cuda.is_available():
@@ -123,24 +180,9 @@ def device():
         return torch.device("mps")
     return torch.device("cpu")
 
-
-def grown(saved, model):
-    """An older network's weights fitted to `model`, which may read more inputs: the new inputs get zero weights, so the
-    network behaves exactly as before until training teaches it to use them. Also says whether anything grew."""
-    own, fitted, grew = model.state_dict(), {}, False
-    for name, weights in saved.items():
-        target = own.get(name)
-        if target is not None and weights.dim() == 2 and weights.shape[0] == target.shape[0] and weights.shape[1] < target.shape[1]:
-            padded = torch.zeros_like(target)
-            padded[:, :weights.shape[1]] = weights
-            weights, grew = padded, True
-        fitted[name] = weights
-    return fitted, grew
-
-
 def load(path, at):
     checkpoint = torch.load(path, map_location=at)
     args = checkpoint["args"]
-    model = Tokens(args["width"], args["depth"], entities=args.get("entities", False)).to(at)
-    model.load_state_dict(grown(checkpoint["model"], model)[0])
+    model = Model(args["width"], args["depth"]).to(at)
+    model.load_state_dict(checkpoint["model"])
     return model.eval()

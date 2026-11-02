@@ -1,0 +1,452 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Catan Table</title>
+<style>:root {
+  --sea: #2f7fc1;
+  --sea-deep: #1f5f99;
+  --panel: #ffffff;
+  --ink: #1d2433;
+  --muted: #6b7385;
+  --line: #e3e7ef;
+  --gold: #f2b705;
+  --blue: #1e88e5;
+  --red: #e53935;
+  --orange: #fb8c00;
+  --green: #43a047;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+body {
+  font-family: "Nunito", "Segoe UI", system-ui, -apple-system, sans-serif;
+  color: var(--ink);
+  background: radial-gradient(circle at 40% 45%, var(--sea) 0%, var(--sea-deep) 100%);
+  overflow: hidden;
+}
+#app { display: grid; grid-template-columns: 1fr 320px; grid-template-rows: 52px 1fr 150px; height: 100vh; }
+#top {
+  grid-column: 1 / 3; display: flex; align-items: center; gap: 14px; padding: 0 16px;
+  background: rgba(10, 30, 60, 0.35); color: #fff;
+}
+#top .title { font-weight: 800; letter-spacing: 0.5px; font-size: 18px; }
+#top .grow { flex: 1; }
+#top button, #top label { color: #fff; }
+#board-wrap { position: relative; display: flex; align-items: center; justify-content: center; min-height: 0; }
+#board { width: 100%; height: 100%; }
+#side { grid-row: 2 / 4; grid-column: 2; display: flex; flex-direction: column; gap: 10px; padding: 10px; min-height: 0; }
+.panel { background: var(--panel); border-radius: 14px; box-shadow: 0 6px 18px rgba(0, 0, 0, 0.18); }
+#players { padding: 8px; display: flex; flex-direction: column; gap: 6px; }
+.player { display: grid; grid-template-columns: 38px 1fr auto; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 10px; }
+.player.current { background: #fff6d6; }
+.avatar { width: 38px; height: 38px; border-radius: 50%; display: grid; place-items: center; color: #fff; font-weight: 800; }
+.pname { font-weight: 800; }
+.pstats { color: var(--muted); font-size: 13px; display: flex; gap: 10px; flex-wrap: wrap; }
+.vp { font-weight: 900; font-size: 20px; }
+.badge { font-size: 11px; padding: 1px 6px; border-radius: 8px; background: #eef1f6; color: var(--ink); }
+.answer { font-size: 12px; font-weight: 700; }
+#log { flex: 1; overflow-y: auto; padding: 10px 12px; font-size: 14px; min-height: 0; }
+#log .event { padding: 3px 0; border-bottom: 1px solid #f2f4f8; }
+#log .who { font-weight: 800; }
+#bottom { grid-column: 1; display: flex; align-items: flex-end; gap: 14px; padding: 0 16px 14px; }
+#hand { padding: 10px 12px; display: flex; gap: 8px; align-items: flex-end; min-height: 118px; }
+.card {
+  width: 62px; height: 88px; border-radius: 9px; display: flex; flex-direction: column; align-items: center;
+  justify-content: space-between; padding: 6px 0; color: #fff; font-weight: 900; position: relative;
+  box-shadow: 0 3px 8px rgba(0, 0, 0, 0.25); border: 2px solid rgba(255, 255, 255, 0.7); user-select: none;
+}
+.card .icon { font-size: 30px; line-height: 1; }
+.card .count { font-size: 18px; }
+.card .label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.4px; }
+.card.clickable { cursor: pointer; outline: 3px solid var(--gold); }
+.card.faded { opacity: 0.45; }
+.brick { background: #c8643b; } .lumber { background: #2f7d32; } .wool { background: #7cc35a; }
+.grain { background: #e8b923; } .ore { background: #7d8799; } .dev { background: #6a4fb3; }
+#actions { padding: 10px; display: flex; gap: 8px; align-items: center; margin-left: auto; }
+button {
+  font: inherit; font-weight: 800; border: none; border-radius: 10px; padding: 9px 14px; cursor: pointer;
+  background: #eef1f6; color: var(--ink);
+}
+button:disabled { opacity: 0.35; cursor: default; }
+button.primary { background: var(--gold); color: #3a2b00; }
+button.active { outline: 3px solid var(--gold); }
+button.tool { display: flex; flex-direction: column; align-items: center; gap: 2px; min-width: 64px; font-size: 12px; }
+button.tool .icon { font-size: 22px; }
+#top button { background: rgba(255, 255, 255, 0.15); }
+#dice { position: absolute; left: 18px; top: 16px; padding: 10px 14px; display: flex; align-items: center; gap: 10px; }
+#dice .sum { font-size: 28px; font-weight: 900; }
+#banner {
+  position: absolute; top: 16px; left: 50%; transform: translateX(-50%); padding: 10px 18px; font-weight: 800;
+  display: none; align-items: center; gap: 10px;
+}
+#trade { position: absolute; bottom: 12px; left: 50%; transform: translateX(-50%); padding: 14px; display: none; min-width: 420px; }
+#trade h3 { margin: 0 0 8px; font-size: 16px; }
+.row { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
+.row .what { width: 70px; font-weight: 800; color: var(--muted); }
+.chip {
+  width: 52px; height: 52px; border-radius: 10px; display: grid; place-items: center; color: #fff; font-weight: 900;
+  position: relative; cursor: pointer; border: 2px solid rgba(255, 255, 255, 0.8); box-shadow: 0 2px 5px rgba(0, 0, 0, 0.2);
+}
+.chip .n { position: absolute; right: 3px; bottom: 1px; font-size: 13px; }
+.chip.off { opacity: 0.3; cursor: default; }
+.answers { display: flex; flex-direction: column; gap: 6px; margin: 8px 0; }
+.answers .line { display: flex; align-items: center; gap: 8px; }
+#over { position: absolute; inset: 0; display: none; place-items: center; background: rgba(10, 20, 40, 0.55); }
+#over .panel { padding: 28px 36px; text-align: center; }
+#over h2 { margin: 0 0 14px; font-size: 30px; }
+.mini { display: inline-flex; gap: 3px; align-items: center; }
+.mini span { padding: 1px 6px; border-radius: 6px; color: #fff; font-size: 12px; font-weight: 800; }
+svg .target { cursor: pointer; }
+svg .pulse { animation: pulse 1.2s ease-in-out infinite; }
+@keyframes pulse { 50% { opacity: 0.45; } }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="top">
+    <span class="title">Catan</span>
+    <span id="rules"></span>
+    <span class="grow"></span>
+    <label>Pace <input id="pace" type="range" min="150" max="2000" step="50" value="700"></label>
+    <button id="pause">Pause</button>
+    <button id="newgame">New game</button>
+  </div>
+  <div id="board-wrap">
+    <svg id="board" xmlns="http://www.w3.org/2000/svg"></svg>
+    <div id="dice" class="panel"><span>🎲</span><span class="sum" id="roll">–</span></div>
+    <div id="banner" class="panel"></div>
+    <div id="trade" class="panel"></div>
+    <div id="over"><div class="panel"><h2 id="winner"></h2><button class="primary" id="again">Play again</button></div></div>
+  </div>
+  <div id="side">
+    <div id="players" class="panel"></div>
+    <div id="log" class="panel"></div>
+  </div>
+  <div id="bottom">
+    <div id="hand" class="panel"></div>
+    <div id="actions" class="panel"></div>
+  </div>
+</div>
+<script>const RES = ["brick", "lumber", "wool", "grain", "ore"];
+const ICON = { brick: "🧱", lumber: "🪵", wool: "🐑", grain: "🌾", ore: "🪨" };
+const DEV = [["knight", "⚔️", "play knight"], ["victory point", "⭐", null], ["road building", "🛣️", "play road building"],
+  ["year of plenty", "🎁", "play year of plenty"], ["monopoly", "💰", "play monopoly"]];
+const TERRAIN = { hills: "#c8643b", forest: "#2f7d32", pasture: "#8fd16a", fields: "#f2c94c", mountains: "#8e9aaf", desert: "#e8d39a" };
+const COLORS = ["#1e88e5", "#e53935", "#fb8c00", "#43a047"];
+const R = 52, XS = R * Math.sqrt(3) / 2, YS = R / 2;
+let view = null, mode = null, paused = false, timer = null, busy = false, bankGive = null;
+
+const $ = (id) => document.getElementById(id);
+const el = (tag, attrs = {}, kids = []) => {
+  const node = tag.startsWith("svg:") ? document.createElementNS("http://www.w3.org/2000/svg", tag.slice(4)) : document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === "on") for (const [e, f] of Object.entries(v)) node.addEventListener(e, f);
+    else if (k === "text") node.textContent = v;
+    else if (k === "html") node.innerHTML = v;
+    else node.setAttribute(k, v);
+  }
+  for (const kid of [].concat(kids)) if (kid != null) node.append(kid);
+  return node;
+};
+const pt = ([x, y]) => [x * XS, y * YS];
+const yours = () => view && view.toAct === view.human && view.winner == null;
+const movesOf = (kind) => view.moves.filter((m) => m.kind === kind);
+const moveOf = (kind, test = () => true) => view.moves.find((m) => m.kind === kind && test(m));
+const who = (seat) => (seat === view.human ? "You" : ["Blue", "Red", "Orange", "Green"][seat]);
+const mini = (counts) => el("span", { class: "mini" }, counts.some((n) => n) ?
+  counts.flatMap((n, r) => (n ? [el("span", { class: RES[r], text: `${n}${ICON[RES[r]]}` })] : [])) : [el("span", { style: "background:#9aa3b5", text: "anything" })]);
+
+async function call(path, body) {
+  const res = await fetch(path, body === undefined ? {} : { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error);
+  return data;
+}
+
+async function act(code) {
+  if (busy) return;
+  busy = true;
+  try { view = await call("/api/act", { code }); mode = null; bankGive = null; render(); } catch (e) { console.warn(e); }
+  busy = false;
+  schedule();
+}
+
+function schedule() {
+  clearTimeout(timer);
+  if (!view || paused || view.winner != null || view.toAct == null || view.toAct === view.human) return;
+  const wait = +$("pace").value;
+  timer = setTimeout(async () => {
+    if (busy) return schedule();
+    busy = true;
+    try { view = await call("/api/step", {}); render(); } catch (e) { console.warn(e); }
+    busy = false;
+    schedule();
+  }, wait);
+}
+
+function drawBoard() {
+  const svg = $("board"), g = view.geometry, b = view.board;
+  svg.replaceChildren();
+  const vs = g.vertices.map(pt), hs = g.hexes.map(pt);
+  const xs = vs.map((p) => p[0]), ys = vs.map((p) => p[1]);
+  const pad = R * 1.5;
+  svg.setAttribute("viewBox", `${Math.min(...xs) - pad} ${Math.min(...ys) - pad} ${Math.max(...xs) - Math.min(...xs) + 2 * pad} ${Math.max(...ys) - Math.min(...ys) + 2 * pad}`);
+  const outline = g.coast.map((e) => g.edges[e]);
+  const frame = el("svg:g");
+  for (const [a, c] of outline) frame.append(el("svg:line", { x1: vs[a][0], y1: vs[a][1], x2: vs[c][0], y2: vs[c][1], stroke: "#e9dcb5", "stroke-width": 26, "stroke-linecap": "round" }));
+  svg.append(frame);
+
+  g.corners.forEach((corners, h) => {
+    const points = corners.map((v) => vs[v].join(",")).join(" ");
+    svg.append(el("svg:polygon", { points, fill: TERRAIN[b.terrain[h]], stroke: "#f3ead0", "stroke-width": 4 }));
+  });
+
+  for (const e of g.coast) {
+    const [a, c] = g.edges[e];
+    const ha = b.harbors[a];
+    if (!ha || ha !== b.harbors[c]) continue;
+    const mx = (vs[a][0] + vs[c][0]) / 2, my = (vs[a][1] + vs[c][1]) / 2;
+    const len = Math.hypot(mx, my), ox = mx + (mx / len) * R * 0.75, oy = my + (my / len) * R * 0.75;
+    for (const v of [a, c]) svg.append(el("svg:line", { x1: vs[v][0], y1: vs[v][1], x2: ox, y2: oy, stroke: "#8b5a2b", "stroke-width": 5 }));
+    svg.append(el("svg:circle", { cx: ox, cy: oy, r: R * 0.36, fill: "#fffaf0", stroke: "#8b5a2b", "stroke-width": 3 }));
+    const label = ha === "3:1" ? "3:1" : `2:1 ${ICON[ha]}`;
+    svg.append(el("svg:text", { x: ox, y: oy + 5, "text-anchor": "middle", "font-size": ha === "3:1" ? 15 : 12, "font-weight": 800, fill: "#5b3a1a", text: label }));
+  }
+
+  b.tokens.forEach((n, h) => {
+    const [x, y] = hs[h];
+    if (n) {
+      svg.append(el("svg:circle", { cx: x, cy: y, r: R * 0.36, fill: "#fbf3dd", stroke: "#c9b98f", "stroke-width": 2 }));
+      const hot = n === 6 || n === 8;
+      svg.append(el("svg:text", { x, y: y + 6, "text-anchor": "middle", "font-size": 20, "font-weight": 900, fill: hot ? "#d32f2f" : "#2b2b2b", text: n }));
+      const pips = 6 - Math.abs(7 - n);
+      for (let i = 0; i < pips; i++) svg.append(el("svg:circle", { cx: x + (i - (pips - 1) / 2) * 5, cy: y + 13, r: 1.8, fill: hot ? "#d32f2f" : "#2b2b2b" }));
+    }
+    if (h === b.robber) {
+      const rx = x + (n ? -R * 0.5 : 0);
+      svg.append(el("svg:ellipse", { cx: rx, cy: y + 10, rx: 10, ry: 14, fill: "#3b3b45", stroke: "#111", "stroke-width": 1.5 }));
+      svg.append(el("svg:circle", { cx: rx, cy: y - 8, r: 7, fill: "#3b3b45", stroke: "#111", "stroke-width": 1.5 }));
+    }
+  });
+
+  const pick = (kind) => (yours() ? movesOf(kind) : []);
+  const showing = (kind) => mode === kind || ["place settlement", "place road", "move robber", "road building"].includes(view.phase);
+
+  if (showing("robber")) for (const m of pick("robber")) {
+    const points = g.corners[m.hex].map((v) => vs[v].join(",")).join(" ");
+    svg.append(el("svg:polygon", { points, fill: "rgba(255,255,255,0.25)", stroke: "#fff", "stroke-width": 4, class: "target pulse", on: { click: () => act(m.code) } }));
+  }
+
+  for (const r of b.roads) {
+    const [a, c] = g.edges[r.edge], col = COLORS[r.seat];
+    const [x1, y1] = vs[a], [x2, y2] = vs[c];
+    const sx = x1 + (x2 - x1) * 0.14, sy = y1 + (y2 - y1) * 0.14, ex = x2 - (x2 - x1) * 0.14, ey = y2 - (y2 - y1) * 0.14;
+    svg.append(el("svg:line", { x1: sx, y1: sy, x2: ex, y2: ey, stroke: "#1a1a1a", "stroke-width": 11, "stroke-linecap": "round" }));
+    svg.append(el("svg:line", { x1: sx, y1: sy, x2: ex, y2: ey, stroke: col, "stroke-width": 7, "stroke-linecap": "round" }));
+  }
+  if (showing("road")) for (const m of pick("road")) {
+    const [a, c] = g.edges[m.edge];
+    svg.append(el("svg:line", { x1: vs[a][0], y1: vs[a][1], x2: vs[c][0], y2: vs[c][1], stroke: "rgba(255,255,255,0.9)", "stroke-width": 10, "stroke-linecap": "round", class: "target pulse", on: { click: () => act(m.code) } }));
+  }
+
+  const house = (x, y, col) => el("svg:polygon", { points: `${x - 9},${y + 8} ${x + 9},${y + 8} ${x + 9},${y - 3} ${x},${y - 11} ${x - 9},${y - 3}`, fill: col, stroke: "#1a1a1a", "stroke-width": 2 });
+  const city = (x, y, col) => el("svg:polygon", { points: `${x - 14},${y + 10} ${x + 14},${y + 10} ${x + 14},${y - 2} ${x + 2},${y - 2} ${x + 2},${y - 8} ${x - 6},${y - 16} ${x - 14},${y - 8}`, fill: col, stroke: "#1a1a1a", "stroke-width": 2 });
+  for (const s of b.settlements) svg.append(house(...vs[s.vertex], COLORS[s.seat]));
+  for (const c of b.cities) svg.append(city(...vs[c.vertex], COLORS[c.seat]));
+  for (const kind of ["settlement", "city"]) if (showing(kind)) for (const m of pick(kind)) {
+    const [x, y] = vs[m.vertex];
+    svg.append(el("svg:circle", { cx: x, cy: y, r: kind === "city" ? 16 : 11, fill: "rgba(255,255,255,0.85)", stroke: COLORS[view.human], "stroke-width": 3, class: "target pulse", on: { click: () => act(m.code) } }));
+  }
+}
+
+function drawPlayers() {
+  const box = $("players");
+  box.replaceChildren();
+  for (const s of view.seats) {
+    const answer = s.answer && view.trade.offer ? el("div", { class: "answer", text: s.answer }) : null;
+    const counter = s.counter ? el("div", { class: "answer" }, ["counter: gives ", mini(s.counter.give), " for ", mini(s.counter.get)]) : null;
+    box.append(el("div", { class: "player" + (s.seat === view.current ? " current" : "") }, [
+      el("div", { class: "avatar", style: `background:${COLORS[s.seat]}`, text: s.you ? "You" : s.name[0] }),
+      el("div", {}, [
+        el("div", { class: "pname", text: s.you ? `You (${s.name})` : s.name }),
+        el("div", { class: "pstats" }, [
+          el("span", { text: `🃏 ${s.cards}` }), el("span", { text: `📜 ${s.devCards}` }),
+          el("span", { text: `⚔️ ${s.knights}` }), el("span", { text: `🛣️ ${s.roadLength}` }),
+          s.longestRoad ? el("span", { class: "badge", text: "Longest Road" }) : null,
+          s.largestArmy ? el("span", { class: "badge", text: "Largest Army" }) : null,
+          s.protected ? el("span", { class: "badge", text: "protected" }) : null,
+        ]),
+        answer, counter,
+      ]),
+      el("div", { class: "vp", text: s.points }),
+    ]));
+  }
+}
+
+function drawLog() {
+  const box = $("log"), atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 4;
+  box.replaceChildren(...view.events.map((e) => el("div", { class: "event" }, [
+    el("span", { class: "who", style: `color:${COLORS[e.seat]}`, text: who(e.seat) + " " }), e.text,
+  ])));
+  if (atBottom) box.scrollTop = box.scrollHeight;
+}
+
+function drawHand() {
+  const box = $("hand");
+  box.replaceChildren();
+  const discard = yours() && view.phase === "discard";
+  view.hand.forEach((n, r) => {
+    const m = discard ? moveOf("pick resource", (x) => x.resource === RES[r]) : null;
+    box.append(el("div", { class: `card ${RES[r]}` + (m ? " clickable" : "") + (n ? "" : " faded"), on: m ? { click: () => act(m.code) } : {} }, [
+      el("div", { class: "icon", text: ICON[RES[r]] }), el("div", { class: "count", text: n }), el("div", { class: "label", text: RES[r] }),
+    ]));
+  });
+  DEV.forEach(([label, icon, kind], c) => {
+    const n = view.devCards[c];
+    if (!n) return;
+    const m = kind && yours() ? moveOf(kind) : null;
+    box.append(el("div", { class: "card dev" + (m ? " clickable" : ""), title: m ? `Play ${label}` : label, on: m ? { click: () => act(m.code) } : {} }, [
+      el("div", { class: "icon", text: icon }), el("div", { class: "count", text: n }), el("div", { class: "label", text: label.split(" ")[0] }),
+    ]));
+  });
+}
+
+function fix(button, enabled) { button.disabled = !enabled; return button; }
+
+function tool(icon, label, kind, onClick, active = false) {
+  const button = el("button", { class: "tool" + (active ? " active" : ""), on: { click: onClick } }, [
+    el("span", { class: "icon", text: icon }), el("span", { text: label }),
+  ]);
+  return fix(button, yours() && movesOf(kind).length > 0);
+}
+
+function drawActions() {
+  const box = $("actions");
+  box.replaceChildren();
+  const toggle = (kind) => () => { mode = mode === kind ? null : kind; render(); };
+  const one = (kind) => () => { const m = moveOf(kind); if (m) act(m.code); };
+  const buttons = [
+    tool("🤝", "Trade", "offer", one("offer")),
+    tool("🏦", "Bank", "bank trade", () => { mode = mode === "bank" ? null : "bank"; bankGive = null; render(); }, mode === "bank"),
+    tool("🛣️", "Road", "road", toggle("road"), mode === "road"),
+    tool("🏠", "Settlement", "settlement", toggle("settlement"), mode === "settlement"),
+    tool("🏰", "City", "city", toggle("city"), mode === "city"),
+    tool("📜", "Dev card", "buy card", one("buy card")),
+  ];
+  for (const b of buttons) box.append(b);
+  const roll = yours() ? moveOf("roll") : null, end = yours() ? moveOf("end turn") : null;
+  const main = roll ? el("button", { class: "primary", text: "🎲 Roll", on: { click: () => act(roll.code) } })
+    : el("button", { class: "primary", text: "End turn", on: { click: () => end && act(end.code) } });
+  main.disabled = !(roll || end);
+  box.append(main);
+}
+
+function chipRow(label, counts, kind) {
+  return el("div", { class: "row" }, [el("span", { class: "what", text: label }), ...RES.map((r, i) => {
+    const m = moveOf(kind, (x) => x.resource === r);
+    return el("div", { class: `chip ${r}` + (m ? "" : " off"), title: r, on: m ? { click: () => act(m.code) } : {} }, [
+      el("span", { text: ICON[r] }), el("span", { class: "n", text: counts[i] || "" }),
+    ]);
+  })]);
+}
+
+function drawTrade() {
+  const box = $("trade"), t = view.trade;
+  box.replaceChildren();
+  let show = false;
+  const current = view.current, me = view.human;
+  if (yours() && (view.phase === "draft" || (view.phase === "respond" && t.drafting === "counter"))) {
+    show = true;
+    box.append(el("h3", { text: view.phase === "draft" ? "Make an offer" : "Your counter-offer" }));
+    box.append(chipRow("You give", t.draft.give, "give"), chipRow("You get", t.draft.get, "ask"));
+    const send = moveOf("send"), close = moveOf("abandon");
+    box.append(el("div", { class: "row" }, [
+      fix(el("button", { class: "primary", text: "Send", on: { click: () => send && act(send.code) } }), !!send),
+      fix(el("button", { text: "Close", on: { click: () => close && act(close.code) } }), !!close),
+      el("span", { style: "color:var(--muted);font-size:13px", text: view.phase === "draft" ? `${t.budgetLeft} moves left this turn` : "" }),
+    ]));
+  } else if (t.offer && (view.phase === "respond" || view.phase === "confirm")) {
+    show = true;
+    const from = current === me ? "You offer" : `${who(current)} offers`;
+    box.append(el("h3", {}, [from, " ", mini(t.offer.give), " for ", mini(t.offer.get)]));
+    const lines = el("div", { class: "answers" });
+    for (const s of view.seats) {
+      if (s.seat === current) continue;
+      const parts = [el("span", { class: "pname", style: `color:${COLORS[s.seat]}`, text: who(s.seat) }), el("span", { class: "answer", text: s.answer })];
+      if (s.counter) parts.push(el("span", {}, [" wants ", mini(s.counter.get), " for ", mini(s.counter.give)]));
+      const take = yours() && view.phase === "confirm" ? moveOf("trade with", (m) => m.seat === s.seat) : null;
+      const counter = yours() && view.phase === "confirm" ? moveOf("take counter", (m) => m.seat === s.seat) : null;
+      if (take) parts.push(el("button", { class: "primary", text: `Trade with ${who(s.seat)}`, on: { click: () => act(take.code) } }));
+      if (counter) parts.push(el("button", { class: "primary", text: "Accept counter", on: { click: () => act(counter.code) } }));
+      lines.append(el("div", { class: "line" }, parts));
+    }
+    box.append(lines);
+    if (yours()) {
+      const row = el("div", { class: "row" });
+      for (const [kind, label] of [["accept", "Accept"], ["decline", "Decline"], ["counter", "Counter"], ["cancel", "Cancel trade"]]) {
+        const m = moveOf(kind);
+        if (m) row.append(el("button", { class: kind === "accept" ? "primary" : "", text: label, on: { click: () => act(m.code) } }));
+      }
+      box.append(row);
+    }
+  } else if (mode === "bank" && yours()) {
+    show = true;
+    const pairs = movesOf("bank trade");
+    box.append(el("h3", { text: "Trade with the bank" }));
+    const gives = RES.filter((r) => pairs.some((m) => m.give === r));
+    box.append(el("div", { class: "row" }, [el("span", { class: "what", text: "Give" }), ...RES.map((r, i) =>
+      el("div", { class: `chip ${r}` + (gives.includes(r) ? "" : " off") + (bankGive === r ? " active" : ""), style: bankGive === r ? "outline:3px solid var(--gold)" : "", on: gives.includes(r) ? { click: () => { bankGive = r; render(); } } : {} }, [
+        el("span", { text: ICON[r] }), el("span", { class: "n", text: view.rates[i] + ":1" }),
+      ]))]));
+    box.append(el("div", { class: "row" }, [el("span", { class: "what", text: "Get" }), ...RES.map((r) => {
+      const m = bankGive && pairs.find((x) => x.give === bankGive && x.get === r);
+      return el("div", { class: `chip ${r}` + (m ? "" : " off"), on: m ? { click: () => act(m.code) } : {} }, [el("span", { text: ICON[r] })]);
+    })]));
+  }
+  box.style.display = show ? "block" : "none";
+}
+
+function drawBanner() {
+  const box = $("banner");
+  box.replaceChildren();
+  let text = null, extra = [];
+  if (view.winner == null && view.toAct != null && view.toAct !== view.human) text = `${who(view.toAct)} is playing…`;
+  if (yours()) {
+    const phase = view.phase;
+    text = {
+      "place settlement": "Place a settlement", "place road": "Place a road", "move robber": "Move the robber",
+      "road building": "Place a free road", "discard": `Discard ${view.count} more — click cards in your hand`,
+      "year of plenty": "Take a resource from the bank", "monopoly": "Name a resource to monopolize",
+      "choose victim": "Choose whom to rob",
+    }[phase] || (mode ? `Choose where to build a ${mode}` : null);
+    if (phase === "year of plenty" || phase === "monopoly") extra = movesOf("pick resource").map((m) =>
+      el("button", { text: `${ICON[m.resource]} ${m.resource}`, on: { click: () => act(m.code) } }));
+    if (phase === "choose victim") extra = movesOf("rob").map((m) =>
+      el("button", { style: `color:${COLORS[m.seat]}`, text: who(m.seat), on: { click: () => act(m.code) } }));
+  }
+  box.append(...(text ? [el("span", { text })] : []), ...extra);
+  box.style.display = text ? "flex" : "none";
+}
+
+function render() {
+  if (!view) return;
+  const r = view.rules;
+  $("rules").textContent = `${r.points} points · discard over ${r.discardLimit}` + (r.friendlyRobber ? " · friendly robber" : "") + (r.balancedDice ? " · balanced dice" : "") + (r.trading ? "" : " · no trading");
+  $("roll").textContent = view.lastRoll ?? "–";
+  drawBoard(); drawPlayers(); drawLog(); drawHand(); drawActions(); drawTrade(); drawBanner();
+  if (view.winner != null) {
+    $("winner").textContent = view.winner === view.human ? "You won!" : `${who(view.winner)} won`;
+    $("over").style.display = "grid";
+  } else $("over").style.display = "none";
+}
+
+async function newGame() { clearTimeout(timer); view = await call("/api/new", {}); mode = null; render(); schedule(); }
+$("newgame").onclick = newGame;
+$("again").onclick = newGame;
+$("pause").onclick = () => { paused = !paused; $("pause").textContent = paused ? "Resume" : "Pause"; schedule(); };
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") { mode = null; render(); } });
+call("/api/view").then((v) => { view = v; render(); schedule(); });
+</script>
+</body>
+</html>

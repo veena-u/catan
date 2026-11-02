@@ -1,4 +1,3 @@
-// constructs the terrain, tokens and harbors of a board
 use std::fmt;
 
 use crate::ids::{Hex, Set, Vertex, VertexKind, HEXES};

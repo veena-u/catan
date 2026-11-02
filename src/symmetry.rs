@@ -1,12 +1,8 @@
-// for augmentation of training data
 use std::sync::OnceLock;
 
 use crate::ids::{Edge, Hex, Vertex, EDGES, HEXES, VERTICES};
 use crate::topology::{topology, Point, COAST};
 
-// k = 0 is the identity
-// k = 1 to 5 are rotations
-// k = 6 to 11 are a mirror followed by a rotation
 pub const SYMMETRIES: usize = 12;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]

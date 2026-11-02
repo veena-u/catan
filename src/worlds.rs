@@ -51,7 +51,6 @@ impl Worlds {
         Ok(Worlds { states, rngs, redealt })
     }
 
-    /// Futures as one player could imagine them: the hidden cards re-dealt from `observer`'s view, nothing else changed.
     pub fn imagine(root: &State, observer: Player, samples: usize, seed: u64) -> Worlds {
         let mut seeds = Rng::new(seed);
         let (mut states, mut rngs) = (Vec::new(), Vec::new());
@@ -127,7 +126,7 @@ mod tests {
 
     #[test]
     fn imagined_futures_look_the_same_to_the_one_imagining() {
-        let mut buffer = Buffer::new(Config { games: 4, history: 64, max_decisions: 5_000, seed: 9, players: 4, paired: false });
+        let mut buffer = Buffer::new(Config { games: 4, history: 64, max_decisions: 5_000, seed: 9, players: 4, paired: false, rules: crate::state::Rules::STANDARD });
         let mut rng = Rng::new(2);
         let mut endings = vec![None; buffer.len()];
         for _ in 0..120 {
@@ -158,7 +157,7 @@ mod tests {
 
     #[test]
     fn worlds_keep_what_the_searcher_sees_and_play_on_legally() {
-        let mut buffer = Buffer::new(Config { games: 16, history: 64, max_decisions: 5_000, seed: 5, players: 4, paired: false });
+        let mut buffer = Buffer::new(Config { games: 16, history: 64, max_decisions: 5_000, seed: 5, players: 4, paired: false, rules: crate::state::Rules::STANDARD });
         let mut rng = Rng::new(1);
         let mut endings = vec![None; buffer.len()];
         for _ in 0..80 {

@@ -1,26 +1,18 @@
 use catan::board::Board;
 use catan::buffer::{self, CHECKPOINT_EVERY, Config, Ending, Finish};
 use catan::dev_card::DevCard;
+use catan::dice::Dice;
 use catan::ids::{Edge, Hex, Vertex};
 use catan::symmetry::{Symmetry, SYMMETRIES};
-use catan::observation::{OBSERVATION_BYTES, observe};
+use catan::observation::{OBSERVATION_BYTES, PHASE_AT, TRADE_AT, observe};
 use catan::player::{Player, MAX_PLAYERS};
 use catan::rng::Rng;
-use catan::state::{ACTIONS, Action, Actor, DEALS, Deal, MASK_WORDS, State};
+use catan::state::{ACTIONS, Action, Actor, MASK_WORDS, MAX_PROPOSED, Phase, Rules, State};
 use catan::topology::topology as board_topology;
 use catan::worlds;
-use numpy::{AllowTypeChange, PyArray1, PyArray2, PyArrayLike1, PyArrayMethods};
+use numpy::{AllowTypeChange, PyArray1, PyArray2, PyArrayLike1, PyArrayLike2, PyArrayMethods};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-
-const OUTCOMES: usize = 11;
-
-type Dice<'py> = (
-    Bound<'py, PyArray1<bool>>,
-    Bound<'py, numpy::PyArrayDyn<u8>>,
-    Bound<'py, numpy::PyArrayDyn<u8>>,
-    Bound<'py, numpy::PyArrayDyn<f32>>,
-);
 
 type Batch<'py> = (Bound<'py, PyArray2<u8>>, Bound<'py, PyArray2<bool>>, Bound<'py, PyArray1<u8>>);
 
@@ -33,8 +25,8 @@ struct Buffer {
 #[pymethods]
 impl Buffer {
     #[new]
-    #[pyo3(signature = (games, history = 1024, max_decisions = 1000, seed = 0, players = 4, paired = false))]
-    fn new(games: usize, history: usize, max_decisions: u32, seed: u64, players: usize, paired: bool) -> PyResult<Self> {
+    #[pyo3(signature = (games, history = 1024, max_decisions = 1000, seed = 0, players = 4, paired = false, rules = None))]
+    fn new(games: usize, history: usize, max_decisions: u32, seed: u64, players: usize, paired: bool, rules: Option<&GameRules>) -> PyResult<Self> {
         if games == 0 || max_decisions == 0 || history == 0 || history as u64 % CHECKPOINT_EVERY != 0 {
             return Err(PyValueError::new_err(format!(
                 "games and max_decisions must be positive, and history a positive multiple of {CHECKPOINT_EVERY}"
@@ -43,7 +35,8 @@ impl Buffer {
         if !(2..=MAX_PLAYERS).contains(&players) {
             return Err(PyValueError::new_err(format!("2 to {MAX_PLAYERS} players")));
         }
-        let inner = buffer::Buffer::new(Config { games, history, max_decisions, seed, players, paired });
+        let rules = rules.map_or(Rules::STANDARD, |r| r.inner);
+        let inner = buffer::Buffer::new(Config { games, history, max_decisions, seed, players, paired, rules });
         Ok(Buffer { inner, endings: vec![None; games] })
     }
 
@@ -83,7 +76,6 @@ impl Buffer {
         Ok(Worlds { inner: worlds })
     }
 
-    /// Each game's victory points by seat, hidden cards included (n, MAX_PLAYERS); seats past the player count are 0.
     fn points<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<u8>> {
         let rows: Vec<Vec<u8>> = (0..self.inner.len())
             .map(|game| {
@@ -92,17 +84,6 @@ impl Buffer {
             })
             .collect();
         PyArray2::from_vec2(py, &rows).expect("rows of MAX_PLAYERS")
-    }
-
-    fn rolls<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<u8>> {
-        let n = self.inner.len();
-        let mut counts = vec![vec![0u8; 11]; n];
-        for (game, row) in counts.iter_mut().enumerate() {
-            for &sum in self.inner.rolls(game) {
-                row[usize::from(sum - 2)] += 1;
-            }
-        }
-        PyArray2::from_vec2(py, &counts).expect("rows of 11")
     }
 
     fn hidden<'py>(&self, py: Python<'py>) -> Bound<'py, numpy::PyArrayDyn<u8>> {
@@ -123,37 +104,6 @@ impl Buffer {
         PyArray1::from_vec(py, out).reshape(vec![n, MAX_PLAYERS - 1, 10]).expect("sizes match")
     }
 
-    fn track_dice(&mut self, on: bool) {
-        self.inner.track_dice(on);
-    }
-
-    fn dice<'py>(&self, py: Python<'py>) -> Dice<'py> {
-        let n = self.inner.len();
-        let (mut has, mut weights) = (vec![false; n], vec![0f32; n * OUTCOMES]);
-        let (mut players, mut bytes) = (vec![0u8; n * OUTCOMES], vec![0u8; n * OUTCOMES * OBSERVATION_BYTES]);
-        for game in 0..n {
-            let children = self.inner.dice(game);
-            has[game] = !children.is_empty();
-            let total: f32 = children.iter().map(|&(w, _)| f32::from(w)).sum();
-            for (k, (weight, child)) in children.iter().enumerate() {
-                let Some(Actor::Player(player)) = child.actor() else { continue };
-                let at = game * OUTCOMES + k;
-                weights[at] = f32::from(*weight) / total;
-                players[at] = player.index() as u8;
-                let out: &mut [u8; OBSERVATION_BYTES] =
-                    (&mut bytes[at * OBSERVATION_BYTES..(at + 1) * OBSERVATION_BYTES]).try_into().expect("one observation");
-                observe(child, player, out);
-            }
-        }
-        let shape = |v: Vec<u8>, dims: &[usize]| PyArray1::from_vec(py, v).reshape(dims.to_vec()).expect("sizes match");
-        (
-            PyArray1::from_vec(py, has),
-            shape(bytes, &[n, OUTCOMES, OBSERVATION_BYTES]),
-            shape(players, &[n, OUTCOMES]),
-            PyArray1::from_vec(py, weights).reshape(vec![n, OUTCOMES]).expect("sizes match"),
-        )
-    }
-
     fn times<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<u64>> {
         PyArray1::from_iter(py, (0..self.inner.len()).map(|g| self.inner.time(g)))
     }
@@ -171,13 +121,42 @@ impl Buffer {
         (observations, masks(py, &words), player_codes(py, &players))
     }
 
-    fn step(&mut self, py: Python<'_>, actions: PyArrayLike1<'_, u16, AllowTypeChange>) -> PyResult<Vec<(usize, Option<u8>, u64)>> {
+    fn forbidden<'py>(&self, py: Python<'py>) -> (Bound<'py, numpy::PyArrayDyn<i8>>, Bound<'py, PyArray1<u8>>) {
+        let n = self.inner.len();
+        let (mut deals, mut counts) = (vec![0i8; n * MAX_PROPOSED * 5], vec![0u8; n]);
+        for game in 0..n {
+            let forbidden = self.inner.state(game).forbidden_deals();
+            counts[game] = forbidden.len() as u8;
+            for (k, deal) in forbidden.iter().enumerate() {
+                deals[(game * MAX_PROPOSED + k) * 5..][..5].copy_from_slice(deal);
+            }
+        }
+        (PyArray1::from_vec(py, deals).reshape(vec![n, MAX_PROPOSED, 5]).expect("sizes match"), PyArray1::from_vec(py, counts))
+    }
+
+    #[pyo3(signature = (actions, deals = None))]
+    fn step(
+        &mut self,
+        py: Python<'_>,
+        actions: PyArrayLike1<'_, u16, AllowTypeChange>,
+        deals: Option<PyArrayLike2<'_, i8, AllowTypeChange>>,
+    ) -> PyResult<Vec<(usize, Option<u8>, u64)>> {
         let actions = actions.as_slice()?;
         if actions.len() != self.inner.len() {
             return Err(PyValueError::new_err(format!("{} actions for {} games", actions.len(), self.inner.len())));
         }
+        let deals: Option<Vec<[i8; 5]>> = match deals {
+            Some(d) => {
+                let d = d.as_array();
+                if d.shape() != [actions.len(), 5] {
+                    return Err(PyValueError::new_err("deals must be one row of 5 counts per game"));
+                }
+                Some(d.rows().into_iter().map(|row| std::array::from_fn(|r| row[r])).collect())
+            }
+            None => None,
+        };
         let (inner, endings) = (&mut self.inner, &mut self.endings);
-        py.detach(|| inner.step(actions, endings)).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        py.detach(|| inner.step_with_deals(actions, deals.as_deref(), endings)).map_err(|e| PyValueError::new_err(e.to_string()))?;
         Ok(endings
             .iter()
             .enumerate()
@@ -269,19 +248,23 @@ struct Game {
     seed: u64,
     state: State,
     rng: Rng,
+    dice: Dice,
     codes: Vec<u16>,
+    history: Vec<(i8, u8, u16)>,
 }
 
 #[pymethods]
 impl Game {
     #[new]
-    #[pyo3(signature = (seed = 0, players = 4))]
-    fn new(seed: u64, players: usize) -> PyResult<Self> {
+    #[pyo3(signature = (seed = 0, players = 4, rules = None))]
+    fn new(seed: u64, players: usize, rules: Option<&GameRules>) -> PyResult<Self> {
         if !(2..=MAX_PLAYERS).contains(&players) {
             return Err(PyValueError::new_err(format!("2 to {MAX_PLAYERS} players")));
         }
-        let state = State::new(Board::random(&mut Rng::new(seed)), players);
-        Ok(Game { seed, state, rng: Rng::new(seed ^ 0x9E37_79B9_7F4A_7C15), codes: Vec::new() })
+        let rules = rules.map_or(Rules::STANDARD, |r| r.inner);
+        let state = State::with_rules(Board::random(&mut Rng::new(seed)), players, rules);
+        let dice = Dice::new(rules.balanced_dice);
+        Ok(Game { seed, state, rng: Rng::new(seed ^ 0x9E37_79B9_7F4A_7C15), dice, codes: Vec::new(), history: Vec::new() })
     }
 
     fn players(&self) -> usize {
@@ -314,13 +297,60 @@ impl Game {
         Ok((PyArray1::from_slice(py, &bytes), PyArray1::from_iter(py, legal)))
     }
 
-    fn step(&mut self, code: u16) -> PyResult<()> {
+    #[pyo3(signature = (code, deal = None))]
+    fn step(&mut self, code: u16, deal: Option<[i8; 5]>) -> PyResult<()> {
+        let actor = match self.state.actor() {
+            Some(Actor::Player(p)) => p.index() as i8,
+            _ => -1,
+        };
+        let mut seen = [0; OBSERVATION_BYTES];
+        observe(&self.state, Player::First, &mut seen);
         self.state.step(code).map_err(|e| PyValueError::new_err(e.to_string()))?;
         self.codes.push(code);
+        self.history.push((actor, seen[PHASE_AT], code));
+        if let (Some(counts), Some(Action::Offer | Action::Counter)) = (deal, Action::from_index(code)) {
+            let mut draft = self.state;
+            let mut phase = [0; OBSERVATION_BYTES];
+            for click in draft.finish_deal(counts) {
+                observe(&self.state, Player::First, &mut phase);
+                self.state.step(click.index()).map_err(|e| PyValueError::new_err(e.to_string()))?;
+                self.codes.push(click.index());
+                self.history.push((actor, phase[PHASE_AT], click.index()));
+            }
+        }
         Ok(())
     }
 
-    /// `samples` futures as the player to act could imagine them: hidden cards re-dealt from their view.
+    fn draft(&self) -> Option<(u8, [u8; 5], [u8; 5], bool)> {
+        match self.state.phase() {
+            Phase::Draft { deal } => Some((1, deal.give, deal.get, false)),
+            Phase::Respond { draft: Some(d), .. } => Some((2, d.give, d.get, false)),
+            Phase::Respond { closed: true, .. } => Some((0, [0; 5], [0; 5], true)),
+            _ => None,
+        }
+    }
+
+    fn forbidden(&self) -> Vec<[i8; 5]> {
+        self.state.forbidden_deals()
+    }
+
+    fn history(&self) -> Vec<(i8, u8, u16)> {
+        self.history.clone()
+    }
+
+    fn observe_as<'py>(&self, py: Python<'py>, player: usize) -> PyResult<Bound<'py, PyArray1<u8>>> {
+        if player >= self.state.players() {
+            return Err(PyValueError::new_err(format!("there is no seat {player}")));
+        }
+        let mut bytes = [0; OBSERVATION_BYTES];
+        observe(&self.state, Player::new(player), &mut bytes);
+        Ok(PyArray1::from_slice(py, &bytes))
+    }
+
+    fn legal(&self) -> Vec<u16> {
+        self.state.legal_actions().iter().map(Action::index).collect()
+    }
+
     #[pyo3(signature = (samples, seed = 0))]
     fn imagine(&self, samples: usize, seed: u64) -> PyResult<Worlds> {
         let Some(Actor::Player(observer)) = self.state.actor() else {
@@ -331,8 +361,12 @@ impl Game {
 
     fn settle(&mut self) {
         while let Some(Actor::Chance) = self.state.actor() {
-            let code = self.state.sample_outcome(&mut self.rng).index();
-            self.step(code).expect("a sampled outcome can happen");
+            let code = if matches!(self.state.phase(), Phase::Dice) {
+                self.dice.roll(&mut self.rng).index()
+            } else {
+                self.state.sample_outcome(&mut self.rng).index()
+            };
+            self.step(code, None).expect("a sampled outcome can happen");
         }
     }
 
@@ -389,6 +423,19 @@ fn symmetries<'py>(py: Python<'py>) -> (Bound<'py, PyArray2<u8>>, Bound<'py, PyA
 }
 
 #[pyfunction]
+fn geometry<'py>(py: Python<'py>) -> (Bound<'py, PyArray2<i32>>, Bound<'py, PyArray2<i32>>, Bound<'py, PyArray1<u8>>) {
+    let t = board_topology();
+    let hexes: Vec<Vec<i32>> = Hex::all().map(|h| { let (x, y) = t.hex_point(h); vec![x, y] }).collect();
+    let vertices: Vec<Vec<i32>> = Vertex::all().map(|v| { let (x, y) = t.vertex_point(v); vec![x, y] }).collect();
+    let coast = t.coast().iter().map(|e| e.index() as u8);
+    (
+        PyArray2::from_vec2(py, &hexes).expect("rows of 2"),
+        PyArray2::from_vec2(py, &vertices).expect("rows of 2"),
+        PyArray1::from_iter(py, coast),
+    )
+}
+
+#[pyfunction]
 fn topology<'py>(py: Python<'py>) -> (Bound<'py, PyArray2<u8>>, Bound<'py, PyArray2<u8>>) {
     let t = board_topology();
     let hex_corners: Vec<Vec<u8>> = Hex::all().map(|h| t.corners(h).map(|v| v.index() as u8).to_vec()).collect();
@@ -403,11 +450,60 @@ fn player_codes<'py>(py: Python<'py>, players: &[Player]) -> Bound<'py, PyArray1
     PyArray1::from_iter(py, players.iter().map(|p| p.index() as u8))
 }
 
-/// The trade menu: row i is what deal i gives (first five counts) and gets (last five), as its proposer sees it.
-#[pyfunction]
-fn deals(py: Python<'_>) -> Bound<'_, PyArray2<u8>> {
-    let rows: Vec<Vec<u8>> = Deal::all().iter().map(|d| [d.give, d.get].concat()).collect();
-    PyArray2::from_vec2(py, &rows).expect("rows of 10")
+#[pyclass(name = "Rules", module = "catan", frozen, skip_from_py_object)]
+#[derive(Clone, Copy)]
+struct GameRules {
+    inner: Rules,
+}
+
+#[pymethods]
+impl GameRules {
+    #[new]
+    #[pyo3(signature = (points = 10, discard_limit = 7, friendly_robber = false, balanced_dice = false, trading = true, turn_budget = 40))]
+    fn new(points: u8, discard_limit: u8, friendly_robber: bool, balanced_dice: bool, trading: bool, turn_budget: u8) -> PyResult<Self> {
+        let inner = Rules { points, discard_limit, friendly_robber, balanced_dice, trading, turn_budget };
+        inner.check().map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(GameRules { inner })
+    }
+
+    #[staticmethod]
+    fn colonist_1v1() -> Self {
+        GameRules { inner: Rules::COLONIST_1V1 }
+    }
+
+    fn __repr__(&self) -> String {
+        format!("{:?}", self.inner)
+    }
+
+    #[getter]
+    fn points(&self) -> u8 {
+        self.inner.points
+    }
+
+    #[getter]
+    fn discard_limit(&self) -> u8 {
+        self.inner.discard_limit
+    }
+
+    #[getter]
+    fn friendly_robber(&self) -> bool {
+        self.inner.friendly_robber
+    }
+
+    #[getter]
+    fn balanced_dice(&self) -> bool {
+        self.inner.balanced_dice
+    }
+
+    #[getter]
+    fn trading(&self) -> bool {
+        self.inner.trading
+    }
+
+    #[getter]
+    fn turn_budget(&self) -> u8 {
+        self.inner.turn_budget
+    }
 }
 
 #[pymodule]
@@ -416,11 +512,12 @@ fn catan_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Buffer>()?;
     m.add_class::<Game>()?;
     m.add_function(wrap_pyfunction!(topology, m)?)?;
+    m.add_function(wrap_pyfunction!(geometry, m)?)?;
     m.add_function(wrap_pyfunction!(symmetries, m)?)?;
     m.add("OBSERVATION_BYTES", OBSERVATION_BYTES)?;
     m.add("ACTIONS", ACTIONS)?;
-    m.add("DEALS", DEALS)?;
-    m.add_function(wrap_pyfunction!(deals, m)?)?;
+    m.add("TRADE_AT", TRADE_AT)?;
+    m.add_class::<GameRules>()?;
     m.add("MAX_PLAYERS", MAX_PLAYERS)?;
     Ok(())
 }
