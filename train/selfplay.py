@@ -12,25 +12,24 @@ from torch import nn
 
 import catan
 
+from . import deals
 from .agents import Network, Random
 from .evaluate import play
-from .features import HEX_VERTEX, SEATS, SYMMETRIES, TRADE_AT
+from .features import ANSWERS_AT, BUDGET_LEFT, HEX_VERTEX, LAST_ACCEPTED, LAST_COUNTERED, OFFERS_MADE, SEATS, SYMMETRIES
 from .model import KIND_COUNT, KIND_MEMBERS, KIND_RUNS, KINDS, Model, device, load
 
 HIDDEN = (SEATS - 1) * 10
 TRADED = np.isin(KINDS, (22, 23))
-DICE_SUMS = 11
 ANSWERS = 3
 SETUP_SETTLEMENT, PHASE_TURN, PHASE_RESPOND, PHASE_CONFIRM, PHASE_DRAFT = 0, 2, 13, 14, 15
-SEND, ABANDON, COUNTER, END_TURN, TRADE_WITH, CANCEL, DESERT = 245, 246, 249, 225, 250, 256, 5
-BUDGET_LEFT = TRADE_AT + 56
+OFFER, COUNTER, END_TURN, TRADE_WITH, CANCEL, DESERT = 234, 249, 225, 250, 256, 5
 CORNER_HEXES = HEX_VERTEX.sum(0)
 
 class Habits:
 
     def __init__(self):
         self.setups = self.pips = self.desert = self.coast = self.sure = 0
-        self.decisions = self.offers = self.counters = self.cancels = self.abandons = 0
+        self.decisions = self.offers = self.counters = self.cancels = self.dropped = 0
         self.ends = self.timeouts = 0
         self.kinds = np.zeros(KIND_COUNT, np.int64)
 
@@ -38,10 +37,9 @@ class Habits:
         phase = o[:, 296]
         self.decisions += int(own.sum())
         self.kinds += np.bincount(KINDS[chosen[own]], minlength=KIND_COUNT)
-        self.offers += int((own & (phase == PHASE_DRAFT) & (chosen == SEND)).sum())
-        self.counters += int((own & (phase == PHASE_RESPOND) & (chosen == SEND)).sum())
+        self.offers += int((own & (chosen == OFFER)).sum())
+        self.counters += int((own & (chosen == COUNTER)).sum())
         self.cancels += int((own & (phase == PHASE_CONFIRM) & (chosen == CANCEL)).sum())
-        self.abandons += int((own & (chosen == ABANDON)).sum())
         ending = own & (phase == PHASE_TURN) & (chosen == END_TURN)
         self.ends += int(ending.sum())
         self.timeouts += int((ending & (o[:, BUDGET_LEFT] == 0)).sum())
@@ -64,14 +62,14 @@ class Habits:
                   for (name, *_), count in zip(KIND_RUNS, self.kinds)}
         return {"setup_pips": self.pips / s, "setup_desert": self.desert / s, "setup_bare_coast": self.coast / s,
                 "setup_sure": self.sure / s, "offers_per_1k": self.offers / d, "counters_per_1k": self.counters / d,
-                "cancels_per_1k": self.cancels / d, "abandons_per_1k": self.abandons / d,
+                "cancels_per_1k": self.cancels / d, "dropped_offers_per_1k": self.dropped / d,
                 "turns_out_of_time": self.timeouts / max(self.ends, 1), **shares}
 
     def summary(self):
         v = self.values()
         return (f"setup pips {v['setup_pips']:.1f} desert {v['setup_desert']:.2f} bare coast {v['setup_bare_coast']:.2f} "
                 f"sure {v['setup_sure']:.2f}  per 1k own moves: offers {v['offers_per_1k']:.1f} "
-                f"counters {v['counters_per_1k']:.1f} cancels {v['cancels_per_1k']:.2f} abandons {v['abandons_per_1k']:.1f}  "
+                f"counters {v['counters_per_1k']:.1f} cancels {v['cancels_per_1k']:.2f} dropped {v['dropped_offers_per_1k']:.2f}  "
                 f"turns out of time {v['turns_out_of_time']:.3f}")
 
 def policy(logits, masks):
@@ -111,15 +109,11 @@ class Critics(nn.Module):
     def __init__(self, width):
         super().__init__()
         self.hidden = nn.Sequential(nn.Linear(width + HIDDEN, width), nn.GELU(), nn.Linear(width, SEATS))
-        self.future = nn.Sequential(nn.Linear(width + DICE_SUMS, width), nn.GELU(), nn.Linear(width, SEATS))
         self.hands = nn.Sequential(nn.Linear(width, width), nn.GELU(), nn.Linear(width, HIDDEN))
         self.answers = nn.Sequential(nn.Linear(width, width), nn.GELU(), nn.Linear(width, (SEATS - 1) * ANSWERS))
 
     def privileged(self, summary, hidden):
         return torch.tanh(self.hidden(torch.cat([summary.float(), hidden.flatten(1).float() / 5], -1)))
-
-    def with_future(self, summary, rolls):
-        return torch.tanh(self.future(torch.cat([summary.float(), rolls.float()], -1)))
 
     def guess_hands(self, summary):
         return self.hands(summary.float()).view(-1, SEATS - 1, 10)
@@ -164,14 +158,19 @@ class League:
         self.members[i]["won"] += int(won)
 
     @torch.no_grad()
-    def act(self, i, obs, masks, greedy=None):
+    def act(self, i, obs, masks, forbidden, counts, greedy=None):
+        model = self.members[i]["model"]
         with torch.autocast(self.at.type, dtype=torch.bfloat16, enabled=self.autocast):
-            logits, _, _ = self.members[i]["model"](torch.from_numpy(obs).to(self.at), torch.from_numpy(masks).to(self.at))
+            logits, _, summary, goods = model(torch.from_numpy(obs).to(self.at), torch.from_numpy(masks).to(self.at), with_goods=True)
         logits = logits.float().cpu()
         moves = torch.multinomial(logits.softmax(1), 1, generator=self.generator).squeeze(1).numpy()
         if greedy is not None and greedy.any():
             moves[greedy] = logits[torch.from_numpy(greedy)].argmax(1).numpy()
-        return moves
+        def logits_for(rows, counts):
+            at = torch.from_numpy(rows).to(self.at)
+            return model.deal_scores(summary[at].float(), goods[at].float(), torch.from_numpy(moves[rows] == COUNTER).to(self.at), counts)
+        offers, _, _ = deals.choose(moves, obs, forbidden, counts, logits_for, self.at, generator=self.generator)
+        return moves, offers
 
     def summary(self):
         hardest = min(range(len(self.members)), key=self.win_rate)
@@ -179,12 +178,12 @@ class League:
                 f"(network wins {self.win_rate(hardest):.2f} vs it, fair 0.50)")
 
 class Rollout:
-    def __init__(self, model, critics, buffer, at, autocast, players, average_dice=False, privileged=False, seed=0,
+    def __init__(self, model, critics, buffer, at, autocast, players, privileged=False, seed=0,
                  vp_reward=0.0, league=None, league_games=0.0, rank=False, greedy_games=0.0, explore_games=0.0):
         self.model, self.critics, self.buffer, self.at, self.autocast = model, critics, buffer, at, autocast
         self.rank, self.greedy_games, self.explore_games = rank, greedy_games, explore_games
         self.games, self.players = len(buffer), players
-        self.average_dice, self.privileged = average_dice, privileged
+        self.privileged = privileged
         self.rng = np.random.default_rng(seed)
         self.vp_reward = vp_reward
         game = np.arange(self.games)
@@ -194,7 +193,6 @@ class Rollout:
         self.opponent = np.full((self.games, SEATS), -1)
         self.greedy = self.rng.random(self.games) < greedy_games
         self.explore = self.rng.random(self.games) < explore_games
-        buffer.track_dice(average_dice)
 
     def reseat(self, game):
         if self.league is not None:
@@ -209,15 +207,22 @@ class Rollout:
         pick = torch.multinomial(legal.float(), 1).squeeze(1)
         return top.indices.gather(1, pick[:, None]).squeeze(1).cpu().numpy()
 
-    def answered(self, o, p, pending, responses, tally):
+    def answered(self, o, p, pending, responses, tally, habits):
         games = np.flatnonzero((pending[:, 0] >= 0) & (p == pending[:, 1]) & np.isin(o[:, 296], (PHASE_TURN, PHASE_CONFIRM)))
         for game in games:
             others = np.arange(1, SEATS) < self.players
+            if o[game, OFFERS_MADE] == pending[game, 2]:
+                habits.dropped += 1
+                pending[game] = -1
+                continue
             if o[game, 296] == PHASE_CONFIRM:
-                status = o[game, TRADE_AT + 21:TRADE_AT + 54:11].astype(np.int64)
+                status = o[game, ANSWERS_AT:ANSWERS_AT + 33:11].astype(np.int64)
                 labels = np.where(others & (status >= 2), status - 2, -1)
             else:
-                labels = np.where(others, 1, -1)
+                seat = np.arange(1, SEATS)
+                accepted = o[game, LAST_ACCEPTED] >> seat & 1
+                countered = o[game, LAST_COUNTERED] >> seat & 1
+                labels = np.where(others, np.where(accepted == 1, 0, np.where(countered == 1, 2, 1)), -1)
             responses[pending[game, 0], game] = self.tensor(labels)
             tally += np.bincount(labels[labels >= 0], minlength=ANSWERS)
             pending[game] = -1
@@ -225,11 +230,11 @@ class Rollout:
     @torch.no_grad()
     def evaluate(self, obs, masks, hidden=None):
         with torch.autocast(self.at.type, dtype=torch.bfloat16, enabled=self.autocast):
-            logits, values, summary = self.model(obs, masks)
+            logits, values, summary, goods = self.model(obs, masks, with_goods=True)
         if hidden is not None:
             values = self.critics.privileged(summary, hidden)
         dist, _ = policy(logits, masks)
-        return dist, values.float()
+        return dist, values.float(), summary.float(), goods.float()
 
     @torch.no_grad()
     def value(self, obs, actors):
@@ -240,16 +245,6 @@ class Rollout:
     def tensor(self, array, dtype=None):
         return torch.from_numpy(array.astype(dtype) if dtype else array).to(self.at)
 
-    def expected_after_roll(self):
-        has, obs, actors, weights = self.buffer.dice()
-        games = np.flatnonzero(has)
-        if len(games) == 0:
-            return games, None
-        outcomes = obs.shape[1]
-        flat_actors = self.tensor(actors[games].reshape(-1), np.int64)
-        values = self.value(self.tensor(obs[games].reshape(-1, obs.shape[-1])), flat_actors).view(len(games), outcomes, -1)
-        return games, (self.tensor(weights[games])[..., None] * values).sum(1)
-
     def collect(self, rounds):
         n, at = self.games, self.at
         obs = torch.zeros(rounds, n, catan.OBSERVATION_BYTES, dtype=torch.uint8, device=at)
@@ -259,15 +254,16 @@ class Rollout:
         values = torch.zeros(rounds, n, SEATS, device=at)
         actors = torch.zeros(rounds, n, dtype=torch.long, device=at)
         hidden = torch.zeros(rounds, n, SEATS - 1, 10, dtype=torch.uint8, device=at)
-        rolls = torch.zeros(rounds, n, DICE_SUMS, device=at)
         done, ends = torch.zeros(rounds, n, dtype=torch.bool, device=at), torch.zeros(rounds, n, SEATS, device=at)
         progress = torch.zeros(rounds, n, SEATS, device=at)
-        rolled, expected = torch.zeros(rounds, n, dtype=torch.bool, device=at), torch.zeros(rounds, n, SEATS, device=at)
         responses = torch.full((rounds, n, SEATS - 1), -1, dtype=torch.long, device=at)
+        offered = torch.zeros(rounds, n, dtype=torch.bool, device=at)
+        offer_choices = torch.full((rounds, n, deals.STEPS), -1, dtype=torch.long, device=at)
+        offer_masks = torch.ones(rounds, n, deals.STEPS, deals.CHOICES, dtype=torch.bool, device=at)
         stats = {"won": 0, "truncated": 0, "first_won": 0, "trades": 0, "league": 0, "league_network_won": 0, "explored": 0}
         habits = Habits()
         learn = torch.ones(rounds, n, dtype=torch.bool, device=at)
-        pending, tally, trades = np.full((n, 2), -1), np.zeros(ANSWERS, np.int64), []
+        pending, tally, trades = np.full((n, 3), -1), np.zeros(ANSWERS, np.int64), []
         if self.league is not None:
             for game in np.flatnonzero((self.league_seats & (self.opponent < 0)).any(1)):
                 self.reseat(game)
@@ -275,18 +271,34 @@ class Rollout:
         for t in range(rounds):
             o, m, p = self.buffer.observe()
             obs[t], masks[t], actors[t] = self.tensor(o), self.tensor(m), self.tensor(p, np.int64)
-            self.answered(o, p, pending, responses, tally)
+            forbidden, counts = self.buffer.forbidden()
+            self.answered(o, p, pending, responses, tally, habits)
             hidden[t] = self.tensor(self.buffer.hidden())
-            dist, v = self.evaluate(obs[t], masks[t], hidden[t] if self.privileged else None)
+            dist, v, summary, goods = self.evaluate(obs[t], masks[t], hidden[t] if self.privileged else None)
             a = dist.sample()
             actions[t], log_probs[t], values[t] = a, dist.log_prob(a), to_absolute(v, actors[t], self.players)
             chosen = a.cpu().numpy()
             opponent = self.opponent[np.arange(n), p]
             league_turn = self.league_seats[np.arange(n), p] & (opponent >= 0)
+            offers = np.zeros((n, deals.RESOURCES), np.int8)
             for k in np.unique(opponent[league_turn]):
                 rows = league_turn & (opponent == k)
-                chosen[rows] = self.league.act(k, o[rows], m[rows], self.greedy[rows])
+                chosen[rows], offers[rows] = self.league.act(k, o[rows], m[rows], forbidden[rows], counts[rows], self.greedy[rows])
             own = ~league_turn
+            mine = np.where(own, chosen, 0)
+            def logits_for(rows, counts):
+                at_rows = self.tensor(rows)
+                return self.model.deal_scores(summary[at_rows], goods[at_rows], self.tensor(mine[rows] == COUNTER), counts)
+            with torch.no_grad(), torch.autocast(at.type, dtype=torch.bfloat16, enabled=self.autocast):
+                own_offers, rows, sampled = deals.choose(mine, o, forbidden, counts, logits_for, at)
+            if sampled is not None:
+                offers[rows] = own_offers[rows]
+                at_rows = self.tensor(rows)
+                offered[t, at_rows], offer_choices[t, at_rows], offer_masks[t, at_rows] = True, sampled[0], sampled[1]
+                with torch.no_grad(), torch.autocast(at.type, dtype=torch.bfloat16, enabled=self.autocast):
+                    deal_lp, _ = self.model.deal_log_probs(summary[at_rows], goods[at_rows], self.tensor(mine[rows] == COUNTER),
+                                                           sampled[0], sampled[1])
+                log_probs[t, at_rows] += deal_lp.float()
             exploring = own & self.explore & (o[:, 296] == SETUP_SETTLEMENT) & (m.sum(1) > 1)
             if exploring.any():
                 chosen[exploring] = self.explore_opening(dist.probs[self.tensor(exploring)])
@@ -297,18 +309,13 @@ class Rollout:
                 learn[t] = self.tensor(~others)
             habits.record(o, chosen, own & ~exploring, dist.probs)
             stats["trades"] += int(TRADED[chosen].sum())
-            sent = np.flatnonzero((o[:, 296] == PHASE_DRAFT) & (chosen == SEND))
-            pending[sent] = np.stack([np.full(len(sent), t), p[sent]], 1)
+            sent = np.flatnonzero(chosen == OFFER)
+            pending[sent] = np.stack([np.full(len(sent), t), p[sent], o[sent, OFFERS_MADE]], 1)
             for game in np.flatnonzero(TRADED[chosen]):
                 trades.append((t, game, p[game], (p[game] + (chosen[game] - TRADE_WITH) % (SEATS - 1) + 1) % self.players))
             before = self.buffer.points()
-            endings = self.buffer.step(chosen)
+            endings = self.buffer.step(chosen, offers)
             progress[t] = self.tensor((self.buffer.points().astype(np.float32) - before))
-            rolls[t] = self.tensor(self.buffer.rolls().astype(np.float32))
-            if self.average_dice:
-                games, value = self.expected_after_roll()
-                if value is not None:
-                    rolled[t, games], expected[t, games] = True, value
             for game, winner, _ in endings:
                 done[t, game] = True
                 ends[t, game] = rewards(winner, self.players, points=before[game] if self.rank else None).to(at)
@@ -333,22 +340,13 @@ class Rollout:
             last = to_absolute(last, self.tensor(p, np.int64), self.players)
         else:
             last = self.value(self.tensor(o), self.tensor(p, np.int64))
-        future = upcoming(rolls, done)
-        batch = dict(obs=obs, masks=masks, actions=actions, log_probs=log_probs, actors=actors, hidden=hidden, future=future,
-                     learn=learn, responses=responses)
+        batch = dict(obs=obs, masks=masks, actions=actions, log_probs=log_probs, actors=actors, hidden=hidden,
+                     learn=learn, responses=responses, offered=offered, offer_choices=offer_choices, offer_masks=offer_masks)
         stats["answers"] = tally
         stats["trade_advantage"] = trade_advantage(trades, values, done)
         shaped = self.vp_reward * relative(progress, self.players) * (~done)[..., None]
         stats["habits"], stats["habit_values"] = habits.summary(), habits.values()
-        return batch, values, (done, ends, rolled, expected, last, shaped), stats
-
-def upcoming(rolls, done, decay=0.9):
-    future = torch.zeros_like(rolls)
-    following = torch.zeros_like(rolls[0])
-    for t in reversed(range(rolls.shape[0])):
-        following = rolls[t] + decay * following * (~done[t])[:, None]
-        future[t] = following
-    return future / 3
+        return batch, values, (done, ends, last, shaped), stats
 
 def sync(at):
     if at.type == "cuda":
@@ -368,13 +366,12 @@ def relative(gains, players):
     out[..., :players] = gains - others
     return out
 
-def advantages(values, done, ends, rolled, expected, last, shaped, lam):
+def advantages(values, done, ends, last, shaped, lam):
     result = torch.zeros_like(values)
     following = torch.zeros_like(last)
     for t in reversed(range(values.shape[0])):
         next_values = last if t == values.shape[0] - 1 else values[t + 1]
-        target = torch.where(rolled[t, :, None], expected[t], next_values)
-        delta = torch.where(done[t, :, None], ends[t] - values[t], shaped[t] + target - values[t])
+        delta = torch.where(done[t, :, None], ends[t] - values[t], shaped[t] + next_values - values[t])
         following = torch.where(done[t, :, None], delta, delta + lam * following)
         result[t] = following
     return result
@@ -404,24 +401,29 @@ def update(model, critics, optimizer, batch, adv, returns, players, args, autoca
             obs, masks = flat["obs"][pick], flat["masks"][pick]
             symmetry = torch.randint(SYMMETRIES, (len(pick),), device=obs.device) if args.symmetry else None
             with torch.autocast(obs.device.type, dtype=torch.bfloat16, enabled=autocast):
-                logits, values, summary = model(obs, masks, symmetry)
+                logits, values, summary, goods = model(obs, masks, symmetry, with_goods=True)
+                offered = flat["offered"][pick]
+                rows = torch.nonzero(offered).squeeze(1)
+                deal_lp, deal_entropy = torch.zeros(len(pick), device=obs.device), torch.zeros(len(pick), device=obs.device)
+                if len(rows):
+                    lp, h = model.deal_log_probs(summary[rows], goods[rows], flat["actions"][pick][rows] == COUNTER,
+                                                 flat["offer_choices"][pick][rows], flat["offer_masks"][pick][rows])
+                    deal_lp, deal_entropy = deal_lp.index_put((rows,), lp.float()), deal_entropy.index_put((rows,), h.float())
             dist, log_probs = policy(logits, masks)
-            new = dist.log_prob(flat["actions"][pick])
+            new = dist.log_prob(flat["actions"][pick]) + deal_lp
             ratio = (new - flat["log_probs"][pick]).exp()
             target = targets[pick]
             value_loss = nn.functional.mse_loss(values.float()[:, seats], target[:, seats])
             a = own[pick]
             if args.privileged:
                 value_loss = value_loss + nn.functional.mse_loss(critics.privileged(summary, flat["hidden"][pick])[:, seats], target[:, seats])
-            if args.future_dice:
-                baseline = critics.with_future(summary, flat["future"][pick])
-                value_loss = value_loss + nn.functional.mse_loss(baseline[:, seats], target[:, seats])
-                a = target[:, 0] - baseline[:, 0].detach()
             kept = informative[pick] & flat["learn"][pick]
             ratio, a = ratio[kept], a[kept]
             a = (a - a.mean()) / (a.std() + 1e-8)
             policy_loss = -torch.min(ratio * a, ratio.clamp(1 - args.clip, 1 + args.clip) * a).mean()
-            entropy_kind, entropy_target = (h[flat["learn"][pick]].mean() for h in entropies(log_probs))
+            kind_h, target_h = entropies(log_probs)
+            target_h = target_h + deal_entropy
+            entropy_kind, entropy_target = (h[flat["learn"][pick]].mean() for h in (kind_h, target_h))
             loss = policy_loss + args.value_coef * value_loss
             loss = loss - entropy_weight * (entropy_kind + args.target_entropy_share * entropy_target)
             if args.aux_hands:
@@ -492,13 +494,9 @@ def main():
                         help="shrink the entropy bonus on its own schedule; defaults to --anneal-steps")
     parser.add_argument("--keep", type=float, default=1.0,
                         help="train the policy only on this fraction of moves, those with the largest advantage magnitude")
-    parser.add_argument("--average-dice", action="store_true",
-                        help="score a move followed by a roll against the average over all 11 rolls, not the one rolled")
     parser.add_argument("--symmetry", action="store_true", help="turn each training sample by a random board symmetry")
     parser.add_argument("--privileged", action="store_true",
                         help="score moves with a critic that also sees every hidden card (training only)")
-    parser.add_argument("--future-dice", action="store_true",
-                        help="score moves against a baseline that also knows the dice rolled next (ICLR 2019)")
     parser.add_argument("--league", type=float, default=0.0,
                         help="share of training games with earlier versions of the network in half the seats; 0 is off")
     parser.add_argument("--league-size", type=int, default=8, help="earlier versions kept in the pool")
@@ -568,7 +566,7 @@ def main():
     buffer = catan.Buffer(args.games, history=64, max_decisions=args.max_decisions, seed=args.seed, players=args.players,
                           rules=rules)
     league = League(args.league_size, at, autocast, args.seed) if args.league else None
-    rollout = Rollout(model, critics, buffer, at, autocast, args.players, args.average_dice, args.privileged, args.seed,
+    rollout = Rollout(model, critics, buffer, at, autocast, args.players, args.privileged, args.seed,
                       args.vp_reward, league, args.league, args.reward == "rank", args.greedy_opponents, args.opening_explore)
     log = open(out / "log.txt", "a")
 

@@ -1,26 +1,18 @@
 use catan::board::Board;
 use catan::buffer::{self, CHECKPOINT_EVERY, Config, Ending, Finish};
 use catan::dev_card::DevCard;
+use catan::dice::Dice;
 use catan::ids::{Edge, Hex, Vertex};
 use catan::symmetry::{Symmetry, SYMMETRIES};
 use catan::observation::{OBSERVATION_BYTES, PHASE_AT, TRADE_AT, observe};
 use catan::player::{Player, MAX_PLAYERS};
 use catan::rng::Rng;
-use catan::state::{ACTIONS, Action, Actor, MASK_WORDS, Rules, State};
+use catan::state::{ACTIONS, Action, Actor, MASK_WORDS, MAX_PROPOSED, Phase, Rules, State};
 use catan::topology::topology as board_topology;
 use catan::worlds;
-use numpy::{AllowTypeChange, PyArray1, PyArray2, PyArrayLike1, PyArrayMethods};
+use numpy::{AllowTypeChange, PyArray1, PyArray2, PyArrayLike1, PyArrayLike2, PyArrayMethods};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-
-const OUTCOMES: usize = 11;
-
-type Dice<'py> = (
-    Bound<'py, PyArray1<bool>>,
-    Bound<'py, numpy::PyArrayDyn<u8>>,
-    Bound<'py, numpy::PyArrayDyn<u8>>,
-    Bound<'py, numpy::PyArrayDyn<f32>>,
-);
 
 type Batch<'py> = (Bound<'py, PyArray2<u8>>, Bound<'py, PyArray2<bool>>, Bound<'py, PyArray1<u8>>);
 
@@ -94,17 +86,6 @@ impl Buffer {
         PyArray2::from_vec2(py, &rows).expect("rows of MAX_PLAYERS")
     }
 
-    fn rolls<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<u8>> {
-        let n = self.inner.len();
-        let mut counts = vec![vec![0u8; 11]; n];
-        for (game, row) in counts.iter_mut().enumerate() {
-            for &sum in self.inner.rolls(game) {
-                row[usize::from(sum - 2)] += 1;
-            }
-        }
-        PyArray2::from_vec2(py, &counts).expect("rows of 11")
-    }
-
     fn hidden<'py>(&self, py: Python<'py>) -> Bound<'py, numpy::PyArrayDyn<u8>> {
         let n = self.inner.len();
         let mut out = vec![0u8; n * (MAX_PLAYERS - 1) * 10];
@@ -121,37 +102,6 @@ impl Buffer {
             }
         }
         PyArray1::from_vec(py, out).reshape(vec![n, MAX_PLAYERS - 1, 10]).expect("sizes match")
-    }
-
-    fn track_dice(&mut self, on: bool) {
-        self.inner.track_dice(on);
-    }
-
-    fn dice<'py>(&self, py: Python<'py>) -> Dice<'py> {
-        let n = self.inner.len();
-        let (mut has, mut weights) = (vec![false; n], vec![0f32; n * OUTCOMES]);
-        let (mut players, mut bytes) = (vec![0u8; n * OUTCOMES], vec![0u8; n * OUTCOMES * OBSERVATION_BYTES]);
-        for game in 0..n {
-            let children = self.inner.dice(game);
-            has[game] = !children.is_empty();
-            let total: f32 = children.iter().map(|&(w, _)| f32::from(w)).sum();
-            for (k, (weight, child)) in children.iter().enumerate() {
-                let Some(Actor::Player(player)) = child.actor() else { continue };
-                let at = game * OUTCOMES + k;
-                weights[at] = f32::from(*weight) / total;
-                players[at] = player.index() as u8;
-                let out: &mut [u8; OBSERVATION_BYTES] =
-                    (&mut bytes[at * OBSERVATION_BYTES..(at + 1) * OBSERVATION_BYTES]).try_into().expect("one observation");
-                observe(child, player, out);
-            }
-        }
-        let shape = |v: Vec<u8>, dims: &[usize]| PyArray1::from_vec(py, v).reshape(dims.to_vec()).expect("sizes match");
-        (
-            PyArray1::from_vec(py, has),
-            shape(bytes, &[n, OUTCOMES, OBSERVATION_BYTES]),
-            shape(players, &[n, OUTCOMES]),
-            PyArray1::from_vec(py, weights).reshape(vec![n, OUTCOMES]).expect("sizes match"),
-        )
     }
 
     fn times<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<u64>> {
@@ -171,13 +121,42 @@ impl Buffer {
         (observations, masks(py, &words), player_codes(py, &players))
     }
 
-    fn step(&mut self, py: Python<'_>, actions: PyArrayLike1<'_, u16, AllowTypeChange>) -> PyResult<Vec<(usize, Option<u8>, u64)>> {
+    fn forbidden<'py>(&self, py: Python<'py>) -> (Bound<'py, numpy::PyArrayDyn<i8>>, Bound<'py, PyArray1<u8>>) {
+        let n = self.inner.len();
+        let (mut deals, mut counts) = (vec![0i8; n * MAX_PROPOSED * 5], vec![0u8; n]);
+        for game in 0..n {
+            let forbidden = self.inner.state(game).forbidden_deals();
+            counts[game] = forbidden.len() as u8;
+            for (k, deal) in forbidden.iter().enumerate() {
+                deals[(game * MAX_PROPOSED + k) * 5..][..5].copy_from_slice(deal);
+            }
+        }
+        (PyArray1::from_vec(py, deals).reshape(vec![n, MAX_PROPOSED, 5]).expect("sizes match"), PyArray1::from_vec(py, counts))
+    }
+
+    #[pyo3(signature = (actions, deals = None))]
+    fn step(
+        &mut self,
+        py: Python<'_>,
+        actions: PyArrayLike1<'_, u16, AllowTypeChange>,
+        deals: Option<PyArrayLike2<'_, i8, AllowTypeChange>>,
+    ) -> PyResult<Vec<(usize, Option<u8>, u64)>> {
         let actions = actions.as_slice()?;
         if actions.len() != self.inner.len() {
             return Err(PyValueError::new_err(format!("{} actions for {} games", actions.len(), self.inner.len())));
         }
+        let deals: Option<Vec<[i8; 5]>> = match deals {
+            Some(d) => {
+                let d = d.as_array();
+                if d.shape() != [actions.len(), 5] {
+                    return Err(PyValueError::new_err("deals must be one row of 5 counts per game"));
+                }
+                Some(d.rows().into_iter().map(|row| std::array::from_fn(|r| row[r])).collect())
+            }
+            None => None,
+        };
         let (inner, endings) = (&mut self.inner, &mut self.endings);
-        py.detach(|| inner.step(actions, endings)).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        py.detach(|| inner.step_with_deals(actions, deals.as_deref(), endings)).map_err(|e| PyValueError::new_err(e.to_string()))?;
         Ok(endings
             .iter()
             .enumerate()
@@ -269,6 +248,7 @@ struct Game {
     seed: u64,
     state: State,
     rng: Rng,
+    dice: Dice,
     codes: Vec<u16>,
     history: Vec<(i8, u8, u16)>,
 }
@@ -281,8 +261,10 @@ impl Game {
         if !(2..=MAX_PLAYERS).contains(&players) {
             return Err(PyValueError::new_err(format!("2 to {MAX_PLAYERS} players")));
         }
-        let state = State::with_rules(Board::random(&mut Rng::new(seed)), players, rules.map_or(Rules::STANDARD, |r| r.inner));
-        Ok(Game { seed, state, rng: Rng::new(seed ^ 0x9E37_79B9_7F4A_7C15), codes: Vec::new(), history: Vec::new() })
+        let rules = rules.map_or(Rules::STANDARD, |r| r.inner);
+        let state = State::with_rules(Board::random(&mut Rng::new(seed)), players, rules);
+        let dice = Dice::new(rules.balanced_dice);
+        Ok(Game { seed, state, rng: Rng::new(seed ^ 0x9E37_79B9_7F4A_7C15), dice, codes: Vec::new(), history: Vec::new() })
     }
 
     fn players(&self) -> usize {
@@ -315,7 +297,8 @@ impl Game {
         Ok((PyArray1::from_slice(py, &bytes), PyArray1::from_iter(py, legal)))
     }
 
-    fn step(&mut self, code: u16) -> PyResult<()> {
+    #[pyo3(signature = (code, deal = None))]
+    fn step(&mut self, code: u16, deal: Option<[i8; 5]>) -> PyResult<()> {
         let actor = match self.state.actor() {
             Some(Actor::Player(p)) => p.index() as i8,
             _ => -1,
@@ -325,7 +308,30 @@ impl Game {
         self.state.step(code).map_err(|e| PyValueError::new_err(e.to_string()))?;
         self.codes.push(code);
         self.history.push((actor, seen[PHASE_AT], code));
+        if let (Some(counts), Some(Action::Offer | Action::Counter)) = (deal, Action::from_index(code)) {
+            let mut draft = self.state;
+            let mut phase = [0; OBSERVATION_BYTES];
+            for click in draft.finish_deal(counts) {
+                observe(&self.state, Player::First, &mut phase);
+                self.state.step(click.index()).map_err(|e| PyValueError::new_err(e.to_string()))?;
+                self.codes.push(click.index());
+                self.history.push((actor, phase[PHASE_AT], click.index()));
+            }
+        }
         Ok(())
+    }
+
+    fn draft(&self) -> Option<(u8, [u8; 5], [u8; 5], bool)> {
+        match self.state.phase() {
+            Phase::Draft { deal } => Some((1, deal.give, deal.get, false)),
+            Phase::Respond { draft: Some(d), .. } => Some((2, d.give, d.get, false)),
+            Phase::Respond { closed: true, .. } => Some((0, [0; 5], [0; 5], true)),
+            _ => None,
+        }
+    }
+
+    fn forbidden(&self) -> Vec<[i8; 5]> {
+        self.state.forbidden_deals()
     }
 
     fn history(&self) -> Vec<(i8, u8, u16)> {
@@ -355,8 +361,12 @@ impl Game {
 
     fn settle(&mut self) {
         while let Some(Actor::Chance) = self.state.actor() {
-            let code = self.state.sample_outcome(&mut self.rng).index();
-            self.step(code).expect("a sampled outcome can happen");
+            let code = if matches!(self.state.phase(), Phase::Dice) {
+                self.dice.roll(&mut self.rng).index()
+            } else {
+                self.state.sample_outcome(&mut self.rng).index()
+            };
+            self.step(code, None).expect("a sampled outcome can happen");
         }
     }
 

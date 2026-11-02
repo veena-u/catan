@@ -3,7 +3,7 @@ mod rules;
 mod validate;
 
 pub use info::Hidden;
-pub use rules::{longest_road, Action, Chances, Deal, Invalid, Mask, Outcome, ACTIONS, DICE, MASK_WORDS, MAX_PROPOSED, RESHUFFLE_BELOW};
+pub use rules::{longest_road, Action, Chances, Deal, Invalid, Mask, Outcome, ACTIONS, DICE, MASK_WORDS, MAX_PROPOSED};
 pub use validate::Violation;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -25,7 +25,7 @@ impl Rules {
     pub fn check(&self) -> Result<(), Violation> {
         let fine = (3..=20).contains(&self.points)
             && self.discard_limit >= 2
-            && (4..=3 * MAX_PROPOSED as u8).contains(&self.turn_budget);
+            && (4..=MAX_PROPOSED as u8).contains(&self.turn_budget);
         if fine { Ok(()) } else { Err(Violation(format!("unplayable rules {self:?}"))) }
     }
 }
@@ -129,7 +129,6 @@ pub struct State {
     deck: [u8; 5],
     bought: [u8; 5],
     card_played: bool,
-    dice: [u8; 11],
     moves: u8,
     proposed: u8,
     proposals: [Deal; MAX_PROPOSED],
@@ -165,7 +164,6 @@ impl State {
             deck: DEV_CARDS,
             bought: [0; 5],
             card_played: false,
-            dice: DICE,
             moves: 0,
             proposed: 0,
             proposals: [Deal::EMPTY; MAX_PROPOSED],
@@ -288,10 +286,6 @@ impl State {
 
     pub fn rules(&self) -> Rules {
         self.rules
-    }
-
-    pub fn dice_weights(&self) -> [u8; 11] {
-        if self.rules.balanced_dice { self.dice } else { DICE }
     }
 
     pub fn moves(&self) -> u8 {

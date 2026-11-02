@@ -6,6 +6,7 @@ from torch import nn
 
 import catan
 
+from .deals import MAX_CARDS, STOP, replay, step_log_probs
 from .features import (
     EDGE_FEATURES, EDGES, GLOBAL_FEATURES, HEX_FEATURES, HEXES, PLAYER_FEATURES, RESOURCE_FEATURES, RESOURCES, SEATS,
     TOKEN_RELATIONS, TOKENS, VERTEX_FEATURES, VERTICES, decode, players, resources, symmetry_tables, token_relations,
@@ -85,9 +86,13 @@ class Model(nn.Module):
         self.gates = nn.Parameter(torch.zeros(questions, width))
         self.keys = nn.Linear(width, width)
         self.value = nn.Linear(width, SEATS)
+        self.deal_query = nn.Linear(width, 2 * width)
+        self.count_embed = nn.Parameter(torch.randn(RESOURCES, 2 * MAX_CARDS + 1, width) * 0.02)
+        self.stop_hidden, self.stop_out = nn.Linear(width, width), nn.Linear(width, 1)
+        self.card_hidden, self.card_out = nn.Linear(2 * width, width), nn.Linear(width, 2)
         self.register_buffer("kind_of", torch.from_numpy(KINDS), persistent=False)
 
-    def forward(self, obs, masks=None, symmetry=None):
+    def forward(self, obs, masks=None, symmetry=None, with_goods=False):
         hexes, vertices, edges, globals_ = decode(obs, symmetry)
         board = torch.cat([self.embed_hex(hexes), self.embed_vertex(vertices), self.embed_edge(edges)], 1) + self.position[1:]
         summary = (self.embed_global(globals_) + self.position[0]).unsqueeze(1)
@@ -99,9 +104,10 @@ class Model(nn.Module):
         x = self.norm(x)
         summary = x[:, 0]
         values = torch.tanh(self.value(summary))
-        if masks is None:
-            return None, values, summary
-        return self.policy(x, summary, masks, symmetry), values, summary
+        log_probs = None if masks is None else self.policy(x, summary, masks, symmetry)
+        if with_goods:
+            return log_probs, values, summary, x[:, 1 + SEATS:1 + SEATS + RESOURCES]
+        return log_probs, values, summary
 
     def policy(self, x, summary, masks, symmetry):
         n, d = len(x), self.width
@@ -124,6 +130,27 @@ class Model(nn.Module):
                 scores[:, start:start + count] = point(q, target)
         scores = untwist(scores, symmetry)
         return factored(self.kind(summary), scores, masks, self.kind_of)
+
+    def deal_scores(self, summary, goods, counter, counts):
+        n, d = len(summary), self.width
+        query = self.deal_query(summary).view(n, 2, d)[torch.arange(n, device=summary.device), counter.long()]
+        shape = counts.shape[:-1]
+        query = query.view(n, *([1] * (len(shape) - 1)), d)
+        h = query + self.count_embed[torch.arange(RESOURCES, device=counts.device), counts + MAX_CARDS].sum(-2)
+        stop = self.stop_out(nn.functional.gelu(self.stop_hidden(h))).squeeze(-1)
+        rows = goods.view(n, *([1] * (len(shape) - 1)), RESOURCES, d).expand(*shape, RESOURCES, d)
+        both = torch.cat([h.unsqueeze(-2).expand(*shape, RESOURCES, d), rows], -1)
+        cards = self.card_out(nn.functional.gelu(self.card_hidden(both)))
+        return stop, torch.cat([cards[..., 0], cards[..., 1]], -1)
+
+    def deal_log_probs(self, summary, goods, counter, choices, masks):
+        stop, cards = self.deal_scores(summary, goods, counter, replay(choices))
+        n, steps = choices.shape
+        log_probs = step_log_probs(stop.reshape(-1), cards.reshape(n * steps, -1), masks.reshape(n * steps, -1)).view(n, steps, -1)
+        taken = choices >= 0
+        chosen = log_probs.gather(-1, choices.clamp(min=STOP)[..., None]).squeeze(-1)
+        entropy = -(log_probs.exp() * log_probs).sum(-1)
+        return torch.where(taken, chosen, 0.0).sum(1), torch.where(taken, entropy, 0.0).sum(1)
 
 KIND_MEMBERS = torch.from_numpy(np.eye(KIND_COUNT, dtype=np.float32)[KINDS])
 

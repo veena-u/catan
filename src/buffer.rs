@@ -4,6 +4,7 @@ use std::sync::Mutex;
 use std::thread;
 
 use crate::board::Board;
+use crate::dice::Dice;
 use crate::observation::{observe, OBSERVATION_BYTES};
 use crate::player::Player;
 use crate::rng::Rng;
@@ -67,7 +68,6 @@ impl std::error::Error for Unavailable {}
 pub struct Buffer {
     games: Vec<Game>,
     max_decisions: u32,
-    track_dice: bool,
 }
 
 struct Game {
@@ -76,13 +76,13 @@ struct Game {
     mask: Mask,
     rng: Rng,
     dice_rng: Rng,
+    dice: Dice,
     deal: Option<u64>,
     round: u64,
     time: u64,
     decisions: u32,
     codes: Box<[u16]>,
     checkpoints: Box<[State]>,
-    dice: Vec<(u8, State)>,
     rolls: Vec<u8>,
 }
 
@@ -106,22 +106,22 @@ impl Buffer {
                     mask: Mask::EMPTY,
                     rng,
                     dice_rng: Rng::new(0),
+                    dice: Dice::new(config.rules.balanced_dice),
                     deal,
                     round: 0,
                     time: 0,
                     decisions: 0,
                     codes: vec![PAD; config.history].into_boxed_slice(),
                     checkpoints: Vec::new().into_boxed_slice(),
-                    dice: Vec::new(),
                     rolls: Vec::new(),
                 };
                 game.state = game.fresh(config.players);
                 game.checkpoints = vec![game.state; config.history / CHECKPOINT_EVERY as usize].into_boxed_slice();
-                game.settle(false);
+                game.settle();
                 game
             })
             .collect();
-        Buffer { games, max_decisions: config.max_decisions, track_dice: false }
+        Buffer { games, max_decisions: config.max_decisions }
     }
 
     pub fn len(&self) -> usize {
@@ -144,29 +144,26 @@ impl Buffer {
         self.games[game].mask
     }
 
-    pub fn track_dice(&mut self, on: bool) {
-        self.track_dice = on;
-    }
-
-    pub fn dice(&self, game: usize) -> &[(u8, State)] {
-        &self.games[game].dice
-    }
-
     pub fn rolls(&self, game: usize) -> &[u8] {
         &self.games[game].rolls
     }
 
     pub fn step(&mut self, actions: &[u16], endings: &mut [Option<Ending>]) -> Result<(), IllegalAction> {
+        self.step_with_deals(actions, None, endings)
+    }
+
+    pub fn step_with_deals(&mut self, actions: &[u16], deals: Option<&[[i8; 5]]>, endings: &mut [Option<Ending>]) -> Result<(), IllegalAction> {
         assert!(actions.len() == self.games.len() && endings.len() == self.games.len(), "one entry per game");
+        assert!(deals.is_none_or(|d| d.len() == actions.len()), "one deal per game");
         for (game, (&action, g)) in actions.iter().zip(&self.games).enumerate() {
             if !Action::from_index(action).is_some_and(|a| g.mask.contains(a)) {
                 return Err(IllegalAction { game, action });
             }
         }
-        let (max_decisions, track) = (self.max_decisions, self.track_dice);
+        let max_decisions = self.max_decisions;
         parallel(&mut self.games, endings, |games, endings, start| {
             for (i, (game, ending)) in games.iter_mut().zip(endings).enumerate() {
-                *ending = game.take(actions[start + i], max_decisions, track);
+                *ending = game.take(actions[start + i], deals.map(|d| d[start + i]), max_decisions);
             }
         });
         Ok(())
@@ -293,18 +290,18 @@ impl Game {
             }
         };
         self.round += 1;
+        self.dice = Dice::new(self.rules.balanced_dice);
         State::with_rules(board, players, self.rules)
     }
 
-    fn settle(&mut self, track_dice: bool) {
-        self.dice.clear();
+    fn settle(&mut self) {
         self.rolls.clear();
-        if track_dice && matches!(self.state.phase(), Phase::Dice) {
-            expand(&self.state, &mut self.dice);
-        }
         while let Some(Actor::Chance) = self.state.actor() {
-            let rolling = matches!(self.state.phase(), Phase::Dice);
-            let outcome = self.state.sample_outcome(if rolling { &mut self.dice_rng } else { &mut self.rng });
+            let outcome = if matches!(self.state.phase(), Phase::Dice) {
+                self.dice.roll(&mut self.dice_rng)
+            } else {
+                self.state.sample_outcome(&mut self.rng)
+            };
             if let Outcome::Dice(sum) = outcome {
                 self.rolls.push(sum);
             }
@@ -314,11 +311,17 @@ impl Game {
         self.mask = self.state.legal_actions();
     }
 
-    fn take(&mut self, action: u16, max_decisions: u32, track_dice: bool) -> Option<Ending> {
+    fn take(&mut self, action: u16, deal: Option<[i8; 5]>, max_decisions: u32) -> Option<Ending> {
         self.record(action);
-        self.state.apply(Action::from_index(action).expect("checked by the caller"));
+        let chosen = Action::from_index(action).expect("checked by the caller");
+        self.state.apply(chosen);
+        if let (Some(counts), Action::Offer | Action::Counter) = (deal, chosen) {
+            for click in self.state.finish_deal(counts) {
+                self.record(click.index());
+            }
+        }
         self.decisions += 1;
-        self.settle(track_dice);
+        self.settle();
         let finish = match self.state.winner() {
             Some(winner) => Finish::Won(winner),
             None if self.decisions >= max_decisions => Finish::Truncated,
@@ -342,7 +345,7 @@ impl Game {
         }
         self.state = state;
         self.decisions = 0;
-        self.settle(false);
+        self.settle();
     }
 }
 
@@ -351,22 +354,6 @@ fn mix(seed: u64, k: u64) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     z ^ (z >> 31)
-}
-
-fn expand(state: &State, into: &mut Vec<(u8, State)>) {
-    for (i, &weight) in state.chances().weights().iter().enumerate() {
-        if weight == 0 {
-            continue;
-        }
-        let mut child = *state;
-        child.resolve(state.outcome(i as u16).expect("an outcome of this node"));
-        let mut rng = Rng::new(i as u64);
-        while let Some(Actor::Chance) = child.actor() {
-            let outcome = child.sample_outcome(&mut rng);
-            child.resolve(outcome);
-        }
-        into.push((weight, child));
-    }
 }
 
 pub(crate) fn parallel<A: Send, B: Send>(a: &mut [A], b: &mut [B], work: impl Fn(&mut [A], &mut [B], usize) + Sync) {

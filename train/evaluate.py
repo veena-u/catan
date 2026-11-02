@@ -16,12 +16,13 @@ def play(a, b, games=4096, parallel=512, seed=0, max_decisions=5000, players=4, 
     wins = losses = truncated = first_wins = decided = 0
     while (finished < per_slot).any():
         obs, masks, actors = buffer.observe()
+        forbidden, counts = buffer.forbidden()
         a_turn = actors == seat_a
-        actions = np.zeros(parallel, np.int64)
+        actions, offers = np.zeros(parallel, np.int64), np.zeros((parallel, 5), np.int8)
         for agent, turn in ((a, a_turn), (b, ~a_turn)):
             if turn.any():
-                actions[turn] = agent(obs[turn], masks[turn])
-        for game, winner, _ in buffer.step(actions):
+                actions[turn], offers[turn] = agent(obs[turn], masks[turn], forbidden[turn], counts[turn])
+        for game, winner, _ in buffer.step(actions, offers):
             if finished[game] >= per_slot:
                 continue
             finished[game] += 1

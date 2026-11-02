@@ -14,8 +14,7 @@ use super::{Actor, LastOffer, Phase, State};
 pub const ACTIONS: usize = 257;
 pub const MASK_WORDS: usize = ACTIONS.div_ceil(64);
 
-pub const MAX_PROPOSED: usize = 20;
-pub const RESHUFFLE_BELOW: u8 = 6;
+pub const MAX_PROPOSED: usize = 40;
 
 const SETTLEMENT: usize = 0;
 const CITY: usize = 54;
@@ -355,7 +354,6 @@ impl State {
                 }
                 mask.insert(Action::EndTurn);
             }
-            Phase::Draft { .. } if self.moves >= self.rules.turn_budget => mask.insert(Action::Abandon),
             Phase::Draft { deal } => {
                 self.insert_draft(&mut mask, player, deal);
                 if deal.gives() + deal.asks() > 0 && !self.was_proposed(deal) {
@@ -439,11 +437,37 @@ impl State {
         self.settle();
     }
 
+    pub fn finish_deal(&mut self, counts: [i8; 5]) -> Vec<Action> {
+        let mut taken = Vec::new();
+        let drafting = |state: &State| matches!(state.phase, Phase::Draft { .. } | Phase::Respond { draft: Some(_), .. });
+        if !drafting(self) {
+            return taken;
+        }
+        let mut whole = true;
+        'cards: for (resource, &count) in Resource::ALL.iter().zip(&counts) {
+            let click = if count < 0 { Action::Give(*resource) } else { Action::Ask(*resource) };
+            for _ in 0..count.unsigned_abs() {
+                if !self.legal_actions().contains(click) {
+                    whole = false;
+                    break 'cards;
+                }
+                self.apply(click);
+                taken.push(click);
+            }
+        }
+        if drafting(self) {
+            let last = if whole && self.legal_actions().contains(Action::Send) { Action::Send } else { Action::Abandon };
+            self.apply(last);
+            taken.push(last);
+        }
+        taken
+    }
+
     pub fn chances(&self) -> Chances {
         let mut weights = [0; 11];
         let count = match self.phase {
             Phase::Dice => {
-                weights = if self.rules.balanced_dice { self.dice } else { DICE };
+                weights = DICE;
                 11
             }
             Phase::Steal { victim, .. } => {
@@ -486,12 +510,6 @@ impl State {
 
     fn happen(&mut self, outcome: Outcome) {
         let player = self.current;
-        if let (true, Outcome::Dice(sum)) = (self.rules.balanced_dice, outcome) {
-            self.dice[usize::from(sum - 2)] -= 1;
-            if self.dice.iter().sum::<u8>() < RESHUFFLE_BELOW {
-                self.dice = DICE;
-            }
-        }
         match (self.phase, outcome) {
             (Phase::Dice, Outcome::Dice(7)) => self.start_discards(),
             (Phase::Dice, Outcome::Dice(sum)) => {
@@ -543,7 +561,7 @@ impl State {
     fn transition(&mut self, action: Action) {
         let player = self.current;
         let p = player.index();
-        if matches!(self.phase, Phase::Turn { rolled: true } | Phase::Draft { .. } | Phase::Confirm { .. }) {
+        if matches!(self.phase, Phase::Turn { rolled: true } | Phase::Confirm { .. }) {
             self.moves = (self.moves + 1).min(self.rules.turn_budget);
         }
         match (self.phase, action) {
@@ -779,6 +797,15 @@ impl State {
             }
         }
         mask.insert(Action::Abandon);
+    }
+
+    pub fn forbidden_deals(&self) -> Vec<[i8; 5]> {
+        let signed = |deal: Deal| std::array::from_fn(|r| deal.get[r] as i8 - deal.give[r] as i8);
+        match self.phase {
+            Phase::Turn { rolled: true } => self.proposals[..usize::from(self.proposed)].iter().map(|&d| signed(d)).collect(),
+            Phase::Respond { deal, draft: None, .. } => vec![signed(deal.reversed())],
+            _ => Vec::new(),
+        }
     }
 
     pub(super) fn was_proposed(&self, deal: Deal) -> bool {

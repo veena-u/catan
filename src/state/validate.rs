@@ -6,7 +6,7 @@ use crate::player::{Player, MAX_PLAYERS};
 use crate::resource::{Resource, RESOURCE_CARDS};
 use crate::topology::topology;
 
-use super::rules::{award, longest_road, Deal, DICE, MAX_PROPOSED};
+use super::rules::{award, longest_road, Deal, MAX_PROPOSED};
 use super::{Actor, Phase, State};
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -250,13 +250,6 @@ impl State {
             !matches!(self.phase, Phase::Turn { rolled: false }) || self.moves == 0,
             || "decisions counted before the roll".into(),
         )?;
-        if self.rules.balanced_dice {
-            let left: u8 = self.dice.iter().sum();
-            ensure(
-                left >= super::rules::RESHUFFLE_BELOW && self.dice.iter().zip(DICE).all(|(&d, full)| d <= full),
-                || "a dice deck that cannot be".into(),
-            )?;
-        }
         let before_roll = match self.phase {
             Phase::PlaceSettlement | Phase::PlaceRoad { .. } | Phase::Dice => true,
             Phase::Turn { rolled }

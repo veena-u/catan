@@ -5,7 +5,7 @@ use crate::player::{Player, MAX_PLAYERS};
 use crate::resource::Resource;
 use crate::state::{Deal, Phase, State};
 
-pub const OBSERVATION_BYTES: usize = 398;
+pub const OBSERVATION_BYTES: usize = 369;
 
 pub const TRADE_AT: usize = 302;
 pub const PHASE_AT: usize = 296;
@@ -122,13 +122,6 @@ pub fn observe(state: &State, observer: Player, out: &mut [u8; OBSERVATION_BYTES
         _ => (None, 0, [None; MAX_PLAYERS], None),
     };
     put(&sides(offer));
-    let (draft, drafting) = match state.phase() {
-        Phase::Draft { deal } => (Some(deal).filter(|_| state.current() == observer), 1),
-        Phase::Respond { draft: Some(d), responder, .. } => (Some(d).filter(|_| responder == observer), 2),
-        _ => (None, 0),
-    };
-    put(&sides(draft));
-    put(&[drafting]);
     for s in 1..MAX_PLAYERS {
         let status = match (offer, seat(s)) {
             (Some(_), Some(p)) if p != state.current() => {
@@ -148,12 +141,11 @@ pub fn observe(state: &State, observer: Player, out: &mut [u8; OBSERVATION_BYTES
         put(&[status]);
         put(&sides(seat(s).and_then(|p| counters[p.index()])));
     }
-    let (closed, clicks) = match state.phase() {
-        Phase::Respond { closed, clicks, .. } => (closed, clicks),
-        _ => (false, 0),
+    let clicks = match state.phase() {
+        Phase::Respond { clicks, .. } => clicks,
+        _ => 0,
     };
-    let rules = state.rules();
-    put(&[state.offers(), state.moves(), rules.turn_budget.saturating_sub(state.moves().max(clicks)), u8::from(closed)]);
+    put(&[state.offers(), state.rules().turn_budget.saturating_sub(state.moves().max(clicks))]);
     let last = state.last_offer();
     let relative_bits = |bits: u8| (0..n).filter(|&p| bits >> p & 1 == 1).fold(0u8, |acc, p| acc | 1 << relative(Player::new(p)));
     put(&sides(last.map(|l| l.deal)));
@@ -162,8 +154,6 @@ pub fn observe(state: &State, observer: Player, out: &mut [u8; OBSERVATION_BYTES
         last.map_or(0, |l| relative_bits(l.countered)),
         last.map_or(0, |l| u8::from(l.traded)),
     ]);
-    put(&[rules.points, rules.discard_limit, u8::from(rules.friendly_robber), u8::from(rules.balanced_dice), u8::from(rules.trading)]);
-    put(&state.dice_weights());
     put(&Resource::ALL.map(|r| state.rate(observer, r)));
     put(&per_seat(&|p| u8::from(state.protected(p))));
     debug_assert_eq!(at, OBSERVATION_BYTES);

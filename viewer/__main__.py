@@ -7,8 +7,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 
+import numpy as np
+
 import catan
 from train.agents import Network, Random
+from train.features import (
+    ANSWERS_AT, BUDGET_LEFT, LAST_AT, LAST_TRADED, OFFERS_MADE, PROTECTED_AT, RATES_AT, TRADE_AT,
+)
 from train.model import KIND_RUNS, KINDS, device, load
 
 RESOURCES = ["brick", "lumber", "wool", "grain", "ore"]
@@ -20,7 +25,7 @@ PHASES = [
 ]
 NAMES = ["Blue", "Red", "Orange", "Green"]
 BANK_PAIRS = [(give, get) for give in range(5) for get in range(5) if get != give]
-TRADE_AT = catan.TRADE_AT
+MAX_PROPOSED = 40
 HEXES, EDGE_ENDS = (a.tolist() for a in catan.topology())
 HEX_POINTS, VERTEX_POINTS, COAST = (a.tolist() for a in catan.geometry())
 GEOMETRY = {"hexes": HEX_POINTS, "vertices": VERTEX_POINTS, "edges": EDGE_ENDS, "corners": HEXES, "coast": COAST}
@@ -60,10 +65,15 @@ class Session:
         if actor is None or actor == self.human:
             return
         obs, mask = self.game.observe()
-        self.take(int(self.agent(obs[None], mask[None])[0]))
+        listed = self.game.forbidden()
+        forbidden = np.zeros((1, MAX_PROPOSED, 5), np.int8)
+        if listed:
+            forbidden[0, :len(listed)] = listed
+        actions, offers = self.agent(obs[None], mask[None], forbidden, np.array([len(listed)], np.uint8))
+        self.take(int(actions[0]), [int(c) for c in offers[0]])
 
-    def take(self, code):
-        self.game.step(code)
+    def take(self, code, deal=None):
+        self.game.step(code, deal)
         self.game.settle()
         self.narrate()
 
@@ -177,42 +187,46 @@ class Session:
                 "seat": seat_of(s), "name": NAMES[seat_of(s)], "you": s == 0, "points": o[288 + s], "cards": hand,
                 "devCards": devs, "knights": o[280 + s], "roadLength": o[284 + s],
                 "longestRoad": holder(o[292]) == seat_of(s), "largestArmy": holder(o[293]) == seat_of(s),
-                "protected": bool(o[t + 92 + s]),
+                "protected": bool(o[PROTECTED_AT + s]),
             }
             if s > 0:
-                at = t + 21 + 11 * (s - 1)
+                at = ANSWERS_AT + 11 * (s - 1)
                 seat["answer"] = ["", "waiting", "accepted", "declined", "countered"][min(o[at], 4)]
                 counter = o[at + 1:at + 11]
                 seat["counter"] = {"give": counter[:5], "get": counter[5:]} if any(counter) else None
             seats.append(seat)
         current = seat_of(o[294])
         offer = o[t:t + 10]
-        draft = o[t + 10:t + 20]
-        last = o[t + 58:t + 68]
+        drafting, give, get, closed = self.game.draft() or (0, [0] * 5, [0] * 5, False)
+        if self.game.to_act() != self.human:
+            drafting, give, get = 0, [0] * 5, [0] * 5
+        draft = list(give) + list(get)
+        last = o[LAST_AT:LAST_AT + 10]
         winner = self.game.winner()
         return {
             "seed": self.seed, "players": n, "human": self.human, "toAct": self.game.to_act(), "winner": winner,
             "geometry": GEOMETRY,
-            "rules": {"points": o[t + 71], "discardLimit": o[t + 72], "friendlyRobber": bool(o[t + 73]),
-                      "balancedDice": bool(o[t + 74]), "trading": bool(o[t + 75])},
+            "rules": {"points": self.rules.points, "discardLimit": self.rules.discard_limit,
+                      "friendlyRobber": self.rules.friendly_robber, "balancedDice": self.rules.balanced_dice,
+                      "trading": self.rules.trading},
             "board": {
                 "terrain": [TERRAINS[c] for c in o[128:147]], "tokens": o[147:166], "robber": o[220],
                 "harbors": [None if h == 0 else ("3:1" if h == 1 else RESOURCES[h - 2]) for h in o[166:220]],
                 "settlements": settlements, "cities": cities, "roads": roads,
             },
             "seats": seats,
-            "hand": o[222:227], "devCards": o[258:263], "bought": o[263:268], "rates": o[t + 87:t + 92],
+            "hand": o[222:227], "devCards": o[258:263], "bought": o[263:268], "rates": o[RATES_AT:RATES_AT + 5],
             "bank": o[253:258], "deck": o[274],
             "phase": PHASES[o[296]], "rolled": bool(o[297]), "count": o[298], "current": current,
             "phasePlayer": None if o[299] == 255 else seat_of(o[299]), "cardPlayed": bool(o[295]),
             "trade": {
                 "offer": {"give": offer[:5], "get": offer[5:]} if any(offer) else None,
                 "draft": {"give": draft[:5], "get": draft[5:]},
-                "drafting": ["", "offer", "counter"][o[t + 20]],
-                "offers": o[t + 54], "budgetLeft": o[t + 56], "closed": bool(o[t + 57]),
-                "last": {"give": last[:5], "get": last[5:], "traded": bool(o[t + 70])} if any(last) else None,
+                "drafting": ["", "offer", "counter"][drafting],
+                "offers": o[OFFERS_MADE], "budgetLeft": o[BUDGET_LEFT], "closed": closed,
+                "last": {"give": last[:5], "get": last[5:], "traded": bool(o[LAST_TRADED])} if any(last) else None,
             },
-            "dice": o[t + 76:t + 87], "lastRoll": self.last_roll,
+            "lastRoll": self.last_roll,
             "moves": self.moves(), "events": self.events[-60:], "record": self.game.record(),
         }
 

@@ -874,13 +874,38 @@ fn the_turn_budget_ends_a_turn_like_a_timer() {
     let mut state = scenario_of(26, 2);
     state.rules = Rules { turn_budget: 4, ..Rules::STANDARD };
     known_hands(&mut state, &[[3, 0, 0, 0, 0], [0; 5]]);
-    act(&mut state, Action::Offer);
-    act(&mut state, Action::Give(Resource::Brick));
-    act(&mut state, Action::Ask(Resource::Ore));
-    assert_eq!(state.moves, 3);
-    state.apply(Action::Give(Resource::Brick));
-    assert_eq!(state.current, Player::Second, "the draft was dropped and the turn ended when time ran out");
+    state.apply(Action::Offer);
+    assert_eq!(state.finish_deal([-1, 0, 0, 0, 1]), [Action::Give(Resource::Brick), Action::Ask(Resource::Ore), Action::Send]);
+    assert_eq!((state.phase, state.moves), (Phase::Turn { rolled: true }, 1), "declined at once; the clicks cost nothing");
+    state.moves = 3;
+    state.apply(Action::Offer);
+    state.finish_deal([-2, 0, 0, 0, 1]);
+    assert_eq!(state.current, Player::Second, "the second offer used up the budget, so the turn ended");
     assert_eq!(state.moves, 0);
+    state.validate().unwrap();
+}
+
+#[test]
+fn a_whole_offer_is_made_in_one_step_and_a_repeat_is_dropped() {
+    let mut state = scenario_of(25, 3);
+    state.hands = seats(&[[2, 0, 0, 0, 0], [0, 0, 0, 0, 1], [0, 0, 0, 0, 1]]);
+    state.apply(Action::Offer);
+    state.finish_deal([-1, 0, 0, 0, 1]);
+    assert!(matches!(state.phase, Phase::Respond { responder: Player::Second, .. }));
+    act(&mut state, Action::Decline);
+    act(&mut state, Action::Decline);
+    assert_eq!(state.forbidden_deals(), [[-1, 0, 0, 0, 1]]);
+    state.apply(Action::Offer);
+    assert_eq!(state.finish_deal([-1, 0, 0, 0, 1]).last(), Some(&Action::Abandon), "an offer already made is dropped");
+    assert_eq!(state.phase, Phase::Turn { rolled: true });
+    state.apply(Action::Offer);
+    assert_eq!(state.finish_deal([-3, 0, 0, 0, 0]).last(), Some(&Action::Abandon), "more brick than in hand stops the offer");
+    state.apply(Action::Offer);
+    state.finish_deal([-2, 0, 0, 0, 0]);
+    assert!(matches!(state.phase, Phase::Respond { .. }), "an open offer: two brick for anything");
+    assert_eq!(state.forbidden_deals(), [[2, 0, 0, 0, 0]], "a counter can't simply accept");
+    act(&mut state, Action::Counter);
+    assert_eq!(state.finish_deal([2, 0, 0, 0, -1]).last(), Some(&Action::Send), "two brick for the ore");
     state.validate().unwrap();
 }
 
@@ -903,25 +928,6 @@ fn a_friendly_robber_spares_players_showing_two_points_or_fewer() {
     assert!(!state.can_rob(Player::Second) && state.can_rob(Player::Third));
     state.rules = Rules::STANDARD;
     assert!(state.can_rob(Player::Second), "without the friendly robber anyone exposed can be robbed");
-}
-
-#[test]
-fn balanced_dice_draw_from_a_deck_of_the_36_combinations() {
-    let mut state = scenario(28);
-    state.rules = Rules { balanced_dice: true, ..Rules::STANDARD };
-    let mut rng = Rng::new(5);
-    for draw in 0..31 {
-        state.phase = Phase::Dice;
-        assert_eq!(state.chances().weights(), &state.dice, "the next roll comes from what is left of the deck");
-        assert_eq!(state.dice.iter().sum::<u8>(), 36 - draw);
-        let outcome = state.sample_outcome(&mut rng);
-        state.happen(outcome);
-    }
-    assert_eq!(state.dice, DICE, "with five combinations left the deck is reshuffled");
-    state.rules = Rules::STANDARD;
-    state.dice = [0, 0, 0, 0, 0, 6, 0, 0, 0, 0, 0];
-    state.phase = Phase::Dice;
-    assert_eq!(state.chances().weights(), &DICE, "ordinary dice ignore the deck");
 }
 
 #[test]
@@ -950,7 +956,7 @@ fn the_rules_set_the_discard_limit_and_the_points_to_win() {
 }
 
 #[test]
-fn everyone_sees_the_offer_and_each_answer_but_only_the_drafter_sees_a_draft() {
+fn everyone_sees_the_offer_and_each_answer_but_no_one_sees_a_draft() {
     let mut state = scenario_of(26, 3);
     state.hands = seats(&[[2, 0, 0, 0, 0], [0, 0, 0, 0, 1], [0, 0, 0, 0, 1]]);
     act(&mut state, Action::Offer);
@@ -959,14 +965,20 @@ fn everyone_sees_the_offer_and_each_answer_but_only_the_drafter_sees_a_draft() {
     let mut theirs = [0; OBSERVATION_BYTES];
     observe(&state, Player::First, &mut mine);
     observe(&state, Player::Second, &mut theirs);
-    let (offer_at, draft_at, drafting_at) = (TRADE_AT, TRADE_AT + 10, TRADE_AT + 20);
-    assert_eq!((mine[draft_at], mine[drafting_at]), (1, 1), "the drafter sees their draft");
-    assert_eq!((theirs[draft_at], theirs[drafting_at]), (0, 1), "the others only see that someone is drafting");
+    act(&mut state, Action::Give(Resource::Brick));
+    let mut again = [0; OBSERVATION_BYTES];
+    observe(&state, Player::First, &mut again);
+    assert_eq!(mine, again, "a draft shows nowhere until it is sent");
+    observe(&state, Player::Second, &mut again);
+    assert_eq!(theirs, again);
+    act(&mut state, Action::Abandon);
+    act(&mut state, Action::Offer);
+    act(&mut state, Action::Give(Resource::Brick));
     act(&mut state, Action::Ask(Resource::Ore));
     act(&mut state, Action::Send);
     act(&mut state, Action::Accept);
     observe(&state, Player::First, &mut mine);
-    assert_eq!(&mine[offer_at..offer_at + 10], &[1, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
-    let status = |seat: usize| mine[drafting_at + 1 + 11 * (seat - 1)];
+    assert_eq!(&mine[TRADE_AT..TRADE_AT + 10], &[1, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    let status = |seat: usize| mine[TRADE_AT + 10 + 11 * (seat - 1)];
     assert_eq!((status(1), status(2), status(3)), (2, 1, 0), "the next seat accepted, the one after is still to answer");
 }

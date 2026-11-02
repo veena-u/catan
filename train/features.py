@@ -12,6 +12,13 @@ VERTEX_FEATURES = 2 * SEATS + 7 + 1 + 5 + 2 * SEATS + SEATS
 EDGE_FEATURES = SEATS + 2 * SEATS + SEATS
 PHASES = 16
 TRADE_AT = catan.TRADE_AT
+ANSWERS_AT = TRADE_AT + 10
+OFFERS_MADE = TRADE_AT + 43
+BUDGET_LEFT = TRADE_AT + 44
+LAST_AT = TRADE_AT + 45
+LAST_ACCEPTED, LAST_COUNTERED, LAST_TRADED = TRADE_AT + 55, TRADE_AT + 56, TRADE_AT + 57
+RATES_AT = TRADE_AT + 58
+PROTECTED_AT = TRADE_AT + 63
 
 NONE = 255
 COSTS = torch.tensor([[1, 1, 0, 0, 0], [1, 1, 1, 1, 0], [0, 0, 0, 2, 3], [0, 0, 1, 1, 1]])
@@ -99,23 +106,17 @@ def decode(obs, symmetry=None):
         obs[:, 298:299].float() / 4,
         optional(obs[:, 299], SEATS),
         optional(obs[:, 301], 5),
-        obs[:, t:t + 20].float() / 4,
-        one_hot(obs[:, t + 20], 3),
+        obs[:, t:t + 10].float() / 4,
         one_hot(answers(obs), 5).flatten(1),
-        obs[:, t + 21:t + 54].view(-1, SEATS - 1, 11)[..., 1:].flatten(1).float() / 4,
-        obs[:, t + 54:t + 55].float() / 10,
-        obs[:, t + 55:t + 57].float() / 40,
-        obs[:, t + 57:t + 58].float(),
-        obs[:, t + 58:t + 68].float() / 4,
-        bits(obs, t + 68, 1, SEATS),
-        bits(obs, t + 69, 1, SEATS),
-        obs[:, t + 70:t + 71].float(),
-        obs[:, t + 71:t + 72].float() / 15,
-        obs[:, t + 72:t + 73].float() / 10,
-        obs[:, t + 73:t + 76].float(),
-        obs[:, t + 76:t + 87].float() / 6,
-        obs[:, t + 87:t + 92].float() / 4,
-        obs[:, t + 92:t + 96].float(),
+        obs[:, ANSWERS_AT:ANSWERS_AT + 33].view(-1, SEATS - 1, 11)[..., 1:].flatten(1).float() / 4,
+        obs[:, OFFERS_MADE:OFFERS_MADE + 1].float() / 10,
+        obs[:, BUDGET_LEFT:BUDGET_LEFT + 1].float() / 40,
+        obs[:, LAST_AT:LAST_AT + 10].float() / 4,
+        bits(obs, LAST_ACCEPTED, 1, SEATS),
+        bits(obs, LAST_COUNTERED, 1, SEATS),
+        obs[:, LAST_TRADED:LAST_TRADED + 1].float(),
+        obs[:, RATES_AT:RATES_AT + 5].float() / 4,
+        obs[:, PROTECTED_AT:PROTECTED_AT + 4].float(),
     ], -1)
     if symmetry is not None:
         hex_inverse, vertex_inverse, edge_inverse, _ = symmetry_tables(obs.device)
@@ -125,7 +126,7 @@ def decode(obs, symmetry=None):
     return hexes, vertices, edges, globals_
 
 def answers(obs):
-    return obs[:, TRADE_AT + 21:TRADE_AT + 54].view(-1, SEATS - 1, 11)[..., 0].clamp(max=4)
+    return obs[:, ANSWERS_AT:ANSWERS_AT + 33].view(-1, SEATS - 1, 11)[..., 0].clamp(max=4)
 
 def rates(obs):
     o = obs.long()
@@ -152,7 +153,7 @@ def players(obs):
     status = torch.zeros(n, SEATS, 5, device=obs.device)
     status[:, 1:] = one_hot(answers(obs), 5)
     counters = torch.zeros(n, SEATS, 10, device=obs.device)
-    counters[:, 1:] = o[:, TRADE_AT + 21:TRADE_AT + 54].view(n, SEATS - 1, 11)[..., 1:].float()
+    counters[:, 1:] = o[:, ANSWERS_AT:ANSWERS_AT + 33].view(n, SEATS - 1, 11)[..., 1:].float()
     flag = lambda column, value: (o[:, column:column + 1] == value).float()
     rows = [
         (seat == 0).float().expand(n, SEATS)[..., None],
@@ -172,7 +173,7 @@ def players(obs):
         status,
         counters / 4,
         flag(299, seat)[..., None],
-        o[:, TRADE_AT + 92:TRADE_AT + 96, None].float(),
+        o[:, PROTECTED_AT:PROTECTED_AT + 4, None].float(),
         (rates(obs) - 2).float() / 2,
         (COSTS.to(obs.device)[None, None] - cards[:, :, None]).clamp(min=0).sum(-1).float() / 5,
     ]
@@ -193,16 +194,15 @@ def resources(obs):
     t = TRADE_AT
     per_resource = lambda at: o[:, at:at + RESOURCES].float()
     known = torch.stack([o[:, 232 + 7 * k:237 + 7 * k] for k in range(SEATS - 1)], -1).float() / 10
-    counters = o[:, t + 21:t + 54].view(n, SEATS - 1, 11)[..., 1:].float()
-    rate = one_hot(o[:, t + 87:t + 92].clamp(2, 4) - 2, 3)
+    counters = o[:, ANSWERS_AT:ANSWERS_AT + 33].view(n, SEATS - 1, 11)[..., 1:].float()
+    rate = one_hot(o[:, RATES_AT:RATES_AT + 5].clamp(2, 4) - 2, 3)
     rows = [
         (per_resource(222) + per_resource(227))[..., None] / 10,
         per_resource(253)[..., None] / 19,
         rate,
         known,
         torch.stack([per_resource(t), per_resource(t + 5)], -1) / 4,
-        torch.stack([per_resource(t + 10), per_resource(t + 15)], -1) / 4,
-        torch.stack([per_resource(t + 58), per_resource(t + 63)], -1) / 4,
+        torch.stack([per_resource(LAST_AT), per_resource(LAST_AT + 5)], -1) / 4,
         torch.cat([counters[..., :RESOURCES], counters[..., RESOURCES:]], 1).transpose(1, 2) / 4,
         production,
         torch.eye(RESOURCES, device=obs.device).expand(n, -1, -1),
