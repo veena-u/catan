@@ -1,5 +1,4 @@
 use std::fmt;
-use std::sync::LazyLock;
 
 use crate::board::Harbor;
 use crate::dev_card::DevCard;
@@ -12,13 +11,11 @@ use crate::topology::topology;
 
 use super::{Actor, LastOffer, Phase, State};
 
-pub const ACTIONS: usize = 513;
+pub const ACTIONS: usize = 257;
 pub const MASK_WORDS: usize = ACTIONS.div_ceil(64);
 
-pub const MAX_OFFERS: u8 = 2;
-pub const DEALS: usize = 230;
-
-pub const WINNING_POINTS: u8 = 10;
+pub const MAX_PROPOSED: usize = 20;
+pub const RESHUFFLE_BELOW: u8 = 6;
 
 const SETTLEMENT: usize = 0;
 const CITY: usize = 54;
@@ -26,25 +23,31 @@ const ROAD: usize = 108;
 const ROBBER: usize = 180;
 const RESOURCE: usize = 199;
 const TRADE: usize = 204;
-const ROLL: usize = 264;
-const END_TURN: usize = 265;
-const BUY_CARD: usize = 266;
-const PLAY_KNIGHT: usize = 267;
-const PLAY_ROAD_BUILDING: usize = 268;
-const PLAY_YEAR_OF_PLENTY: usize = 269;
-const PLAY_MONOPOLY: usize = 270;
-const ROB: usize = 271;
-const DEAL: usize = 274;
-const ACCEPT: usize = 504;
-const DECLINE: usize = 505;
-const TRADE_WITH: usize = 506;
-const TAKE_COUNTER: usize = 509;
-const CANCEL: usize = 512;
+const ROLL: usize = 224;
+const END_TURN: usize = 225;
+const BUY_CARD: usize = 226;
+const PLAY_KNIGHT: usize = 227;
+const PLAY_ROAD_BUILDING: usize = 228;
+const PLAY_YEAR_OF_PLENTY: usize = 229;
+const PLAY_MONOPOLY: usize = 230;
+const ROB: usize = 231;
+const OFFER: usize = 234;
+const GIVE: usize = 235;
+const ASK: usize = 240;
+const SEND: usize = 245;
+const ABANDON: usize = 246;
+const ACCEPT: usize = 247;
+const DECLINE: usize = 248;
+const COUNTER: usize = 249;
+const TRADE_WITH: usize = 250;
+const TAKE_COUNTER: usize = 253;
+const CANCEL: usize = 256;
 
 const _: () = assert!(CITY == SETTLEMENT + VERTICES && ROAD == CITY + VERTICES);
 const _: () = assert!(ROBBER == ROAD + EDGES && RESOURCE == ROBBER + 19 && TRADE == RESOURCE + 5);
-const _: () = assert!(ROLL == TRADE + 3 * 5 * 4 && PLAY_MONOPOLY + 1 == ROB && ROB + MAX_PLAYERS - 1 == DEAL);
-const _: () = assert!(ACCEPT == DEAL + DEALS && DECLINE == ACCEPT + 1 && TRADE_WITH == DECLINE + 1);
+const _: () = assert!(ROLL == TRADE + 5 * 4 && PLAY_MONOPOLY + 1 == ROB && ROB + MAX_PLAYERS - 1 == OFFER);
+const _: () = assert!(GIVE == OFFER + 1 && ASK == GIVE + 5 && SEND == ASK + 5 && ABANDON == SEND + 1);
+const _: () = assert!(ACCEPT == ABANDON + 1 && DECLINE == ACCEPT + 1 && COUNTER == DECLINE + 1 && TRADE_WITH == COUNTER + 1);
 const _: () = assert!(TAKE_COUNTER == TRADE_WITH + MAX_PLAYERS - 1 && CANCEL == TAKE_COUNTER + MAX_PLAYERS - 1);
 const _: () = assert!(CANCEL + 1 == ACTIONS);
 
@@ -57,7 +60,7 @@ const ROADS: u8 = 15;
 const SETTLEMENTS: u8 = 5;
 const CITIES: u8 = 4;
 
-const DICE: [u8; 11] = [1, 2, 3, 4, 5, 6, 5, 4, 3, 2, 1];
+pub const DICE: [u8; 11] = [1, 2, 3, 4, 5, 6, 5, 4, 3, 2, 1];
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Action {
@@ -69,7 +72,6 @@ pub enum Action {
     Trade {
         give: Resource,
         get: Resource,
-        rate: u8,
     },
     Roll,
     EndTurn,
@@ -79,47 +81,42 @@ pub enum Action {
     PlayYearOfPlenty,
     PlayMonopoly,
     Rob(u8),
-    Deal(u8),
+    Offer,
+    Give(Resource),
+    Ask(Resource),
+    Send,
+    Abandon,
     Accept,
     Decline,
+    Counter,
     TradeWith(u8),
     TakeCounter(u8),
     Cancel,
 }
 
-/// A trade between players: what the one proposing it gives and gets, one or two cards a side.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub struct Deal {
     pub give: [u8; 5],
     pub get: [u8; 5],
 }
 
-static MENU: LazyLock<Vec<Deal>> = LazyLock::new(|| {
-    let card = |r: usize| std::array::from_fn(|i| u8::from(i == r));
-    let pair = |a: usize, b: usize| std::array::from_fn(|i| u8::from(i == a) + u8::from(i == b));
-    let bundles: Vec<[u8; 5]> = (0..5).map(card).chain((0..5).flat_map(|a| (a..5).map(move |b| pair(a, b)))).collect();
-    let apart = |x: &[u8; 5], y: &[u8; 5]| (0..5).all(|r| x[r] == 0 || y[r] == 0);
-    let menu: Vec<Deal> =
-        bundles.iter().flat_map(|give| bundles.iter().filter(|get| apart(give, get)).map(|&get| Deal { give: *give, get })).collect();
-    assert_eq!(menu.len(), DEALS);
-    menu
-});
-
 impl Deal {
-    pub fn all() -> &'static [Deal] {
-        &MENU
-    }
-
-    pub fn from_id(id: u8) -> Deal {
-        MENU[usize::from(id)]
-    }
-
-    pub fn id(self) -> Option<u8> {
-        MENU.iter().position(|&d| d == self).map(|i| i as u8)
-    }
+    pub const EMPTY: Deal = Deal { give: [0; 5], get: [0; 5] };
 
     pub fn reversed(self) -> Deal {
         Deal { give: self.get, get: self.give }
+    }
+
+    pub fn gives(self) -> u8 {
+        self.give.iter().sum()
+    }
+
+    pub fn asks(self) -> u8 {
+        self.get.iter().sum()
+    }
+
+    pub fn complete(self) -> bool {
+        self.gives() > 0 && self.asks() > 0
     }
 }
 
@@ -131,10 +128,9 @@ impl Action {
             Action::Road(e) => ROAD + e.index(),
             Action::Robber(h) => ROBBER + h.index(),
             Action::Resource(r) => RESOURCE + r.index(),
-            Action::Trade { give, get, rate } => {
-                debug_assert!((2..=4).contains(&rate) && give != get);
-                let get = get.index() - usize::from(get > give);
-                TRADE + 20 * usize::from(rate - 2) + 4 * give.index() + get
+            Action::Trade { give, get } => {
+                debug_assert!(give != get);
+                TRADE + 4 * give.index() + get.index() - usize::from(get > give)
             }
             Action::Roll => ROLL,
             Action::EndTurn => END_TURN,
@@ -144,9 +140,14 @@ impl Action {
             Action::PlayYearOfPlenty => PLAY_YEAR_OF_PLENTY,
             Action::PlayMonopoly => PLAY_MONOPOLY,
             Action::Rob(offset) => ROB + usize::from(offset) - 1,
-            Action::Deal(id) => DEAL + usize::from(id),
+            Action::Offer => OFFER,
+            Action::Give(r) => GIVE + r.index(),
+            Action::Ask(r) => ASK + r.index(),
+            Action::Send => SEND,
+            Action::Abandon => ABANDON,
             Action::Accept => ACCEPT,
             Action::Decline => DECLINE,
+            Action::Counter => COUNTER,
             Action::TradeWith(offset) => TRADE_WITH + usize::from(offset) - 1,
             Action::TakeCounter(offset) => TAKE_COUNTER + usize::from(offset) - 1,
             Action::Cancel => CANCEL,
@@ -163,13 +164,8 @@ impl Action {
             _ if i < RESOURCE => Action::Robber(Hex::new(i - ROBBER)),
             _ if i < TRADE => Action::Resource(Resource::ALL[i - RESOURCE]),
             _ if i < ROLL => {
-                let (rate, rest) = ((i - TRADE) / 20, (i - TRADE) % 20);
-                let (give, get) = (rest / 4, rest % 4);
-                Action::Trade {
-                    give: Resource::ALL[give],
-                    get: Resource::ALL[get + usize::from(get >= give)],
-                    rate: rate as u8 + 2,
-                }
+                let (give, get) = ((i - TRADE) / 4, (i - TRADE) % 4);
+                Action::Trade { give: Resource::ALL[give], get: Resource::ALL[get + usize::from(get >= give)] }
             }
             ROLL => Action::Roll,
             END_TURN => Action::EndTurn,
@@ -178,10 +174,15 @@ impl Action {
             PLAY_ROAD_BUILDING => Action::PlayRoadBuilding,
             PLAY_YEAR_OF_PLENTY => Action::PlayYearOfPlenty,
             PLAY_MONOPOLY => Action::PlayMonopoly,
-            _ if i < DEAL => Action::Rob((i - ROB + 1) as u8),
-            _ if i < ACCEPT => Action::Deal((i - DEAL) as u8),
+            _ if i < OFFER => Action::Rob((i - ROB + 1) as u8),
+            OFFER => Action::Offer,
+            _ if i < ASK => Action::Give(Resource::ALL[i - GIVE]),
+            _ if i < SEND => Action::Ask(Resource::ALL[i - ASK]),
+            SEND => Action::Send,
+            ABANDON => Action::Abandon,
             ACCEPT => Action::Accept,
             DECLINE => Action::Decline,
+            COUNTER => Action::Counter,
             _ if i < TAKE_COUNTER => Action::TradeWith((i - TRADE_WITH + 1) as u8),
             _ if i < CANCEL => Action::TakeCounter((i - TAKE_COUNTER + 1) as u8),
             CANCEL => Action::Cancel,
@@ -216,6 +217,11 @@ impl Mask {
     pub fn insert(&mut self, action: Action) {
         let i = usize::from(action.index());
         self.words[i / 64] |= 1 << (i % 64);
+    }
+
+    pub fn remove(&mut self, action: Action) {
+        let i = usize::from(action.index());
+        self.words[i / 64] &= !(1 << (i % 64));
     }
 
     pub fn len(&self) -> u32 {
@@ -319,6 +325,7 @@ impl State {
                 mask.insert(Action::Roll);
                 self.insert_playable_cards(&mut mask);
             }
+            Phase::Turn { rolled: true } if self.moves >= self.rules.turn_budget => mask.insert(Action::EndTurn),
             Phase::Turn { rolled: true } => {
                 if self.can_pay(player, SETTLEMENT_COST) {
                     mask.insert_bits(SETTLEMENT, self.settlement_spots(player).bits().into());
@@ -330,14 +337,12 @@ impl State {
                     mask.insert_bits(ROAD, self.road_spots(player).bits());
                 }
                 for give in Resource::ALL {
-                    for rate in 2..=4 {
-                        if self.hands[p][give.index()] < rate || !self.has_rate(player, give, rate) {
-                            continue;
-                        }
-                        for get in Resource::ALL {
-                            if get != give && self.bank(get) > 0 {
-                                mask.insert(Action::Trade { give, get, rate });
-                            }
+                    if self.hands[p][give.index()] < self.rate(player, give) {
+                        continue;
+                    }
+                    for get in Resource::ALL {
+                        if get != give && self.bank(get) > 0 {
+                            mask.insert(Action::Trade { give, get });
                         }
                     }
                 }
@@ -345,18 +350,35 @@ impl State {
                     mask.insert(Action::BuyCard);
                 }
                 self.insert_playable_cards(&mut mask);
-                if self.offers < MAX_OFFERS {
-                    self.insert_deals(&mut mask, player, self.others(player), None);
+                if self.rules.trading && self.proposed < MAX_PROPOSED as u8 {
+                    mask.insert(Action::Offer);
                 }
                 mask.insert(Action::EndTurn);
             }
-            Phase::Respond { deal, responder, .. } => {
-                let offered = Deal::from_id(deal);
-                if self.can_pay(responder, offered.get) {
+            Phase::Draft { .. } if self.moves >= self.rules.turn_budget => mask.insert(Action::Abandon),
+            Phase::Draft { deal } => {
+                self.insert_draft(&mut mask, player, deal);
+                if deal.gives() + deal.asks() > 0 && !self.was_proposed(deal) {
+                    mask.insert(Action::Send);
+                }
+            }
+            Phase::Respond { responder, draft: Some(draft), clicks, deal, .. } => {
+                if clicks < self.rules.turn_budget {
+                    self.insert_draft(&mut mask, responder, draft);
+                    if draft.complete() && draft != deal.reversed() {
+                        mask.insert(Action::Send);
+                    }
+                }
+                mask.insert(Action::Abandon);
+            }
+            Phase::Respond { deal, responder, draft: None, closed, .. } => {
+                if deal.complete() && self.can_pay(responder, deal.get) {
                     mask.insert(Action::Accept);
                 }
                 mask.insert(Action::Decline);
-                self.insert_deals(&mut mask, responder, std::iter::once(player), Some(offered));
+                if !closed && self.hand_size(responder) > 0 {
+                    mask.insert(Action::Counter);
+                }
             }
             Phase::Confirm { accepted, counters, .. } => {
                 for offset in 1..self.players() {
@@ -364,14 +386,11 @@ impl State {
                     if accepted >> partner.index() & 1 == 1 {
                         mask.insert(Action::TradeWith(offset as u8));
                     }
-                    if counters[partner.index()].is_some_and(|c| self.can_pay(player, Deal::from_id(c).get)) {
+                    if counters[partner.index()].is_some_and(|c| self.can_pay(player, c.get)) {
                         mask.insert(Action::TakeCounter(offset as u8));
                     }
                 }
-                // once someone accepts, the offer is binding: trade with an accepter (or take a counter)
-                if accepted == 0 {
-                    mask.insert(Action::Cancel);
-                }
+                mask.insert(Action::Cancel);
             }
             Phase::Discard { player, owed, from } => {
                 let hand = &self.hands[player.index()];
@@ -383,8 +402,12 @@ impl State {
                 }
             }
             Phase::MoveRobber { .. } => {
-                for hex in Hex::all().filter(|&h| h != self.robber) {
-                    mask.insert(Action::Robber(hex));
+                let allowed = |h: Hex| h != self.robber && !self.others(player).any(|o| self.protected(o) && self.touches(o, h));
+                let friendly: Vec<Hex> = Hex::all().filter(|&h| allowed(h)).collect();
+                if friendly.is_empty() {
+                    Hex::all().filter(|&h| h != self.robber).for_each(|h| mask.insert(Action::Robber(h)));
+                } else {
+                    friendly.into_iter().for_each(|h| mask.insert(Action::Robber(h)));
                 }
             }
             Phase::ChooseVictim { .. } => {
@@ -420,7 +443,7 @@ impl State {
         let mut weights = [0; 11];
         let count = match self.phase {
             Phase::Dice => {
-                weights = DICE;
+                weights = if self.rules.balanced_dice { self.dice } else { DICE };
                 11
             }
             Phase::Steal { victim, .. } => {
@@ -463,6 +486,12 @@ impl State {
 
     fn happen(&mut self, outcome: Outcome) {
         let player = self.current;
+        if let (true, Outcome::Dice(sum)) = (self.rules.balanced_dice, outcome) {
+            self.dice[usize::from(sum - 2)] -= 1;
+            if self.dice.iter().sum::<u8>() < RESHUFFLE_BELOW {
+                self.dice = DICE;
+            }
+        }
         match (self.phase, outcome) {
             (Phase::Dice, Outcome::Dice(7)) => self.start_discards(),
             (Phase::Dice, Outcome::Dice(sum)) => {
@@ -514,6 +543,9 @@ impl State {
     fn transition(&mut self, action: Action) {
         let player = self.current;
         let p = player.index();
+        if matches!(self.phase, Phase::Turn { rolled: true } | Phase::Draft { .. } | Phase::Confirm { .. }) {
+            self.moves = (self.moves + 1).min(self.rules.turn_budget);
+        }
         match (self.phase, action) {
             (Phase::PlaceSettlement, Action::Settlement(vertex)) => {
                 self.place_settlement(vertex);
@@ -554,34 +586,59 @@ impl State {
                 self.place_road(edge);
                 self.finish_if_won();
             }
-            (Phase::Turn { rolled: true }, Action::Trade { give, get, rate }) => {
-                self.spend(player, give.index(), rate);
+            (Phase::Turn { rolled: true }, Action::Trade { give, get }) => {
+                self.spend(player, give.index(), self.rate(player, give));
                 self.gain(player, get.index(), 1);
             }
             (Phase::Turn { rolled: true }, Action::BuyCard) => {
                 self.pay(player, CARD_COST);
                 self.phase = Phase::Draw;
             }
-            (Phase::Turn { rolled: true }, Action::Deal(deal)) => {
-                self.offers += 1;
-                self.reveal(player, Deal::from_id(deal).give);
-                self.phase = Phase::Respond { deal, responder: self.next(player), accepted: 0, counters: [None; MAX_PLAYERS] };
+            (Phase::Turn { rolled: true }, Action::Offer) => self.phase = Phase::Draft { deal: Deal::EMPTY },
+            (Phase::Draft { mut deal }, Action::Give(r) | Action::Ask(r)) => {
+                add_card(&mut deal, action, r);
+                self.phase = Phase::Draft { deal };
             }
-            (Phase::Respond { deal, responder, mut accepted, mut counters }, Action::Accept | Action::Decline | Action::Deal(_)) => {
-                match action {
-                    Action::Accept => {
+            (Phase::Draft { .. }, Action::Abandon) => self.phase = Phase::Turn { rolled: true },
+            (Phase::Draft { deal }, Action::Send) => {
+                self.proposals[usize::from(self.proposed)] = deal;
+                self.proposed += 1;
+                self.reveal(player, deal.give);
+                self.phase = Phase::Respond {
+                    deal,
+                    responder: self.next(player),
+                    accepted: 0,
+                    counters: [None; MAX_PLAYERS],
+                    draft: None,
+                    closed: false,
+                    clicks: 0,
+                };
+            }
+            (Phase::Respond { deal, responder, accepted, counters, draft: None, clicks, .. }, Action::Counter) => {
+                self.phase = Phase::Respond { deal, responder, accepted, counters, draft: Some(Deal::EMPTY), closed: false, clicks: clicks + 1 };
+            }
+            (Phase::Respond { deal, responder, accepted, counters, draft: Some(mut draft), clicks, .. }, Action::Give(r) | Action::Ask(r)) => {
+                add_card(&mut draft, action, r);
+                self.phase = Phase::Respond { deal, responder, accepted, counters, draft: Some(draft), closed: false, clicks: clicks + 1 };
+            }
+            (Phase::Respond { deal, responder, accepted, counters, draft: Some(_), clicks, .. }, Action::Abandon) => {
+                self.phase = Phase::Respond { deal, responder, accepted, counters, draft: None, closed: true, clicks };
+            }
+            (Phase::Respond { deal, responder, mut accepted, mut counters, draft, .. }, Action::Accept | Action::Decline | Action::Send) => {
+                match (action, draft) {
+                    (Action::Accept, _) => {
                         accepted |= 1 << responder.index();
-                        self.reveal(responder, Deal::from_id(deal).get);
+                        self.reveal(responder, deal.get);
                     }
-                    Action::Deal(counter) => {
+                    (Action::Send, Some(counter)) => {
                         counters[responder.index()] = Some(counter);
-                        self.reveal(responder, Deal::from_id(counter).give);
+                        self.reveal(responder, counter.give);
                     }
                     _ => {}
                 }
                 let next = self.next(responder);
                 self.phase = if next != player {
-                    Phase::Respond { deal, responder: next, accepted, counters }
+                    Phase::Respond { deal, responder: next, accepted, counters, draft: None, closed: false, clicks: 0 }
                 } else if accepted != 0 || counters.iter().any(Option::is_some) {
                     Phase::Confirm { deal, accepted, counters }
                 } else {
@@ -592,12 +649,12 @@ impl State {
             (Phase::Confirm { deal, accepted, counters }, Action::TradeWith(_) | Action::TakeCounter(_) | Action::Cancel) => {
                 match action {
                     Action::TradeWith(offset) => {
-                        self.exchange(player, player.after(usize::from(offset), self.players()), Deal::from_id(deal));
+                        self.exchange(player, player.after(usize::from(offset), self.players()), deal);
                     }
                     Action::TakeCounter(offset) => {
                         let partner = player.after(usize::from(offset), self.players());
                         let counter = counters[partner.index()].expect("a counter-offer to take");
-                        self.exchange(partner, player, Deal::from_id(counter));
+                        self.exchange(partner, player, counter);
                     }
                     _ => {}
                 }
@@ -609,7 +666,9 @@ impl State {
                 self.current = self.next(player);
                 self.bought = [0; 5];
                 self.card_played = false;
-                self.offers = 0;
+                self.proposed = 0;
+                self.proposals = [Deal::EMPTY; MAX_PROPOSED];
+                self.moves = 0;
                 self.last_offer = None;
                 self.phase = Phase::Turn { rolled: false };
                 self.finish_if_won();
@@ -708,28 +767,41 @@ impl State {
         }
     }
 
-    /// Every deal `asker` holds the cards for, asking only for what one of `holders` might hold as far as `asker` can tell.
-    /// When `answering` an offer, a counter must give some of what was asked for, and must not simply accept it.
-    fn insert_deals(&self, mask: &mut Mask, asker: Player, holders: impl Iterator<Item = Player>, answering: Option<Deal>) {
-        let a = asker.index();
-        let out_there: [u8; 5] =
-            std::array::from_fn(|r| RESOURCE_CARDS - self.bank(Resource::ALL[r]) - self.hands[a][r] - self.set_aside[a][r]);
-        let unplaced: [u8; 5] =
-            std::array::from_fn(|r| out_there[r].saturating_sub(self.others(asker).map(|g| self.known[a][g.index()][r]).sum()));
-        let ceilings: Vec<([u8; 5], u8)> = holders
-            .map(|h| {
-                let (known, size) = (self.known[a][h.index()], self.hand_size(h));
-                let unsure = size.saturating_sub(known.iter().sum());
-                (std::array::from_fn(|r| known[r] + unsure.min(unplaced[r])), size)
-            })
-            .collect();
-        for (id, &deal) in Deal::all().iter().enumerate() {
-            let asked = deal.get.iter().sum::<u8>();
-            let possible = ceilings.iter().any(|(c, size)| asked <= *size && (0..5).all(|r| deal.get[r] <= c[r]));
-            if possible && answering.is_none_or(|offer| responsive(deal, offer)) && self.can_pay(asker, deal.give) {
-                mask.insert(Action::Deal(id as u8));
+    fn insert_draft(&self, mask: &mut Mask, drafter: Player, draft: Deal) {
+        let hand = self.hands[drafter.index()];
+        for resource in Resource::ALL {
+            let r = resource.index();
+            if draft.get[r] == 0 && hand[r] > draft.give[r] {
+                mask.insert(Action::Give(resource));
+            }
+            if draft.give[r] == 0 && draft.get[r] < RESOURCE_CARDS - hand[r] {
+                mask.insert(Action::Ask(resource));
             }
         }
+        mask.insert(Action::Abandon);
+    }
+
+    pub(super) fn was_proposed(&self, deal: Deal) -> bool {
+        self.proposals[..usize::from(self.proposed)].contains(&deal)
+    }
+
+    pub fn rate(&self, player: Player, give: Resource) -> u8 {
+        let on = |harbor: Harbor| !(self.buildings(player) & self.board.harbor_vertices(harbor)).is_empty();
+        if on(Harbor::Special(give)) {
+            2
+        } else if on(Harbor::Generic) {
+            3
+        } else {
+            4
+        }
+    }
+
+    pub fn protected(&self, player: Player) -> bool {
+        self.rules.friendly_robber && player != self.current && self.public_victory_points(player) <= 2
+    }
+
+    fn touches(&self, player: Player, hex: Hex) -> bool {
+        !(self.buildings(player) & topology().corner_set(hex)).is_empty()
     }
 
     fn spend(&mut self, player: Player, r: usize, count: u8) {
@@ -770,7 +842,7 @@ impl State {
     fn next_discarder(&self, after: Player) -> Option<Player> {
         let mut candidate = self.next(after);
         while candidate != self.current {
-            if self.hand_size(candidate) > 7 {
+            if self.hand_size(candidate) > self.rules.discard_limit {
                 return Some(candidate);
             }
             candidate = self.next(candidate);
@@ -779,9 +851,7 @@ impl State {
     }
 
     pub(super) fn can_rob(&self, victim: Player) -> bool {
-        victim != self.current
-            && self.hand_size(victim) > 0
-            && !(self.buildings(victim) & topology().corner_set(self.robber)).is_empty()
+        victim != self.current && self.hand_size(victim) > 0 && self.touches(victim, self.robber) && !self.protected(victim)
     }
 
     fn place_settlement(&mut self, vertex: Vertex) {
@@ -840,15 +910,6 @@ impl State {
                 mask.insert(action);
             }
         }
-    }
-
-    fn has_rate(&self, player: Player, give: Resource, rate: u8) -> bool {
-        let harbor = match rate {
-            4 => return true,
-            3 => Harbor::Generic,
-            _ => Harbor::Special(give),
-        };
-        !(self.buildings(player) & self.board.harbor_vertices(harbor)).is_empty()
     }
 
     fn all_roads(&self) -> Set<EdgeKind> {
@@ -920,7 +981,7 @@ impl State {
 
     fn start_discards(&mut self) {
         let n = self.players();
-        let first = (0..n).map(|offset| self.current.after(offset, n)).find(|&p| self.hand_size(p) > 7);
+        let first = (0..n).map(|offset| self.current.after(offset, n)).find(|&p| self.hand_size(p) > self.rules.discard_limit);
         self.phase = match first {
             Some(player) => Phase::Discard { player, owed: self.hand_size(player) / 2, from: Resource::Brick },
             None => Phase::MoveRobber { rolled: true },
@@ -944,14 +1005,17 @@ impl State {
     }
 
     fn finish_if_won(&mut self) {
-        if self.victory_points(self.current) >= WINNING_POINTS {
+        if self.victory_points(self.current) >= self.rules.points {
             self.phase = Phase::Over { winner: self.current };
         }
     }
 }
 
-pub(super) fn responsive(counter: Deal, offer: Deal) -> bool {
-    counter != offer.reversed() && (0..5).any(|r| counter.give[r] > 0 && offer.get[r] > 0)
+fn add_card(draft: &mut Deal, action: Action, resource: Resource) {
+    match action {
+        Action::Give(_) => draft.give[resource.index()] += 1,
+        _ => draft.get[resource.index()] += 1,
+    }
 }
 
 pub(super) fn award(holder: Option<Player>, counts: &[u8], least: u8) -> Option<Player> {

@@ -3,7 +3,7 @@ use crate::resource::Resource;
 use crate::rng::Rng;
 
 use super::validate::Violation;
-use super::{Phase, State};
+use super::{Deal, Phase, State};
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Hidden {
@@ -81,12 +81,20 @@ impl State {
             world.hands[o] = hidden.hands[o];
             world.set_aside[o] = hidden.set_aside[o];
         }
-        if let Phase::Discard { player, owed, .. } = self.phase {
-            if player != observer {
+        match self.phase {
+            Phase::Discard { player, owed, .. } if player != observer => {
                 let aside = world.set_aside[player.index()];
                 let highest = (0..5).rev().find(|&r| aside[r] > 0).unwrap_or(0);
                 world.phase = Phase::Discard { player, owed, from: Resource::ALL[highest] };
             }
+            Phase::Draft { deal } if self.current != observer => {
+                world.phase = Phase::Draft { deal: trimmed(deal, world.hands[self.current.index()]) };
+            }
+            Phase::Respond { deal, responder, accepted, counters, draft: Some(draft), closed, clicks } if responder != observer => {
+                let draft = Some(trimmed(draft, world.hands[responder.index()]));
+                world.phase = Phase::Respond { deal, responder, accepted, counters, draft, closed, clicks };
+            }
+            _ => {}
         }
         world.validate()?;
         Ok(world)
@@ -183,6 +191,13 @@ impl State {
 
     pub(super) fn discards_hidden_from(&self, observer: Player, player: Player) -> bool {
         matches!(self.phase, Phase::Discard { .. }) && player != observer
+    }
+}
+
+fn trimmed(draft: Deal, hand: [u8; 5]) -> Deal {
+    Deal {
+        give: std::array::from_fn(|r| draft.give[r].min(hand[r])),
+        get: std::array::from_fn(|r| draft.get[r].min(crate::resource::RESOURCE_CARDS - hand[r])),
     }
 }
 

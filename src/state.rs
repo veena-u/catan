@@ -3,8 +3,32 @@ mod rules;
 mod validate;
 
 pub use info::Hidden;
-pub use rules::{longest_road, Action, Chances, Deal, Invalid, Mask, Outcome, ACTIONS, DEALS, MASK_WORDS, MAX_OFFERS, WINNING_POINTS};
+pub use rules::{longest_road, Action, Chances, Deal, Invalid, Mask, Outcome, ACTIONS, DICE, MASK_WORDS, MAX_PROPOSED, RESHUFFLE_BELOW};
 pub use validate::Violation;
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct Rules {
+    pub points: u8,
+    pub discard_limit: u8,
+    pub friendly_robber: bool,
+    pub balanced_dice: bool,
+    pub trading: bool,
+    pub turn_budget: u8,
+}
+
+impl Rules {
+    pub const STANDARD: Rules =
+        Rules { points: 10, discard_limit: 7, friendly_robber: false, balanced_dice: false, trading: true, turn_budget: 40 };
+    pub const COLONIST_1V1: Rules =
+        Rules { points: 15, discard_limit: 9, friendly_robber: true, balanced_dice: true, trading: true, turn_budget: 40 };
+
+    pub fn check(&self) -> Result<(), Violation> {
+        let fine = (3..=20).contains(&self.points)
+            && self.discard_limit >= 2
+            && (4..=3 * MAX_PROPOSED as u8).contains(&self.turn_budget);
+        if fine { Ok(()) } else { Err(Violation(format!("unplayable rules {self:?}"))) }
+    }
+}
 
 use crate::board::Board;
 use crate::dev_card::{DevCard, DEV_CARDS};
@@ -21,71 +45,77 @@ pub enum Actor {
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Phase {
-    PlaceSettlement, // waiting for a setup settlement to be placed
-    PlaceRoad { // waiting for a setup road to be placed
-        settlement: Vertex, // the road must touch this settlement
+    PlaceSettlement,
+    PlaceRoad {
+        settlement: Vertex,
     },
-    Turn { // waiting for the current player's next move
-        rolled: bool, // dice roll yet?
+    Turn {
+        rolled: bool,
     },
-    Dice, // waiting for dice to be rolled
-    Discard { // waiting for a player over 7 cards to discard one
-        player: Player, // who is discarding
-        owed: u8, // how many cards left to discard
-        from: Resource, // lowest card allowed
+    Dice,
+    Discard {
+        player: Player,
+        owed: u8,
+        from: Resource,
     },
-    MoveRobber { // waiting for player to move robber
-        rolled: bool, // dice roll yet?
+    MoveRobber {
+        rolled: bool,
     },
-    ChooseVictim { // waiting for the robber's mover to pick whom to rob
-        rolled: bool, // dice roll yet?
+    ChooseVictim {
+        rolled: bool,
     },
-    Steal { // waiting for chance to pick a stolen card
-        rolled: bool, // dice roll yet?
-        victim: Player, // whose hand the card comes from
+    Steal {
+        rolled: bool,
+        victim: Player,
     },
-    Draw, // waiting for player to draw a dev card
-    RoadBuilding { // waiting for player to place two roads (dev card)
-        rolled: bool, // dice roll yet?
-        roads: u8, // how many roads left to place
+    Draw,
+    RoadBuilding {
+        rolled: bool,
+        roads: u8,
     },
-    YearOfPlenty { // waiting for player to pick two resources (dev card)
-        rolled: bool, // dice roll yet?
-        picks: u8, // how many resources left to pick
+    YearOfPlenty {
+        rolled: bool,
+        picks: u8,
     },
-    Monopoly { // waiting for player to pick a resource (dev card)
-        rolled: bool, // dice roll yet?
+    Monopoly {
+        rolled: bool,
     },
-    Over { // end of game
+    Over {
         winner: Player,
     },
-    Respond { // each other player in turn accepts, declines, or counters the current player's deal
-        deal: u8, // which deal, as the current player gives and gets
-        responder: Player, // who answers now
-        accepted: u8, // bit p set: player p accepted
-        counters: [Option<u8>; MAX_PLAYERS], // the deal player p proposed instead, as p gives and gets
+    Draft {
+        deal: Deal,
     },
-    Confirm { // the current player trades with one who accepted, takes a counter-offer, or cancels
-        deal: u8,
+    Respond {
+        deal: Deal,
+        responder: Player,
         accepted: u8,
-        counters: [Option<u8>; MAX_PLAYERS],
+        counters: [Option<Deal>; MAX_PLAYERS],
+        draft: Option<Deal>,
+        closed: bool,
+        clicks: u8,
+    },
+    Confirm {
+        deal: Deal,
+        accepted: u8,
+        counters: [Option<Deal>; MAX_PLAYERS],
     },
 }
 
-/// How the current player's latest offer this turn ended. Offers are public, so everyone remembers this.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct LastOffer {
-    pub deal: u8, // which deal, as the current player gives and gets
-    pub accepted: u8, // bit p set: player p accepted
-    pub countered: u8, // bit p set: player p countered
-    pub traded: bool, // whether a trade came of it
+    pub deal: Deal,
+    pub accepted: u8,
+    pub countered: u8,
+    pub traded: bool,
 }
 
 type PerPlayer<T> = [T; MAX_PLAYERS];
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct State { // most fields are indexed by player; seats past `players` stay empty
+pub struct State {
     board: Board,
+    rules: Rules,
     players: u8,
     settlements: PerPlayer<Set<VertexKind>>,
     cities: PerPlayer<Set<VertexKind>>,
@@ -93,14 +123,17 @@ pub struct State { // most fields are indexed by player; seats past `players` st
     road_lengths: PerPlayer<u8>,
     robber: Hex,
     hands: PerPlayer<[u8; 5]>,
-    known: PerPlayer<PerPlayer<[u8; 5]>>, // known[o][p]: the fewest of each resource o is sure p holds
+    known: PerPlayer<PerPlayer<[u8; 5]>>,
     set_aside: PerPlayer<[u8; 5]>,
     dev_cards: PerPlayer<[u8; 5]>,
     deck: [u8; 5],
     bought: [u8; 5],
     card_played: bool,
-    offers: u8, // trade offers made this turn
-    last_offer: Option<LastOffer>, // how the latest of them ended
+    dice: [u8; 11],
+    moves: u8,
+    proposed: u8,
+    proposals: [Deal; MAX_PROPOSED],
+    last_offer: Option<LastOffer>,
     knights: PerPlayer<u8>,
     longest_road: Option<Player>,
     largest_army: Option<Player>,
@@ -110,10 +143,16 @@ pub struct State { // most fields are indexed by player; seats past `players` st
 
 impl State {
     pub fn new(board: Board, players: usize) -> State {
+        State::with_rules(board, players, Rules::STANDARD)
+    }
+
+    pub fn with_rules(board: Board, players: usize, rules: Rules) -> State {
         assert!((2..=MAX_PLAYERS).contains(&players), "2 to {MAX_PLAYERS} players");
+        rules.check().expect("playable rules");
         State {
             robber: board.desert(),
             board,
+            rules,
             players: players as u8,
             settlements: [Set::EMPTY; MAX_PLAYERS],
             cities: [Set::EMPTY; MAX_PLAYERS],
@@ -126,7 +165,10 @@ impl State {
             deck: DEV_CARDS,
             bought: [0; 5],
             card_played: false,
-            offers: 0,
+            dice: DICE,
+            moves: 0,
+            proposed: 0,
+            proposals: [Deal::EMPTY; MAX_PROPOSED],
             last_offer: None,
             knights: [0; MAX_PLAYERS],
             longest_road: None,
@@ -241,7 +283,19 @@ impl State {
     }
 
     pub fn offers(&self) -> u8 {
-        self.offers
+        self.proposed
+    }
+
+    pub fn rules(&self) -> Rules {
+        self.rules
+    }
+
+    pub fn dice_weights(&self) -> [u8; 11] {
+        if self.rules.balanced_dice { self.dice } else { DICE }
+    }
+
+    pub fn moves(&self) -> u8 {
+        self.moves
     }
 
     pub fn knights(&self, player: Player) -> u8 {

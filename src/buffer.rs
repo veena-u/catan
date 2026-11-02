@@ -7,7 +7,7 @@ use crate::board::Board;
 use crate::observation::{observe, OBSERVATION_BYTES};
 use crate::player::Player;
 use crate::rng::Rng;
-use crate::state::{Action, Actor, Mask, Outcome, Phase, State, Violation, MASK_WORDS};
+use crate::state::{Action, Actor, Mask, Outcome, Phase, Rules, State, Violation, MASK_WORDS};
 
 pub const CHECKPOINT_EVERY: u64 = 16;
 pub const PAD: u16 = u16::MAX;
@@ -15,12 +15,13 @@ const _: () = assert!(PAD as usize >= crate::state::ACTIONS);
 
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
-    pub games: usize, // how many games to run in parallel
-    pub history: usize, // how many recent steps each game remembers
-    pub max_decisions: u32, // max decisions before a game is truncated
+    pub games: usize,
+    pub history: usize,
+    pub max_decisions: u32,
     pub seed: u64,
-    pub players: usize, // players per game, 2 to 4
-    pub paired: bool, // each run of `players` games shares boards and dice rolls, game by game
+    pub players: usize,
+    pub paired: bool,
+    pub rules: Rules,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -36,7 +37,7 @@ pub struct Ending {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct IllegalAction { // move is not legal
+pub struct IllegalAction {
     pub game: usize,
     pub action: u16,
 }
@@ -50,7 +51,7 @@ impl fmt::Display for IllegalAction {
 impl std::error::Error for IllegalAction {}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Unavailable { // past position cannot be built
+pub struct Unavailable {
     pub game: usize,
     pub time: u64,
 }
@@ -71,6 +72,7 @@ pub struct Buffer {
 
 struct Game {
     state: State,
+    rules: Rules,
     mask: Mask,
     rng: Rng,
     dice_rng: Rng,
@@ -99,7 +101,8 @@ impl Buffer {
                 let rng = seeds.fork();
                 let deal = config.paired.then(|| mix(config.seed, (slot / config.players) as u64));
                 let mut game = Game {
-                    state: State::new(Board::random(&mut Rng::new(0)), config.players),
+                    state: State::with_rules(Board::random(&mut Rng::new(0)), config.players, config.rules),
+                    rules: config.rules,
                     mask: Mask::EMPTY,
                     rng,
                     dice_rng: Rng::new(0),
@@ -290,7 +293,7 @@ impl Game {
             }
         };
         self.round += 1;
-        State::new(board, players)
+        State::with_rules(board, players, self.rules)
     }
 
     fn settle(&mut self, track_dice: bool) {

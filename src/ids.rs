@@ -1,4 +1,3 @@
-// primitive for hexes, vertices, and edges (which are all represented as bitsets)
 use std::fmt;
 use std::hash::Hash;
 use std::marker::PhantomData;
@@ -15,7 +14,6 @@ pub trait Kind: Copy + Eq + Ord + Hash + fmt::Debug {
     const NAME: &'static str;
     type Bits: Bits;
 }
-
 
 pub trait Bits:
     Copy + Eq + Hash + fmt::Debug + BitAnd<Output = Self> + BitOr<Output = Self> + Not<Output = Self>

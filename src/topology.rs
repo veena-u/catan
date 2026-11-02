@@ -7,7 +7,6 @@ pub type Point = (i32, i32);
 
 const CORNER_OFFSETS: [Point; 6] = [(0, -2), (1, -1), (1, 1), (0, 2), (-1, 1), (-1, -1)];
 
-// cached relationships between hexes, vertices, and edges
 pub struct Topology {
     hex_points: [Point; HEXES],
     vertex_points: [Point; VERTICES],

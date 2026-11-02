@@ -3,10 +3,10 @@ use catan::buffer::{self, CHECKPOINT_EVERY, Config, Ending, Finish};
 use catan::dev_card::DevCard;
 use catan::ids::{Edge, Hex, Vertex};
 use catan::symmetry::{Symmetry, SYMMETRIES};
-use catan::observation::{OBSERVATION_BYTES, observe};
+use catan::observation::{OBSERVATION_BYTES, PHASE_AT, TRADE_AT, observe};
 use catan::player::{Player, MAX_PLAYERS};
 use catan::rng::Rng;
-use catan::state::{ACTIONS, Action, Actor, DEALS, Deal, MASK_WORDS, State};
+use catan::state::{ACTIONS, Action, Actor, MASK_WORDS, Rules, State};
 use catan::topology::topology as board_topology;
 use catan::worlds;
 use numpy::{AllowTypeChange, PyArray1, PyArray2, PyArrayLike1, PyArrayMethods};
@@ -33,8 +33,8 @@ struct Buffer {
 #[pymethods]
 impl Buffer {
     #[new]
-    #[pyo3(signature = (games, history = 1024, max_decisions = 1000, seed = 0, players = 4, paired = false))]
-    fn new(games: usize, history: usize, max_decisions: u32, seed: u64, players: usize, paired: bool) -> PyResult<Self> {
+    #[pyo3(signature = (games, history = 1024, max_decisions = 1000, seed = 0, players = 4, paired = false, rules = None))]
+    fn new(games: usize, history: usize, max_decisions: u32, seed: u64, players: usize, paired: bool, rules: Option<&GameRules>) -> PyResult<Self> {
         if games == 0 || max_decisions == 0 || history == 0 || history as u64 % CHECKPOINT_EVERY != 0 {
             return Err(PyValueError::new_err(format!(
                 "games and max_decisions must be positive, and history a positive multiple of {CHECKPOINT_EVERY}"
@@ -43,7 +43,8 @@ impl Buffer {
         if !(2..=MAX_PLAYERS).contains(&players) {
             return Err(PyValueError::new_err(format!("2 to {MAX_PLAYERS} players")));
         }
-        let inner = buffer::Buffer::new(Config { games, history, max_decisions, seed, players, paired });
+        let rules = rules.map_or(Rules::STANDARD, |r| r.inner);
+        let inner = buffer::Buffer::new(Config { games, history, max_decisions, seed, players, paired, rules });
         Ok(Buffer { inner, endings: vec![None; games] })
     }
 
@@ -83,7 +84,6 @@ impl Buffer {
         Ok(Worlds { inner: worlds })
     }
 
-    /// Each game's victory points by seat, hidden cards included (n, MAX_PLAYERS); seats past the player count are 0.
     fn points<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<u8>> {
         let rows: Vec<Vec<u8>> = (0..self.inner.len())
             .map(|game| {
@@ -270,18 +270,19 @@ struct Game {
     state: State,
     rng: Rng,
     codes: Vec<u16>,
+    history: Vec<(i8, u8, u16)>,
 }
 
 #[pymethods]
 impl Game {
     #[new]
-    #[pyo3(signature = (seed = 0, players = 4))]
-    fn new(seed: u64, players: usize) -> PyResult<Self> {
+    #[pyo3(signature = (seed = 0, players = 4, rules = None))]
+    fn new(seed: u64, players: usize, rules: Option<&GameRules>) -> PyResult<Self> {
         if !(2..=MAX_PLAYERS).contains(&players) {
             return Err(PyValueError::new_err(format!("2 to {MAX_PLAYERS} players")));
         }
-        let state = State::new(Board::random(&mut Rng::new(seed)), players);
-        Ok(Game { seed, state, rng: Rng::new(seed ^ 0x9E37_79B9_7F4A_7C15), codes: Vec::new() })
+        let state = State::with_rules(Board::random(&mut Rng::new(seed)), players, rules.map_or(Rules::STANDARD, |r| r.inner));
+        Ok(Game { seed, state, rng: Rng::new(seed ^ 0x9E37_79B9_7F4A_7C15), codes: Vec::new(), history: Vec::new() })
     }
 
     fn players(&self) -> usize {
@@ -315,12 +316,35 @@ impl Game {
     }
 
     fn step(&mut self, code: u16) -> PyResult<()> {
+        let actor = match self.state.actor() {
+            Some(Actor::Player(p)) => p.index() as i8,
+            _ => -1,
+        };
+        let mut seen = [0; OBSERVATION_BYTES];
+        observe(&self.state, Player::First, &mut seen);
         self.state.step(code).map_err(|e| PyValueError::new_err(e.to_string()))?;
         self.codes.push(code);
+        self.history.push((actor, seen[PHASE_AT], code));
         Ok(())
     }
 
-    /// `samples` futures as the player to act could imagine them: hidden cards re-dealt from their view.
+    fn history(&self) -> Vec<(i8, u8, u16)> {
+        self.history.clone()
+    }
+
+    fn observe_as<'py>(&self, py: Python<'py>, player: usize) -> PyResult<Bound<'py, PyArray1<u8>>> {
+        if player >= self.state.players() {
+            return Err(PyValueError::new_err(format!("there is no seat {player}")));
+        }
+        let mut bytes = [0; OBSERVATION_BYTES];
+        observe(&self.state, Player::new(player), &mut bytes);
+        Ok(PyArray1::from_slice(py, &bytes))
+    }
+
+    fn legal(&self) -> Vec<u16> {
+        self.state.legal_actions().iter().map(Action::index).collect()
+    }
+
     #[pyo3(signature = (samples, seed = 0))]
     fn imagine(&self, samples: usize, seed: u64) -> PyResult<Worlds> {
         let Some(Actor::Player(observer)) = self.state.actor() else {
@@ -389,6 +413,19 @@ fn symmetries<'py>(py: Python<'py>) -> (Bound<'py, PyArray2<u8>>, Bound<'py, PyA
 }
 
 #[pyfunction]
+fn geometry<'py>(py: Python<'py>) -> (Bound<'py, PyArray2<i32>>, Bound<'py, PyArray2<i32>>, Bound<'py, PyArray1<u8>>) {
+    let t = board_topology();
+    let hexes: Vec<Vec<i32>> = Hex::all().map(|h| { let (x, y) = t.hex_point(h); vec![x, y] }).collect();
+    let vertices: Vec<Vec<i32>> = Vertex::all().map(|v| { let (x, y) = t.vertex_point(v); vec![x, y] }).collect();
+    let coast = t.coast().iter().map(|e| e.index() as u8);
+    (
+        PyArray2::from_vec2(py, &hexes).expect("rows of 2"),
+        PyArray2::from_vec2(py, &vertices).expect("rows of 2"),
+        PyArray1::from_iter(py, coast),
+    )
+}
+
+#[pyfunction]
 fn topology<'py>(py: Python<'py>) -> (Bound<'py, PyArray2<u8>>, Bound<'py, PyArray2<u8>>) {
     let t = board_topology();
     let hex_corners: Vec<Vec<u8>> = Hex::all().map(|h| t.corners(h).map(|v| v.index() as u8).to_vec()).collect();
@@ -403,11 +440,60 @@ fn player_codes<'py>(py: Python<'py>, players: &[Player]) -> Bound<'py, PyArray1
     PyArray1::from_iter(py, players.iter().map(|p| p.index() as u8))
 }
 
-/// The trade menu: row i is what deal i gives (first five counts) and gets (last five), as its proposer sees it.
-#[pyfunction]
-fn deals(py: Python<'_>) -> Bound<'_, PyArray2<u8>> {
-    let rows: Vec<Vec<u8>> = Deal::all().iter().map(|d| [d.give, d.get].concat()).collect();
-    PyArray2::from_vec2(py, &rows).expect("rows of 10")
+#[pyclass(name = "Rules", module = "catan", frozen, skip_from_py_object)]
+#[derive(Clone, Copy)]
+struct GameRules {
+    inner: Rules,
+}
+
+#[pymethods]
+impl GameRules {
+    #[new]
+    #[pyo3(signature = (points = 10, discard_limit = 7, friendly_robber = false, balanced_dice = false, trading = true, turn_budget = 40))]
+    fn new(points: u8, discard_limit: u8, friendly_robber: bool, balanced_dice: bool, trading: bool, turn_budget: u8) -> PyResult<Self> {
+        let inner = Rules { points, discard_limit, friendly_robber, balanced_dice, trading, turn_budget };
+        inner.check().map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(GameRules { inner })
+    }
+
+    #[staticmethod]
+    fn colonist_1v1() -> Self {
+        GameRules { inner: Rules::COLONIST_1V1 }
+    }
+
+    fn __repr__(&self) -> String {
+        format!("{:?}", self.inner)
+    }
+
+    #[getter]
+    fn points(&self) -> u8 {
+        self.inner.points
+    }
+
+    #[getter]
+    fn discard_limit(&self) -> u8 {
+        self.inner.discard_limit
+    }
+
+    #[getter]
+    fn friendly_robber(&self) -> bool {
+        self.inner.friendly_robber
+    }
+
+    #[getter]
+    fn balanced_dice(&self) -> bool {
+        self.inner.balanced_dice
+    }
+
+    #[getter]
+    fn trading(&self) -> bool {
+        self.inner.trading
+    }
+
+    #[getter]
+    fn turn_budget(&self) -> u8 {
+        self.inner.turn_budget
+    }
 }
 
 #[pymodule]
@@ -416,11 +502,12 @@ fn catan_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Buffer>()?;
     m.add_class::<Game>()?;
     m.add_function(wrap_pyfunction!(topology, m)?)?;
+    m.add_function(wrap_pyfunction!(geometry, m)?)?;
     m.add_function(wrap_pyfunction!(symmetries, m)?)?;
     m.add("OBSERVATION_BYTES", OBSERVATION_BYTES)?;
     m.add("ACTIONS", ACTIONS)?;
-    m.add("DEALS", DEALS)?;
-    m.add_function(wrap_pyfunction!(deals, m)?)?;
+    m.add("TRADE_AT", TRADE_AT)?;
+    m.add_class::<GameRules>()?;
     m.add("MAX_PLAYERS", MAX_PLAYERS)?;
     Ok(())
 }

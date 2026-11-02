@@ -6,20 +6,18 @@ from pathlib import Path
 
 BARS = "▁▂▃▄▅▆▇█"
 LINE = re.compile(r"^iter\s+(\d+)\s+[\d.]+M decisions\s+(\d+)s")
-FIELDS = ("random", "bot", "previous", "anchor")
-
+FIELDS = ("random", "previous", "anchor")
 
 def spark(values, low, high, least=0.1):
     middle = (low + high) / 2
     low, high = min(low, middle - least / 2), max(high, middle + least / 2)
     return "".join(BARS[min(7, max(0, int((v - low) / (high - low) * 8)))] for v in values)
 
-
 def main():
     signal.signal(signal.SIGPIPE, signal.SIG_DFL)
     parser = argparse.ArgumentParser(description="Summarise a training log: speed, time left, and checkup curves.")
-    parser.add_argument("log", help="e.g. runs/four-scratch.out")
-    parser.add_argument("--total", type=int, default=12000, help="the run's last iteration")
+    parser.add_argument("log", help="e.g. runs/2p-baseline-s1.out")
+    parser.add_argument("--total", type=int, default=100000, help="the run's last iteration")
     parser.add_argument("--rows", type=int, default=8, help="how many recent checkups to list")
     parser.add_argument("--curve", type=int, default=60, help="how many checkups in each curve")
     args = parser.parse_args()
@@ -74,7 +72,6 @@ def main():
         values = [r[name] for r in evals if name in r][-args.curve:]
         print(f"{name:>8}  {spark(values, min(values), max(values))}  {min(values):.2f} to {max(values):.2f}, last {values[-1]:.3f}")
     print(f"(curves cover the last {min(args.curve, len(evals))} checkups; each spans at least 0.1, so noise stays flat)")
-
 
 if __name__ == "__main__":
     main()
