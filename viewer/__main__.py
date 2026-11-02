@@ -11,6 +11,7 @@ import numpy as np
 
 import catan
 from train.agents import Network, Random
+from train.evaluate import RULE_SETS, rules_of
 from train.features import (
     ANSWERS_AT, BUDGET_LEFT, LAST_AT, LAST_TRADED, OFFERS_MADE, PROTECTED_AT, RATES_AT, TRADE_AT,
 )
@@ -47,7 +48,7 @@ class Session:
     def __init__(self, args, agent):
         self.args, self.agent = args, agent
         self.lock = threading.Lock()
-        self.rules = catan.Rules.colonist_1v1() if args.rules == "colonist-1v1" else catan.Rules()
+        self.rules = rules_of(args)
         self.new(args.seed, args.seat)
 
     def new(self, seed=None, seat=None):
@@ -336,7 +337,7 @@ def main():
     parser = argparse.ArgumentParser(description="Play the network in the browser, on a Colonist-style board.")
     parser.add_argument("--checkpoint", help="a trained network to play against; without one, a random player")
     parser.add_argument("--players", type=int, default=2)
-    parser.add_argument("--rules", choices=["standard", "colonist-1v1"], default="colonist-1v1")
+    parser.add_argument("--rules", choices=list(RULE_SETS), default="colonist-1v1")
     parser.add_argument("--seat", type=int, help="your seat; random if not given")
     parser.add_argument("--seed", type=int)
     parser.add_argument("--temperature", type=float, default=0.8, help="how freely the network samples its moves")

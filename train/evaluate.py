@@ -47,8 +47,19 @@ def play(a, b, games=4096, parallel=512, seed=0, max_decisions=5000, players=4, 
         "players": players,
     }
 
+RULE_SETS = {
+    "standard": dict(points=10, discard_limit=7, friendly_robber=False, balanced_dice=False),
+    "colonist-1v1": dict(points=15, discard_limit=9, friendly_robber=True, balanced_dice=True),
+    "colonist-4p": dict(points=10, discard_limit=7, friendly_robber=True, balanced_dice=True),
+}
+TURN_BUDGET = 15
+
+def rules_named(name, trading=True, turn_budget=TURN_BUDGET):
+    return catan.Rules(**RULE_SETS[name], trading=trading, turn_budget=turn_budget)
+
 def rules_of(args):
-    return catan.Rules.colonist_1v1() if getattr(args, "rules", "standard") == "colonist-1v1" else catan.Rules()
+    return rules_named(getattr(args, "rules", "standard"), not getattr(args, "no_trading", False),
+                       getattr(args, "turn_budget", TURN_BUDGET))
 
 def report(name, result):
     print(

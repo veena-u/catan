@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 
 from .agents import Network, Random
-from .evaluate import play, rules_of
+from .evaluate import RULE_SETS, play, rules_of
 from .model import device, load
 
 def ratings(wins, prior=0.5):
@@ -24,7 +24,7 @@ def main():
     parser.add_argument("--checkpoints", type=int, default=6, help="how many per run directory, evenly spaced, including the last")
     parser.add_argument("--games", type=int, default=256, help="games per pairing")
     parser.add_argument("--players", type=int, default=2)
-    parser.add_argument("--rules", choices=["standard", "colonist-1v1"], default="colonist-1v1")
+    parser.add_argument("--rules", choices=list(RULE_SETS), default="colonist-1v1")
     parser.add_argument("--max-decisions", type=int, default=8000)
     args = parser.parse_args()
 

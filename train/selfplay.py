@@ -14,7 +14,7 @@ import catan
 
 from . import deals
 from .agents import Network, Random
-from .evaluate import play
+from .evaluate import RULE_SETS, TURN_BUDGET, play, rules_of
 from .features import ANSWERS_AT, BUDGET_LEFT, HEX_VERTEX, LAST_ACCEPTED, LAST_COUNTERED, OFFERS_MADE, SEATS, SYMMETRIES
 from .model import KIND_COUNT, KIND_MEMBERS, KIND_RUNS, KINDS, Model, device, load
 
@@ -486,10 +486,10 @@ def main():
     parser.add_argument("--entropy-floor", type=float, default=0.001)
     parser.add_argument("--target-entropy-share", type=float, default=1.0,
                         help="weight of the targets' entropy relative to the kinds'")
-    parser.add_argument("--rules", choices=["standard", "colonist-1v1"], default="standard",
-                        help="colonist-1v1: 15 points, a 9-card discard limit, the friendly robber and balanced dice")
+    parser.add_argument("--rules", choices=list(RULE_SETS), default="standard",
+                        help="colonist-1v1: 15 points, discard over 9; colonist-4p: 10 points, discard over 7; both with the friendly robber and balanced dice")
     parser.add_argument("--no-trading", action="store_true", help="no trades between players, only with the bank")
-    parser.add_argument("--turn-budget", type=int, default=40, help="decisions a turn may take after the roll: a turn timer")
+    parser.add_argument("--turn-budget", type=int, default=TURN_BUDGET, help="decisions a turn may take after the roll: a turn timer")
     parser.add_argument("--anneal-power", type=float, default=0.0,
                         help="shrink the learning rate and entropy bonus as (1 + iteration / anneal-steps) ** -power; 0 is off")
     parser.add_argument("--anneal-steps", type=float, default=20.0)
@@ -560,9 +560,7 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     (out / "args.json").write_text(json.dumps(vars(args), indent=2))
 
-    base = catan.Rules.colonist_1v1() if args.rules == "colonist-1v1" else catan.Rules()
-    rules = catan.Rules(base.points, base.discard_limit, base.friendly_robber, base.balanced_dice, not args.no_trading,
-                        args.turn_budget)
+    rules = rules_of(args)
     model = Model(args.width, args.depth).to(at)
     critics = Critics(args.width).to(at)
     optimizer = torch.optim.AdamW([*model.parameters(), *critics.parameters()], lr=args.lr)

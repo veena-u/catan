@@ -1,7 +1,7 @@
 import argparse
 
 from .agents import Network
-from .evaluate import play, rules_of, report
+from .evaluate import RULE_SETS, play, report, rules_of
 from .model import device, load
 
 def main():
@@ -10,7 +10,7 @@ def main():
     parser.add_argument("challengers", nargs="+", help="one or more .pt files")
     parser.add_argument("--games", type=int, default=2048)
     parser.add_argument("--players", type=int, default=2)
-    parser.add_argument("--rules", choices=["standard", "colonist-1v1"], default="colonist-1v1")
+    parser.add_argument("--rules", choices=list(RULE_SETS), default="colonist-1v1")
     parser.add_argument("--max-decisions", type=int, default=8000)
     args = parser.parse_args()
 

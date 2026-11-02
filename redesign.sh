@@ -4,7 +4,7 @@ if [ -f /venv/main/bin/activate ]; then source /venv/main/bin/activate; fi
 cd "$(dirname "$0")"
 
 if [ "${1:-}" = status ]; then
-  for out in runs/2p-*.out; do
+  for out in runs/[0-9]p-*.out; do
     [ -f "$out" ] || continue
     echo "== $(basename "$out" .out)"
     grep "(eval" "$out" | awk '{
@@ -25,6 +25,9 @@ fi
 ARMS="baseline, no-trading, one-pass, no-hands, no-answers, league, population or exploit"
 ARM=${1:?name a run: $ARMS}
 SEED=${SEED:?set SEED, e.g. SEED=1}
+PLAYERS=${PLAYERS:-2}
+if [ "$PLAYERS" = 2 ]; then RULES=${RULES:-colonist-1v1}; else RULES=${RULES:-colonist-4p}; fi
+PREFIX="${PLAYERS}p"
 case $ARM in
   baseline) EXTRA="" ;;
   no-trading) EXTRA="--no-trading --aux-answers 0" ;;
@@ -32,21 +35,21 @@ case $ARM in
   no-hands) EXTRA="--aux-hands 0" ;;
   no-answers) EXTRA="--aux-answers 0" ;;
   league) EXTRA="--league 0.2 --league-size 8 --league-every 250" ;;
-  population) EXTRA="--league 0.5 --league-size 8 --league-every 250 --league-watch runs/2p-pop --publish runs/2p-pop/s$SEED.pt" ;;
-  exploit) EXTRA="--exploit ${TARGET:?set TARGET to the network to exploit, e.g. TARGET=runs/2p-baseline-s1/latest.pt}" ;;
+  population) EXTRA="--league 0.5 --league-size 8 --league-every 250 --league-watch runs/$PREFIX-pop --publish runs/$PREFIX-pop/s$SEED.pt" ;;
+  exploit) EXTRA="--exploit ${TARGET:?set TARGET to the network to exploit, e.g. TARGET=runs/$PREFIX-baseline-s1/latest.pt}" ;;
   *) echo "the runs are $ARMS"; exit 1 ;;
 esac
-NAME="2p-$ARM-s$SEED"
+NAME="$PREFIX-$ARM-s$SEED"
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF-expandable_segments:True}
 python -m pip install --quiet ./python
-FLAGS="--players 2 --rules colonist-1v1 --games ${GAMES:-2048} --rounds 64 --minibatch ${MINIBATCH:-4096} \
+FLAGS="--players $PLAYERS --rules $RULES --games ${GAMES:-2048} --rounds 64 --minibatch ${MINIBATCH:-4096} \
   --width 128 --depth 4 --symmetry --vp-fade 2000 --opening-explore 0.1 --aux-hands 0.1 --aux-answers 0.1 \
   --entropy 0.01 --entropy-floor 0.001 --max-decisions 8000 --turn-budget 15 \
   --eval-every ${EVAL_EVERY:-200} --eval-games 512 --save-every 250 --checkpoint-every 50 \
   --anneal-power 0.5 --anneal-steps 200 --entropy-anneal-steps 20 --iterations ${ITERATIONS:-100000} --seed $SEED"
 if [ -n "${WANDB_PROJECT:-}" ]; then
   python -m pip install --quiet wandb
-  FLAGS="$FLAGS --wandb $WANDB_PROJECT --wandb-group ${WANDB_GROUP:-2p-v1}"
+  FLAGS="$FLAGS --wandb $WANDB_PROJECT --wandb-group ${WANDB_GROUP:-$PREFIX-v1}"
 fi
 mkdir -p runs
 echo "=== $NAME: $EXTRA ${MORE:-} ($(date))" >> "runs/$NAME.out"
