@@ -20,7 +20,7 @@ fn decisions(buffer: &mut Buffer, rounds: usize, rng: &mut Rng) -> Vec<Vec<(u64,
 #[test]
 fn recent_decisions_are_rebuilt_exactly_and_old_ones_refused() {
     let history = 256;
-    let mut buffer = Buffer::new(Config { games: 300, history, max_decisions: 5_000, seed: 7, players: 4, paired: false, rules: crate::state::Rules::STANDARD });
+    let mut buffer = Buffer::new(Config { games: 300, history, max_decisions: 5_000, seed: 7, players: 4, paired: false, rules: crate::state::Rules::STANDARD, random_starts: 0 });
     let seen = decisions(&mut buffer, 300, &mut Rng::new(1));
     let window = history as u64 - CHECKPOINT_EVERY;
     let (mut rebuilt, mut refused) = (0, 0);
@@ -49,7 +49,7 @@ fn recent_decisions_are_rebuilt_exactly_and_old_ones_refused() {
 #[test]
 fn paired_games_share_their_board_and_their_rolls_whatever_is_played() {
     let players = 4;
-    let mut buffer = Buffer::new(Config { games: 8, history: 64, max_decisions: 5_000, seed: 11, players, paired: true, rules: crate::state::Rules::STANDARD });
+    let mut buffer = Buffer::new(Config { games: 8, history: 64, max_decisions: 5_000, seed: 11, players, paired: true, rules: crate::state::Rules::STANDARD, random_starts: 0 });
     let boards: Vec<_> = (0..8).map(|g| *buffer.state(g).board()).collect();
     for g in 0..8 {
         assert_eq!(boards[g] == boards[0], g < players, "game {g}");

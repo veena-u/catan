@@ -83,8 +83,15 @@ class Session:
 
     def take(self, code, deal=None):
         actor, phase = self.game.to_act(), PHASES[self.game.observe_as(self.human)[PHASE_AT]]
+        self.countering = None
         self.track(actor, phase, code, deal, self.game.draft())
         self.game.step(code, deal)
+        if self.countering and self.trade:
+            seat, proposer = self.countering[0], self.trade["proposer"]
+            relative = (seat - proposer) % self.args.players
+            if self.game.observe_as(proposer)[ANSWERS_AT + 11 * (relative - 1)] == 4:
+                self.answer(seat, "countered", *self.countering[1:])
+        self.countering = None
         self.game.settle()
         self.narrate()
         self.settled()
@@ -106,7 +113,7 @@ class Session:
             elif code == DECLINE:
                 self.answer(actor, "declined")
             elif code == COUNTER and deal is not None:
-                self.answer(actor, "countered", *sides(deal))
+                self.countering = (actor, *sides(deal))
             elif code == SEND and drafted and drafted[0] == 2:
                 self.answer(actor, "countered", list(drafted[1]), list(drafted[2]))
         elif phase == "confirm" and self.trade:
@@ -130,7 +137,7 @@ class Session:
         entry["status"] = status
         if give is not None:
             entry["counter"] = {"give": give, "get": get}
-            self.say(seat, f"countered: gives {cards(give)} for {cards(get)}")
+            self.say(seat, f"declined, and offered {cards(give)} for {cards(get)} instead")
         else:
             self.say(seat, f"{status} the offer")
 

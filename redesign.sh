@@ -22,7 +22,7 @@ if [ "${1:-}" = status ]; then
   exit 0
 fi
 
-ARMS="baseline, no-trading, one-pass, no-hands, no-answers, league, population or exploit"
+ARMS="baseline, no-trading, one-pass, no-hands, no-answers, league, offer-search, upgo, random-starts, wide, no-vp, population or exploit"
 ARM=${1:?name a run: $ARMS}
 SEED=${SEED:?set SEED, e.g. SEED=1}
 PLAYERS=${PLAYERS:-2}
@@ -35,6 +35,11 @@ case $ARM in
   no-hands) EXTRA="--aux-hands 0" ;;
   no-answers) EXTRA="--aux-answers 0" ;;
   league) EXTRA="--league 0.2 --league-size 8 --league-every 250" ;;
+  offer-search) EXTRA="--offer-search 8 --offer-candidates 8" ;;
+  upgo) EXTRA="--upgo 1.0" ;;
+  random-starts) EXTRA="--random-starts 25" ;;
+  wide) EXTRA="--width 192" ;;
+  no-vp) EXTRA="--vp-reward 0" ;;
   population) EXTRA="--league 0.5 --league-size 8 --league-every 250 --league-watch runs/$PREFIX-pop --publish runs/$PREFIX-pop/s$SEED.pt" ;;
   exploit) EXTRA="--exploit ${TARGET:?set TARGET to the network to exploit, e.g. TARGET=runs/$PREFIX-baseline-s1/latest.pt}" ;;
   *) echo "the runs are $ARMS"; exit 1 ;;

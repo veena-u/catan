@@ -25,8 +25,8 @@ struct Buffer {
 #[pymethods]
 impl Buffer {
     #[new]
-    #[pyo3(signature = (games, history = 1024, max_decisions = 1000, seed = 0, players = 4, paired = false, rules = None))]
-    fn new(games: usize, history: usize, max_decisions: u32, seed: u64, players: usize, paired: bool, rules: Option<&GameRules>) -> PyResult<Self> {
+    #[pyo3(signature = (games, history = 1024, max_decisions = 1000, seed = 0, players = 4, paired = false, rules = None, random_starts = 0))]
+    fn new(games: usize, history: usize, max_decisions: u32, seed: u64, players: usize, paired: bool, rules: Option<&GameRules>, random_starts: u8) -> PyResult<Self> {
         if games == 0 || max_decisions == 0 || history == 0 || history as u64 % CHECKPOINT_EVERY != 0 {
             return Err(PyValueError::new_err(format!(
                 "games and max_decisions must be positive, and history a positive multiple of {CHECKPOINT_EVERY}"
@@ -36,7 +36,7 @@ impl Buffer {
             return Err(PyValueError::new_err(format!("2 to {MAX_PLAYERS} players")));
         }
         let rules = rules.map_or(Rules::STANDARD, |r| r.inner);
-        let inner = buffer::Buffer::new(Config { games, history, max_decisions, seed, players, paired, rules });
+        let inner = buffer::Buffer::new(Config { games, history, max_decisions, seed, players, paired, rules, random_starts: random_starts.min(100) });
         Ok(Buffer { inner, endings: vec![None; games] })
     }
 
@@ -119,6 +119,31 @@ impl Buffer {
             py.detach(|| inner.observe(out, &mut words, &mut players));
         }
         (observations, masks(py, &words), player_codes(py, &players))
+    }
+
+    fn trade_views<'py>(
+        &self,
+        py: Python<'py>,
+        games: PyArrayLike1<'_, u64, AllowTypeChange>,
+        deals: PyArrayLike2<'_, i8, AllowTypeChange>,
+        partners: PyArrayLike1<'_, u8, AllowTypeChange>,
+    ) -> PyResult<(Bound<'py, PyArray2<u8>>, Bound<'py, PyArray1<bool>>)> {
+        let (games, partners, deals) = (games.as_slice()?, partners.as_slice()?, deals.as_array());
+        let m = games.len();
+        if partners.len() != m || deals.shape() != [m, 5] {
+            return Err(PyValueError::new_err("one game, partner and five counts per query"));
+        }
+        let (mut bytes, mut ok) = (vec![0u8; m * OBSERVATION_BYTES], vec![false; m]);
+        for k in 0..m {
+            let state = self.inner.state(games[k] as usize);
+            let counts: [i8; 5] = std::array::from_fn(|r| deals[[k, r]]);
+            if let Some(after) = state.after_trade(partners[k], counts) {
+                let out: &mut [u8; OBSERVATION_BYTES] = (&mut bytes[k * OBSERVATION_BYTES..(k + 1) * OBSERVATION_BYTES]).try_into().expect("one observation");
+                observe(&after, after.current(), out);
+                ok[k] = true;
+            }
+        }
+        Ok((PyArray1::from_vec(py, bytes).reshape([m, OBSERVATION_BYTES]).expect("sizes match"), PyArray1::from_vec(py, ok)))
     }
 
     fn forbidden<'py>(&self, py: Python<'py>) -> (Bound<'py, numpy::PyArrayDyn<i8>>, Bound<'py, PyArray1<u8>>) {

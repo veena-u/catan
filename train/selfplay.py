@@ -179,8 +179,10 @@ class League:
 
 class Rollout:
     def __init__(self, model, critics, buffer, at, autocast, players, privileged=False, seed=0,
-                 vp_reward=0.0, league=None, league_games=0.0, rank=False, greedy_games=0.0, explore_games=0.0):
+                 vp_reward=0.0, league=None, league_games=0.0, rank=False, greedy_games=0.0, explore_games=0.0,
+                 offer_search=0, offer_candidates=8):
         self.model, self.critics, self.buffer, self.at, self.autocast = model, critics, buffer, at, autocast
+        self.offer_search, self.offer_candidates = offer_search, offer_candidates
         self.rank, self.greedy_games, self.explore_games = rank, greedy_games, explore_games
         self.games, self.players = len(buffer), players
         self.privileged = privileged
@@ -206,6 +208,40 @@ class Rollout:
         legal = top.values > 0
         pick = torch.multinomial(legal.float(), 1).squeeze(1)
         return top.indices.gather(1, pick[:, None]).squeeze(1).cpu().numpy()
+
+    @torch.no_grad()
+    def search_offers(self, t, rows, o, forbidden, counts, summary, goods, v, search, stats):
+        if len(rows) == 0:
+            return
+        rows = self.rng.choice(rows, min(self.offer_search, len(rows)), replace=False)
+        k, at = self.offer_candidates, self.at
+        repeat = lambda x: x.repeat_interleave(k, 0)
+        index = self.tensor(rows)
+        s, g = repeat(summary[index]), repeat(goods[index])
+        hand = repeat(self.tensor(o[rows, 222:227]).long())
+        with torch.autocast(at.type, dtype=torch.bfloat16, enabled=self.autocast):
+            chosen, choices, masks = deals.sample(
+                lambda r, c: self.model.deal_scores(s[r], g[r], torch.zeros(len(r), dtype=torch.bool, device=at), c),
+                hand, torch.zeros(len(hand), dtype=torch.bool, device=at), repeat(self.tensor(forbidden[rows])),
+                repeat(self.tensor(counts[rows]).long()))
+        partners = self.players - 1
+        games = np.repeat(np.repeat(rows, k), partners)
+        offsets = np.tile(np.arange(1, partners + 1), len(rows) * k).astype(np.uint8)
+        views, ok = self.buffer.trade_views(games.astype(np.uint64), np.repeat(chosen.cpu().numpy().astype(np.int8), partners, 0), offsets)
+        with torch.autocast(at.type, dtype=torch.bfloat16, enabled=self.autocast):
+            _, after, _ = self.model(self.tensor(views))
+        after = after.float().view(len(rows), k, partners, -1)
+        now = v[index].float()[:, None, None]
+        mine = after[..., 0] - now[..., 0]
+        theirs = (after - now).gather(-1, torch.arange(1, partners + 1, device=at).view(1, 1, -1, 1).expand(len(rows), k, -1, 1)).squeeze(-1)
+        agree = torch.sigmoid(theirs / 0.05) * self.tensor(ok).view(len(rows), k, partners).float()
+        score = (agree * mine).max(-1).values
+        spread = score.std(1, keepdim=True) + 1e-4
+        weights = ((score - score.mean(1, keepdim=True)) / spread * 2).softmax(1)
+        search.append((self.tensor(o[rows]), choices.view(len(rows), k, -1), masks.view(len(rows), k, *masks.shape[1:]), weights))
+        stats["searched_offers"] += len(rows)
+        stats["offer_gain"] += float(score.max(1).values.sum())
+        stats["acceptable"] += float((agree > 0.5).any(-1).float().mean(1).sum())
 
     def answered(self, o, p, pending, responses, tally, habits):
         games = np.flatnonzero((pending[:, 0] >= 0) & (p == pending[:, 1]) & np.isin(o[:, 296], (PHASE_TURN, PHASE_CONFIRM)))
@@ -268,6 +304,8 @@ class Rollout:
         habits = Habits()
         learn = torch.ones(rounds, n, dtype=torch.bool, device=at)
         pending, tally, trades = np.full((n, 3), -1), np.zeros(ANSWERS, np.int64), []
+        search = []
+        stats.update(searched_offers=0, offer_gain=0.0, acceptable=0.0)
         if self.league is not None:
             for game in np.flatnonzero((self.league_seats & (self.opponent < 0)).any(1)):
                 self.reseat(game)
@@ -305,6 +343,8 @@ class Rollout:
                     deal_lp, _ = self.model.deal_log_probs(summary[at_rows], goods[at_rows], self.tensor(mine[rows] == COUNTER),
                                                            sampled[0], sampled[1])
                 log_probs[t, at_rows] += deal_lp.float()
+                if self.offer_search:
+                    self.search_offers(t, rows[mine[rows] == OFFER], o, forbidden, counts, summary, goods, v, search, stats)
             exploring = own & self.explore & (o[:, 296] == SETUP_SETTLEMENT) & (m.sum(1) > 1)
             if exploring.any():
                 chosen[exploring] = self.explore_opening(dist.probs[self.tensor(exploring)])
@@ -348,6 +388,8 @@ class Rollout:
             last = self.value(self.tensor(o), self.tensor(p, np.int64))
         batch = dict(obs=obs, masks=masks, actions=actions, log_probs=log_probs, actors=actors, hidden=hidden,
                      learn=learn, responses=responses, offered=offered, offer_choices=offer_choices, offer_masks=offer_masks)
+        if search:
+            batch["search"] = tuple(torch.cat(part) for part in zip(*search))
         stats["answers"] = tally
         stats["trade_advantage"] = trade_advantage(trades, values, done)
         shaped = self.vp_reward * relative(progress, self.players) * (~done)[..., None]
@@ -382,6 +424,20 @@ def advantages(values, done, ends, last, shaped, lam):
         result[t] = following
     return result
 
+def upgo_advantages(values, done, ends, last, shaped):
+    steps = values.shape[0]
+    following = torch.zeros_like(values)
+    for t in reversed(range(steps)):
+        next_values = last if t == steps - 1 else values[t + 1]
+        if t == steps - 1:
+            carry = next_values
+        else:
+            after = last if t + 1 == steps - 1 else values[t + 2]
+            q = torch.where(done[t + 1, :, None], ends[t + 1], shaped[t + 1] + after)
+            carry = torch.where(q >= values[t + 1], following[t + 1], values[t + 1])
+        following[t] = torch.where(done[t, :, None], ends[t], shaped[t] + carry)
+    return following - values
+
 def entropies(log_probs):
     probs = log_probs.exp()
     total = -(probs * log_probs).sum(-1)
@@ -389,16 +445,18 @@ def entropies(log_probs):
     kind = -(kinds * kinds.clamp(min=1e-12).log()).sum(-1)
     return kind, total - kind
 
-def update(model, critics, optimizer, batch, adv, returns, players, args, autocast, entropy_weight=0.0):
-    flat = {k: v.flatten(0, 1) for k, v in batch.items()}
+def update(model, critics, optimizer, batch, adv, returns, players, args, autocast, entropy_weight=0.0, upgo=None):
+    search = batch.get("search")
+    flat = {k: v.flatten(0, 1) for k, v in batch.items() if k != "search"}
     actors = flat["actors"]
     own = adv.flatten(0, 1).gather(1, actors[:, None]).squeeze(1)
+    own_upgo = None if upgo is None else upgo.flatten(0, 1).gather(1, actors[:, None]).squeeze(1)
     targets = to_relative(returns.flatten(0, 1), actors, players)
     total = len(own)
     seats = slice(0, players)
     threshold = own.abs().float().quantile(1 - args.keep) if args.keep < 1 else -1.0
     informative = own.abs() >= threshold
-    logs = {"policy": 0.0, "value": 0.0, "approx_kl": 0.0, "clipped": 0.0, "hands": 0.0, "answers": 0.0,
+    logs = {"upgo": 0.0, "offer_search": 0.0, "policy": 0.0, "value": 0.0, "approx_kl": 0.0, "clipped": 0.0, "hands": 0.0, "answers": 0.0,
             "answers_right": 0.0, "answers_seen": 0.0, "entropy_kind": 0.0, "entropy_target": 0.0,
             "kept": informative.float().mean().item()}
     steps = 0
@@ -427,6 +485,12 @@ def update(model, critics, optimizer, batch, adv, returns, players, args, autoca
             ratio, a = ratio[kept], a[kept]
             a = (a - a.mean()) / (a.std() + 1e-8)
             policy_loss = -torch.min(ratio * a, ratio.clamp(1 - args.clip, 1 + args.clip) * a).mean()
+            if own_upgo is not None:
+                u = own_upgo[pick][kept]
+                u = (u - u.mean()) / (u.std() + 1e-8)
+                upgo_loss = -torch.min(ratio * u, ratio.clamp(1 - args.clip, 1 + args.clip) * u).mean()
+                policy_loss = policy_loss + args.upgo * upgo_loss
+                logs["upgo"] += upgo_loss.item()
             kind_h, target_h = entropies(log_probs)
             target_h = target_h + deal_entropy
             entropy_kind, entropy_target = (h[flat["learn"][pick]].mean() for h in (kind_h, target_h))
@@ -445,6 +509,18 @@ def update(model, critics, optimizer, batch, adv, returns, players, args, autoca
                 logs["answers"] += answers_loss.item()
                 logs["answers_right"] += (guesses.argmax(-1) == labels)[seen].sum().item()
                 logs["answers_seen"] += seen.sum().item()
+            if search is not None:
+                s_obs, s_choices, s_masks, s_weights = search
+                take = torch.randint(len(s_obs), (min(len(s_obs), max(len(pick) // 16, 1)),), device=s_obs.device)
+                k = s_choices.shape[1]
+                with torch.autocast(obs.device.type, dtype=torch.bfloat16, enabled=autocast):
+                    _, _, s_summary, s_goods = model(s_obs[take], with_goods=True)
+                    lp, _ = model.deal_log_probs(s_summary.repeat_interleave(k, 0), s_goods.repeat_interleave(k, 0),
+                                                 torch.zeros(len(take) * k, dtype=torch.bool, device=obs.device),
+                                                 s_choices[take].flatten(0, 1), s_masks[take].flatten(0, 1))
+                search_loss = -(s_weights[take] * lp.float().view(len(take), k)).sum(1).mean()
+                loss = loss + args.offer_search_weight * search_loss
+                logs["offer_search"] += search_loss.item()
             optimizer.zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_([*model.parameters(), *critics.parameters()], args.max_grad_norm)
@@ -523,6 +599,14 @@ def main():
                              "those moves are not learned from")
     parser.add_argument("--aux-hands", type=float, default=0.0,
                         help="weight of learning to guess every opponent's hidden cards (training only); 0 is off")
+    parser.add_argument("--upgo", type=float, default=0.0,
+                        help="weight of a second policy loss on UPGO advantages (AlphaStar): returns that keep following moves which did better than expected")
+    parser.add_argument("--offer-search", type=int, default=0,
+                        help="offer decisions per step whose candidate offers are scored with the network's own values; 0 is off")
+    parser.add_argument("--offer-candidates", type=int, default=8, help="offers sampled and scored per searched decision")
+    parser.add_argument("--offer-search-weight", type=float, default=1.0)
+    parser.add_argument("--random-starts", type=int, default=0,
+                        help="percent of training games where every player starts with up to 3 extra cards and maybe a development card")
     parser.add_argument("--aux-answers", type=float, default=0.0,
                         help="weight of learning to predict how each opponent answers an offer (training only); 0 is off")
     parser.add_argument("--wandb", metavar="PROJECT", help="also log every metric to this Weights & Biases project")
@@ -568,10 +652,11 @@ def main():
     critics = Critics(args.width).to(at)
     optimizer = torch.optim.AdamW([*model.parameters(), *critics.parameters()], lr=args.lr)
     buffer = catan.Buffer(args.games, history=64, max_decisions=args.max_decisions, seed=args.seed, players=args.players,
-                          rules=rules)
+                          rules=rules, random_starts=args.random_starts)
     league = League(args.league_size, at, autocast, args.seed) if args.league else None
     rollout = Rollout(model, critics, buffer, at, autocast, args.players, args.privileged, args.seed,
-                      args.vp_reward, league, args.league, args.reward == "rank", args.greedy_opponents, args.opening_explore)
+                      args.vp_reward, league, args.league, args.reward == "rank", args.greedy_opponents, args.opening_explore,
+                      args.offer_search, args.offer_candidates)
     log = open(out / "log.txt", "a")
 
     def say(line):
@@ -657,7 +742,8 @@ def main():
             group["lr"] = args.lr * scale
         model.train()
         entropy_weight = max(args.entropy * pull, args.entropy_floor)
-        logs = update(learner, critics, optimizer, batch, adv, returns, args.players, args, autocast, entropy_weight)
+        upgo = upgo_advantages(values, *scoring) if args.upgo else None
+        logs = update(learner, critics, optimizer, batch, adv, returns, args.players, args, autocast, entropy_weight, upgo)
         sync(at)
         update_time = time.time() - clock
         decisions += args.games * args.rounds
@@ -696,6 +782,13 @@ def main():
             cards = stats["offer_cards"] / stats["offers_built"]
             line += f"  cards per offer {cards:.1f}"
             metrics["trade/cards_per_offer"] = cards
+        if stats["searched_offers"]:
+            m = stats["searched_offers"]
+            line += f"  offer search: best gain {stats['offer_gain'] / m:+.4f}, acceptable {stats['acceptable'] / m:.2f}"
+            metrics.update({"search/best_gain": stats["offer_gain"] / m, "search/acceptable": stats["acceptable"] / m,
+                            "loss/offer_search": logs["offer_search"]})
+        if args.upgo:
+            metrics["loss/upgo"] = logs["upgo"]
         advantage, counted = stats["trade_advantage"]
         if counted:
             line += f"  trade advantage {advantage:+.3f}"

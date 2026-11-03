@@ -23,6 +23,7 @@ pub struct Config {
     pub players: usize,
     pub paired: bool,
     pub rules: Rules,
+    pub random_starts: u8,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -77,6 +78,8 @@ struct Game {
     rng: Rng,
     dice_rng: Rng,
     dice: Dice,
+    random_starts: u8,
+    randomize: bool,
     deal: Option<u64>,
     round: u64,
     time: u64,
@@ -107,6 +110,8 @@ impl Buffer {
                     rng,
                     dice_rng: Rng::new(0),
                     dice: Dice::new(config.rules.balanced_dice),
+                    random_starts: config.random_starts,
+                    randomize: false,
                     deal,
                     round: 0,
                     time: 0,
@@ -291,10 +296,15 @@ impl Game {
         };
         self.round += 1;
         self.dice = Dice::new(self.rules.balanced_dice);
+        self.randomize = self.random_starts > 0 && self.rng.below(100) < usize::from(self.random_starts);
         State::with_rules(board, players, self.rules)
     }
 
     fn settle(&mut self) {
+        if self.randomize && !matches!(self.state.phase(), Phase::PlaceSettlement | Phase::PlaceRoad { .. }) {
+            self.randomize = false;
+            self.state.randomize_start(&mut self.rng);
+        }
         self.rolls.clear();
         while let Some(Actor::Chance) = self.state.actor() {
             let outcome = if matches!(self.state.phase(), Phase::Dice) {

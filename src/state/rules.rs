@@ -777,6 +777,42 @@ impl State {
         }
     }
 
+    pub fn randomize_start(&mut self, rng: &mut Rng) {
+        for player in self.seats() {
+            for _ in 0..rng.below(4) {
+                let bank: [u8; 5] = std::array::from_fn(|r| self.bank(Resource::ALL[r]));
+                if bank.iter().all(|&n| n == 0) {
+                    break;
+                }
+                self.gain(player, rng.weighted(&bank), 1);
+            }
+            if rng.below(2) == 0 && self.deck_size() > 0 {
+                let card = rng.weighted(&self.deck);
+                self.deck[card] -= 1;
+                self.dev_cards[player.index()][card] += 1;
+            }
+        }
+    }
+
+    pub fn after_trade(&self, partner_offset: u8, counts: [i8; 5]) -> Option<State> {
+        let proposer = self.current;
+        let partner = proposer.after(usize::from(partner_offset), self.players());
+        let deal = Deal {
+            give: counts.map(|c| (-c).max(0) as u8),
+            get: counts.map(|c| c.max(0) as u8),
+        };
+        let fits = matches!(self.phase, Phase::Turn { rolled: true })
+            && partner != proposer
+            && deal.complete()
+            && self.can_pay(proposer, deal.give)
+            && self.can_pay(partner, deal.get);
+        fits.then(|| {
+            let mut after = *self;
+            after.exchange(proposer, partner, deal);
+            after
+        })
+    }
+
     fn exchange(&mut self, proposer: Player, partner: Player, deal: Deal) {
         for r in 0..5 {
             self.spend(proposer, r, deal.give[r]);

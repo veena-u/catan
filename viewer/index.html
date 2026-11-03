@@ -108,7 +108,7 @@ button.tool .icon { font-size: 22px; }
 .mark { width: 30px; height: 30px; border-radius: 50%; display: grid; place-items: center; font-weight: 900; font-size: 16px; color: #fff; flex: none; }
 .mark.yes { background: #2e9d4f; } .mark.no { background: #d84339; } .mark.wait { background: #c3c9d4; } .mark.counter { background: #f0a020; }
 button.mark { padding: 0; cursor: pointer; box-shadow: 0 0 0 4px rgba(46, 157, 79, 0.3); animation: pulse 1.2s ease-in-out infinite; }
-.counter { display: flex; align-items: center; gap: 6px; }
+.counter-offer { display: flex; align-items: center; gap: 10px; margin-left: 40px; padding: 8px 10px; border-radius: 10px; background: #fbf6e8; border: 1px solid var(--line); }
 .choices { display: flex; gap: 10px; margin-top: 10px; align-items: center; }
 .choices button.mark { width: 40px; height: 40px; font-size: 20px; animation: none; box-shadow: none; }
 .result { margin-top: 8px; font-weight: 800; font-size: 13px; color: var(--muted); }
@@ -474,15 +474,21 @@ function drawOffer() {
     let mark;
     if (a.status === "accepted" && trade) mark = el("button", { class: "mark yes", title: `Trade with ${who(a.seat)}`, text: "✓", on: { click: () => act(trade.code) } });
     else if (a.status === "accepted") mark = el("div", { class: "mark yes", title: done ? "traded" : "accepted", text: "✓" });
-    else if (a.status === "declined") mark = el("div", { class: "mark no", title: "declined", text: "✕" });
-    else if (a.status === "countered") mark = el("div", { class: "mark counter", title: "counter-offer", text: "⇄" });
+    else if (a.status === "declined" || a.status === "countered") mark = el("div", { class: "mark no", title: "declined", text: "✕" });
     else mark = el("div", { class: "mark wait", title: "thinking", text: "…" });
-    const counter = a.counter ? el("div", { class: "counter" }, [
-      el("small", { text: a.seat === view.human ? "You give" : `${who(a.seat)} gives` }), tiles(a.counter.give),
-      el("small", { text: "for" }), tiles(a.counter.get),
-      take ? el("button", { class: "mark yes", title: "Take this counter-offer", text: "✓", on: { click: () => act(take.code) } }) : null,
-    ]) : null;
-    list.append(el("div", { class: "response" }, [avatar(a.seat, 30), mark, counter]));
+    list.append(el("div", { class: "response" }, [avatar(a.seat, 30), mark,
+      a.status === "countered" ? el("small", { style: "color:var(--muted)", text: "declined, and made a counter-offer" }) : null]));
+    if (a.counter) {
+      const mine = a.seat === view.human, them = mine ? "You" : who(a.seat);
+      list.append(el("div", { class: "counter-offer" }, [
+        avatar(a.seat, 30),
+        el("div", { class: "offer-side" }, [el("small", { text: `${them} give${mine ? "" : "s"}` }), tiles(a.counter.give)]),
+        el("div", { class: "swap", text: "⇄" }),
+        el("div", { class: "offer-side" }, [el("small", { text: `${them} want${mine ? "" : "s"}` }), tiles(a.counter.get)]),
+        take ? el("button", { class: "mark yes", title: "Accept this counter-offer", text: "✓", on: { click: () => act(take.code) } })
+          : el("div", { class: "mark " + (done ? "yes" : b.result ? "no" : "wait"), title: done ? "traded" : b.result ? "not taken" : "waiting", text: done ? "✓" : b.result ? "✕" : "…" }),
+      ]));
+    }
   }
   box.append(list);
   if (live && yours() && view.phase === "respond" && mode !== "counter") {

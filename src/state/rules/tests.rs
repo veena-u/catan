@@ -839,6 +839,35 @@ fn an_offer_holds_at_most_four_cards_on_each_side() {
 }
 
 #[test]
+fn a_random_start_hands_out_a_few_cards_and_stays_consistent() {
+    let mut rng = Rng::new(3);
+    for seed in 0..50 {
+        let mut state = after_setup_of(seed, 4);
+        let before: Vec<u8> = state.seats().map(|p| state.hand_size(p)).collect();
+        state.randomize_start(&mut rng);
+        assert!(state.seats().zip(&before).all(|(p, &b)| state.hand_size(p) <= b + 3 && state.dev_card_count(p) <= 1));
+        state.validate().unwrap();
+        for _ in 0..300 {
+            if state.actor().is_none() { break; }
+            random_step(&mut state, &mut rng);
+            state.validate().unwrap();
+        }
+    }
+}
+
+#[test]
+fn a_trade_can_be_imagined_without_changing_the_game() {
+    let mut state = scenario_of(25, 3);
+    state.hands = seats(&[[2, 0, 0, 0, 0], [0, 0, 0, 0, 1], [0, 0, 0, 0, 0]]);
+    let before = state;
+    let after = state.after_trade(1, [-1, 0, 0, 0, 1]).expect("the next seat holds the ore");
+    assert_eq!((after.hand(Player::First), after.hand(Player::Second)), ([1, 0, 0, 0, 1], [1, 0, 0, 0, 0]));
+    assert!(state.after_trade(2, [-1, 0, 0, 0, 1]).is_none(), "the third seat has no ore");
+    assert!(state.after_trade(1, [-3, 0, 0, 0, 1]).is_none(), "nor can the offerer give three brick");
+    assert_eq!(state, before);
+}
+
+#[test]
 fn there_is_no_cap_on_offers_in_a_turn() {
     let mut state = scenario_of(26, 2);
     known_hands(&mut state, &[[5, 0, 0, 0, 0], [0; 5]]);
