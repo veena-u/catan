@@ -40,9 +40,9 @@ class Habits:
         self.offers += int((own & (chosen == OFFER)).sum())
         self.counters += int((own & (chosen == COUNTER)).sum())
         self.cancels += int((own & (phase == PHASE_CONFIRM) & (chosen == CANCEL)).sum())
-        ending = own & (phase == PHASE_TURN) & (chosen == END_TURN)
-        self.ends += int(ending.sum())
-        self.timeouts += int((ending & (o[:, BUDGET_LEFT] == 0)).sum())
+        timed = own & ((phase == PHASE_TURN) & (o[:, 297] == 1) | (phase == PHASE_CONFIRM)) & (o[:, BUDGET_LEFT] == 1) & (chosen != END_TURN)
+        self.ends += int((own & (phase == PHASE_TURN) & (chosen == END_TURN)).sum()) + int(timed.sum())
+        self.timeouts += int(timed.sum())
         setup = np.flatnonzero(own & (phase == SETUP_SETTLEMENT))
         if len(setup) == 0:
             return
@@ -211,6 +211,9 @@ class Rollout:
         games = np.flatnonzero((pending[:, 0] >= 0) & (p == pending[:, 1]) & np.isin(o[:, 296], (PHASE_TURN, PHASE_CONFIRM)))
         for game in games:
             others = np.arange(1, SEATS) < self.players
+            if o[game, 296] == PHASE_TURN and o[game, 297] == 0:
+                pending[game] = -1
+                continue
             if o[game, OFFERS_MADE] == pending[game, 2]:
                 habits.dropped += 1
                 pending[game] = -1
