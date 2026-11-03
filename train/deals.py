@@ -2,8 +2,10 @@ import numpy as np
 import torch
 
 RESOURCES = 5
-MAX_CARDS = 12
+SIDE = 4
+MAX_CARDS = 2 * SIDE
 STEPS = MAX_CARDS + 1
+COUNT_OFFSET = 12
 CHOICES = 1 + 2 * RESOURCES
 STOP = 0
 OFFER, COUNTER = 234, 249
@@ -21,9 +23,9 @@ def step_mask(counts, hand, counter, forbidden, listed, cards):
     valid = torch.where(counter, gave & asked, gave | asked)
     same = (forbidden.long() == counts[:, None]).all(-1) & (torch.arange(forbidden.shape[1], device=counts.device)[None] < listed[:, None])
     valid &= ~same.any(1)
-    room = cards < MAX_CARDS
-    give = (counts <= 0) & (-counts < hand) & room[:, None]
-    ask = (counts >= 0) & (counts < BANK_CARDS - hand) & room[:, None]
+    gives, asks = (-counts).clamp(min=0).sum(1), counts.clamp(min=0).sum(1)
+    give = (counts <= 0) & (-counts < hand) & (gives < SIDE)[:, None]
+    ask = (counts >= 0) & (counts < BANK_CARDS - hand) & (asks < SIDE)[:, None]
     mask = torch.cat([valid[:, None], give, ask], 1)
     mask[~mask.any(1), STOP] = True
     return mask

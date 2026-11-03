@@ -819,11 +819,33 @@ fn the_offerer_trades_with_an_accepter_or_kills_the_deal_but_cannot_make_it_agai
 }
 
 #[test]
+fn an_offer_holds_at_most_four_cards_on_each_side() {
+    let mut state = scenario_of(27, 3);
+    state.hands = seats(&[[6, 0, 0, 0, 0], [0, 1, 0, 0, 0], [0, 1, 0, 0, 2]]);
+    state.apply(Action::Offer);
+    assert_eq!(state.finish_deal([-3, 0, 0, 0, 2]).last(), Some(&Action::Send), "three brick for two ore is fine");
+    act(&mut state, Action::Decline);
+    act(&mut state, Action::Decline);
+    act(&mut state, Action::Offer);
+    draft(&mut state, [4, 0, 0, 0, 0], [0, 0, 0, 2, 2]);
+    let legal = state.legal_actions();
+    assert!(!legal.contains(Action::Give(Resource::Brick)), "a fifth card to give is refused");
+    assert!(!legal.contains(Action::Ask(Resource::Ore)) && !legal.contains(Action::Ask(Resource::Wool)), "and a fifth to ask for");
+    assert!(legal.contains(Action::Send));
+    state.validate().unwrap();
+    act(&mut state, Action::Abandon);
+    state.apply(Action::Offer);
+    assert_eq!(state.finish_deal([-5, 0, 0, 0, 1]).last(), Some(&Action::Abandon), "a whole offer over the limit is dropped");
+}
+
+#[test]
 fn there_is_no_cap_on_offers_in_a_turn() {
     let mut state = scenario_of(26, 2);
     known_hands(&mut state, &[[5, 0, 0, 0, 0], [0; 5]]);
     for k in 1..=5 {
-        offer(&mut state, [k, 0, 0, 0, 0], [0, 0, 0, 0, 1]);
+        let mut ask = [0; 5];
+        ask[k as usize - 1 + usize::from(k == 1)] = 1;
+        offer(&mut state, [1 + u8::from(k == 1), 0, 0, 0, 0], ask);
         let options: Vec<Action> = state.legal_actions().iter().collect();
         assert_eq!(options, [Action::Decline], "an empty hand can neither accept nor counter");
         act(&mut state, Action::Decline);

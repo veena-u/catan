@@ -6,7 +6,7 @@ from torch import nn
 
 import catan
 
-from .deals import MAX_CARDS, STOP, replay, step_log_probs
+from .deals import COUNT_OFFSET, STOP, replay, step_log_probs
 from .features import (
     EDGE_FEATURES, EDGES, GLOBAL_FEATURES, HEX_FEATURES, HEXES, PLAYER_FEATURES, RESOURCE_FEATURES, RESOURCES, SEATS,
     TOKEN_RELATIONS, TOKENS, VERTEX_FEATURES, VERTICES, decode, players, resources, symmetry_tables, token_relations,
@@ -87,7 +87,7 @@ class Model(nn.Module):
         self.keys = nn.Linear(width, width)
         self.value = nn.Linear(width, SEATS)
         self.deal_query = nn.Linear(width, 2 * width)
-        self.count_embed = nn.Parameter(torch.randn(RESOURCES, 2 * MAX_CARDS + 1, width) * 0.02)
+        self.count_embed = nn.Parameter(torch.randn(RESOURCES, 2 * COUNT_OFFSET + 1, width) * 0.02)
         self.stop_hidden, self.stop_out = nn.Linear(width, width), nn.Linear(width, 1)
         self.card_hidden, self.card_out = nn.Linear(2 * width, width), nn.Linear(width, 2)
         self.register_buffer("kind_of", torch.from_numpy(KINDS), persistent=False)
@@ -136,7 +136,7 @@ class Model(nn.Module):
         query = self.deal_query(summary).view(n, 2, d)[torch.arange(n, device=summary.device), counter.long()]
         shape = counts.shape[:-1]
         query = query.view(n, *([1] * (len(shape) - 1)), d)
-        h = query + self.count_embed[torch.arange(RESOURCES, device=counts.device), counts + MAX_CARDS].sum(-2)
+        h = query + self.count_embed[torch.arange(RESOURCES, device=counts.device), counts + COUNT_OFFSET].sum(-2)
         stop = self.stop_out(nn.functional.gelu(self.stop_hidden(h))).squeeze(-1)
         rows = goods.view(n, *([1] * (len(shape) - 1)), RESOURCES, d).expand(*shape, RESOURCES, d)
         both = torch.cat([h.unsqueeze(-2).expand(*shape, RESOURCES, d), rows], -1)

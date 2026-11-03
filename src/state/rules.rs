@@ -15,6 +15,7 @@ pub const ACTIONS: usize = 257;
 pub const MASK_WORDS: usize = ACTIONS.div_ceil(64);
 
 pub const MAX_PROPOSED: usize = 40;
+pub const MAX_SIDE: u8 = 4;
 
 const SETTLEMENT: usize = 0;
 const CITY: usize = 54;
@@ -789,10 +790,10 @@ impl State {
         let hand = self.hands[drafter.index()];
         for resource in Resource::ALL {
             let r = resource.index();
-            if draft.get[r] == 0 && hand[r] > draft.give[r] {
+            if draft.get[r] == 0 && hand[r] > draft.give[r] && draft.gives() < MAX_SIDE {
                 mask.insert(Action::Give(resource));
             }
-            if draft.give[r] == 0 && draft.get[r] < RESOURCE_CARDS - hand[r] {
+            if draft.give[r] == 0 && draft.get[r] < RESOURCE_CARDS - hand[r] && draft.asks() < MAX_SIDE {
                 mask.insert(Action::Ask(resource));
             }
         }

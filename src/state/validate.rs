@@ -6,7 +6,7 @@ use crate::player::{Player, MAX_PLAYERS};
 use crate::resource::{Resource, RESOURCE_CARDS};
 use crate::topology::topology;
 
-use super::rules::{award, longest_road, Deal, MAX_PROPOSED};
+use super::rules::{award, longest_road, Deal, MAX_PROPOSED, MAX_SIDE};
 use super::{Actor, Phase, State};
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -402,6 +402,7 @@ impl State {
 impl State {
     fn validate_draft(&self, drafter: Player, draft: Deal) -> Result<(), Violation> {
         ensure(disjoint(draft), || "a draft with a resource on both sides".into())?;
+        ensure(draft.gives() <= MAX_SIDE && draft.asks() <= MAX_SIDE, || "a draft with more than four cards on a side".into())?;
         ensure(self.can_pay(drafter, draft.give), || "a draft giving cards the drafter does not hold".into())?;
         let hand = self.hands[drafter.index()];
         ensure(

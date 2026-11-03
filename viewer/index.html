@@ -406,7 +406,8 @@ function drawTrade() {
         counts[i] ? el("button", { class: "minus", title: `remove ${r}`, text: "−", on: { click: () => { counts[i] -= 1; render(); } } }) : el("span", { class: "minus-space" }),
       ]);
     })]);
-    box.append(row("You give", give, get, (i) => view.hand[i]), row("You get", get, give, (i) => 19 - view.hand[i]));
+    const room = (counts) => 4 - counts.reduce((a, b) => a + b, 0);
+    box.append(row("You give", give, get, (i) => Math.min(view.hand[i], give[i] + room(give))), row("You get", get, give, (i) => Math.min(19 - view.hand[i], get[i] + room(get))));
     const signed = RES.map((_, i) => get[i] - give[i]);
     const gives = give.some((n) => n), asks = get.some((n) => n);
     const repeat = view.forbidden.some((f) => f.every((n, i) => n === signed[i]));
