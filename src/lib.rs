@@ -7,6 +7,7 @@ pub mod observation;
 pub mod player;
 pub mod resource;
 pub mod rng;
+pub mod search;
 pub mod state;
 pub mod symmetry;
 pub mod topology;

@@ -813,6 +813,35 @@ impl State {
         })
     }
 
+    pub fn after_answer(&self) -> Option<(State, Player)> {
+        let Phase::Respond { deal, responder, draft: None, .. } = self.phase else {
+            return None;
+        };
+        let fits = deal.complete() && self.can_pay(self.current, deal.give) && self.can_pay(responder, deal.get);
+        fits.then(|| {
+            let mut after = *self;
+            after.exchange(self.current, responder, deal);
+            after.phase = Phase::Turn { rolled: true };
+            (after, responder)
+        })
+    }
+
+    /// The position if the responder countered with `counts` (what it gives negative, what it asks for positive)
+    /// and the player whose turn it is took the counter-offer.
+    pub fn after_counter(&self, counts: [i8; 5]) -> Option<(State, Player)> {
+        let Phase::Respond { responder, draft: None, .. } = self.phase else {
+            return None;
+        };
+        let deal = Deal { give: counts.map(|c| (-c).max(0) as u8), get: counts.map(|c| c.max(0) as u8) };
+        let fits = deal.complete() && self.can_pay(responder, deal.give) && self.can_pay(self.current, deal.get);
+        fits.then(|| {
+            let mut after = *self;
+            after.exchange(responder, self.current, deal);
+            after.phase = Phase::Turn { rolled: true };
+            (after, responder)
+        })
+    }
+
     fn exchange(&mut self, proposer: Player, partner: Player, deal: Deal) {
         for r in 0..5 {
             self.spend(proposer, r, deal.give[r]);

@@ -33,6 +33,20 @@ class Random:
                                     "cpu", generator=generator)
         return actions, offers
 
+TRADING = np.array([234, 247, 249, 250, 251, 252, 253, 254, 255])
+
+class NoTrade:
+    """Any agent, never offering, accepting, countering or closing a trade: the same player without trading."""
+
+    def __init__(self, agent):
+        self.agent = agent
+        self.uses_state = getattr(agent, "uses_state", False)
+
+    def __call__(self, obs, masks, forbidden, counts, *state):
+        masks = masks.copy()
+        masks[:, TRADING] = False
+        return self.agent(obs, masks, forbidden, counts, *state)
+
 class Network:
 
     def __init__(self, model, device, greedy=False, seed=0, temperature=1.0):

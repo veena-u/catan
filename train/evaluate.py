@@ -21,7 +21,8 @@ def play(a, b, games=4096, parallel=512, seed=0, max_decisions=5000, players=4, 
         actions, offers = np.zeros(parallel, np.int64), np.zeros((parallel, 5), np.int8)
         for agent, turn in ((a, a_turn), (b, ~a_turn)):
             if turn.any():
-                actions[turn], offers[turn] = agent(obs[turn], masks[turn], forbidden[turn], counts[turn])
+                state = (buffer, np.flatnonzero(turn)) if getattr(agent, "uses_state", False) else ()
+                actions[turn], offers[turn] = agent(obs[turn], masks[turn], forbidden[turn], counts[turn], *state)
         for game, winner, _ in buffer.step(actions, offers):
             if finished[game] >= per_slot:
                 continue
@@ -46,6 +47,17 @@ def play(a, b, games=4096, parallel=512, seed=0, max_decisions=5000, players=4, 
         "first_player_win_rate": first_wins / max(decided, 1),
         "players": players,
     }
+
+def matchup(a, b, games=256, players=2, rules=None, seed=0, max_decisions=8000):
+    """How a scores against b, where 0.5 is even. With more than two players one seat against a full table of the
+    other is lopsided (even is 1/players), so both play alone in turn and each is scored by its lone-seat win rate."""
+    first = play(a, b, games=games, parallel=min(games, 512), seed=seed, players=players, rules=rules, max_decisions=max_decisions)
+    if players == 2:
+        return {"share": first["win_rate"], "alone": (first["win_rate"], None), "decided": first["wins"] + first["losses"]}
+    back = play(b, a, games=games, parallel=min(games, 512), seed=seed + 1, players=players, rules=rules, max_decisions=max_decisions)
+    alone_a, alone_b = first["win_rate"], back["win_rate"]
+    return {"share": alone_a / max(alone_a + alone_b, 1e-9), "alone": (alone_a, alone_b),
+            "decided": first["wins"] + first["losses"] + back["wins"] + back["losses"]}
 
 RULE_SETS = {
     "standard": dict(points=10, discard_limit=7, friendly_robber=False, balanced_dice=False),

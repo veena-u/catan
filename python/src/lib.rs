@@ -7,6 +7,7 @@ use catan::symmetry::{Symmetry, SYMMETRIES};
 use catan::observation::{OBSERVATION_BYTES, PHASE_AT, TRADE_AT, observe};
 use catan::player::{Player, MAX_PLAYERS};
 use catan::rng::Rng;
+use catan::search;
 use catan::state::{ACTIONS, Action, Actor, MASK_WORDS, MAX_PROPOSED, Phase, Rules, State};
 use catan::topology::topology as board_topology;
 use catan::worlds;
@@ -121,12 +122,32 @@ impl Buffer {
         (observations, masks(py, &words), player_codes(py, &players))
     }
 
+    /// Every game seen by the seat this many places after the player whose turn it is.
+    fn observe_as<'py>(&self, py: Python<'py>, games: PyArrayLike1<'_, u64, AllowTypeChange>, offsets: PyArrayLike1<'_, u8, AllowTypeChange>) -> PyResult<Bound<'py, PyArray2<u8>>> {
+        let (games, offsets) = (games.as_slice()?, offsets.as_slice()?);
+        if games.len() != offsets.len() || games.iter().any(|&g| g as usize >= self.inner.len()) {
+            return Err(PyValueError::new_err("one offset per game, and only games that exist"));
+        }
+        let m = games.len();
+        let mut bytes = vec![0u8; m * OBSERVATION_BYTES];
+        for k in 0..m {
+            let state = self.inner.state(games[k] as usize);
+            let seat = state.current().after(usize::from(offsets[k]), state.players());
+            let out: &mut [u8; OBSERVATION_BYTES] = (&mut bytes[k * OBSERVATION_BYTES..(k + 1) * OBSERVATION_BYTES]).try_into().expect("one observation");
+            observe(state, seat, out);
+        }
+        Ok(PyArray1::from_vec(py, bytes).reshape([m, OBSERVATION_BYTES]).expect("sizes match"))
+    }
+
+    /// The position after each deal with each partner, seen by the proposer, or with `as_partner` by the partner.
+    #[pyo3(signature = (games, deals, partners, as_partner = false))]
     fn trade_views<'py>(
         &self,
         py: Python<'py>,
         games: PyArrayLike1<'_, u64, AllowTypeChange>,
         deals: PyArrayLike2<'_, i8, AllowTypeChange>,
         partners: PyArrayLike1<'_, u8, AllowTypeChange>,
+        as_partner: bool,
     ) -> PyResult<(Bound<'py, PyArray2<u8>>, Bound<'py, PyArray1<bool>>)> {
         let (games, partners, deals) = (games.as_slice()?, partners.as_slice()?, deals.as_array());
         let m = games.len();
@@ -139,11 +160,67 @@ impl Buffer {
             let counts: [i8; 5] = std::array::from_fn(|r| deals[[k, r]]);
             if let Some(after) = state.after_trade(partners[k], counts) {
                 let out: &mut [u8; OBSERVATION_BYTES] = (&mut bytes[k * OBSERVATION_BYTES..(k + 1) * OBSERVATION_BYTES]).try_into().expect("one observation");
-                observe(&after, after.current(), out);
+                let seer = if as_partner { after.current().after(usize::from(partners[k]), after.players()) } else { after.current() };
+                observe(&after, seer, out);
                 ok[k] = true;
             }
         }
         Ok((PyArray1::from_vec(py, bytes).reshape([m, OBSERVATION_BYTES]).expect("sizes match"), PyArray1::from_vec(py, ok)))
+    }
+
+    /// The position after each responder's counter-offer is taken: seen by the responder, and by the player whose turn it is.
+    fn counter_views<'py>(&self, py: Python<'py>, games: PyArrayLike1<'_, u64, AllowTypeChange>, deals: PyArrayLike2<'_, i8, AllowTypeChange>) -> PyResult<(Bound<'py, PyArray2<u8>>, Bound<'py, PyArray2<u8>>, Bound<'py, PyArray1<bool>>)> {
+        let (games, deals) = (games.as_slice()?, deals.as_array());
+        let m = games.len();
+        if deals.shape() != [m, 5] || games.iter().any(|&g| g as usize >= self.inner.len()) {
+            return Err(PyValueError::new_err("five counts per game, and only games that exist"));
+        }
+        let (mut theirs, mut current, mut ok) = (vec![0u8; m * OBSERVATION_BYTES], vec![0u8; m * OBSERVATION_BYTES], vec![false; m]);
+        for k in 0..m {
+            let counts: [i8; 5] = std::array::from_fn(|r| deals[[k, r]]);
+            if let Some((after, responder)) = self.inner.state(games[k] as usize).after_counter(counts) {
+                let at = k * OBSERVATION_BYTES..(k + 1) * OBSERVATION_BYTES;
+                observe(&after, responder, (&mut theirs[at.clone()]).try_into().expect("one observation"));
+                observe(&after, after.current(), (&mut current[at]).try_into().expect("one observation"));
+                ok[k] = true;
+            }
+        }
+        let shape = [m, OBSERVATION_BYTES];
+        Ok((PyArray1::from_vec(py, theirs).reshape(shape).expect("sizes match"), PyArray1::from_vec(py, current).reshape(shape).expect("sizes match"), PyArray1::from_vec(py, ok)))
+    }
+
+    /// Put a single game's position into one of the buffer's slots, so batch tools can work on it.
+    fn load(&mut self, slot: usize, game: &Game) -> PyResult<()> {
+        if slot >= self.inner.len() {
+            return Err(PyValueError::new_err(format!("there is no slot {slot}")));
+        }
+        self.inner.reset(slot, game.state).map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+
+    fn answer_views<'py>(&self, py: Python<'py>, games: PyArrayLike1<'_, u64, AllowTypeChange>) -> PyResult<(Bound<'py, PyArray2<u8>>, Bound<'py, PyArray1<bool>>)> {
+        let games = games.as_slice()?;
+        let m = games.len();
+        let (mut bytes, mut ok) = (vec![0u8; m * OBSERVATION_BYTES], vec![false; m]);
+        for k in 0..m {
+            if let Some((after, responder)) = self.inner.state(games[k] as usize).after_answer() {
+                let out: &mut [u8; OBSERVATION_BYTES] = (&mut bytes[k * OBSERVATION_BYTES..(k + 1) * OBSERVATION_BYTES]).try_into().expect("one observation");
+                observe(&after, responder, out);
+                ok[k] = true;
+            }
+        }
+        Ok((PyArray1::from_vec(py, bytes).reshape([m, OBSERVATION_BYTES]).expect("sizes match"), PyArray1::from_vec(py, ok)))
+    }
+
+    #[pyo3(signature = (games, simulations, worlds = 4, considered = 16, seed = 0, noise = true, value_scale = 0.1, rescale = true))]
+    #[allow(clippy::too_many_arguments)]
+    fn search(&self, py: Python<'_>, games: PyArrayLike1<'_, u64, AllowTypeChange>, simulations: u32, worlds: usize, considered: usize, seed: u64, noise: bool, value_scale: f32, rescale: bool) -> PyResult<Search> {
+        let games = games.as_slice()?;
+        if let Some(&game) = games.iter().find(|&&g| g as usize >= self.inner.len()) {
+            return Err(PyValueError::new_err(format!("there is no game {game}")));
+        }
+        let roots: Vec<State> = games.iter().map(|&g| *self.inner.state(g as usize)).collect();
+        let config = search::Config { simulations, worlds, considered: considered.max(1), noise, value_scale, rescale };
+        Ok(Search { inner: py.detach(|| search::Search::new(&roots, config, seed)) })
     }
 
     fn forbidden<'py>(&self, py: Python<'py>) -> (Bound<'py, numpy::PyArrayDyn<i8>>, Bound<'py, PyArray1<u8>>) {
@@ -269,6 +346,67 @@ impl Worlds {
 }
 
 #[pyclass(module = "catan")]
+struct Search {
+    inner: search::Search,
+}
+
+#[pymethods]
+impl Search {
+    fn __len__(&self) -> usize {
+        self.inner.len()
+    }
+
+    /// The positions that need the network next: observations, legal moves, every other seat's hidden cards
+    /// (for a critic that sees them), and which root each belongs to. Empty once every root is done.
+    fn leaves<'py>(&mut self, py: Python<'py>) -> (Bound<'py, PyArray2<u8>>, Bound<'py, PyArray2<bool>>, Bound<'py, numpy::PyArrayDyn<u8>>, Bound<'py, PyArray1<u64>>) {
+        let inner = &mut self.inner;
+        let leaves = py.detach(|| inner.leaves());
+        let k = leaves.len();
+        let mut bytes = Vec::with_capacity(k * OBSERVATION_BYTES);
+        let mut hidden = Vec::with_capacity(k * (MAX_PLAYERS - 1) * 10);
+        let mut words = Vec::with_capacity(k);
+        for (_, leaf) in &leaves {
+            bytes.extend_from_slice(&leaf.observation);
+            leaf.hidden.iter().for_each(|h| hidden.extend_from_slice(h));
+            words.push(leaf.mask);
+        }
+        let rows = PyArray1::from_iter(py, leaves.iter().map(|&(i, _)| i as u64));
+        (
+            PyArray1::from_vec(py, bytes).reshape([k, OBSERVATION_BYTES]).expect("sizes match"),
+            masks(py, &words),
+            PyArray1::from_vec(py, hidden).reshape(vec![k, MAX_PLAYERS - 1, 10]).expect("sizes match"),
+            rows,
+        )
+    }
+
+    /// The network's log-probabilities over every move and its values (the player to act first) for the leaves.
+    fn expand(&mut self, py: Python<'_>, log_probs: PyArrayLike2<'_, f32, AllowTypeChange>, values: PyArrayLike2<'_, f32, AllowTypeChange>) -> PyResult<()> {
+        let (log_probs, values) = (log_probs.as_array(), values.as_array());
+        if log_probs.ncols() != ACTIONS || values.ncols() < MAX_PLAYERS || log_probs.nrows() != values.nrows() {
+            return Err(PyValueError::new_err(format!("log-probabilities over {ACTIONS} moves and {MAX_PLAYERS} values per leaf")));
+        }
+        let rows: Vec<[f32; ACTIONS]> = log_probs.rows().into_iter().map(|r| std::array::from_fn(|i| r[i])).collect();
+        let vals: Vec<[f32; MAX_PLAYERS]> = values.rows().into_iter().map(|r| std::array::from_fn(|i| r[i])).collect();
+        let inner = &mut self.inner;
+        py.detach(|| inner.expand(&rows, &vals));
+        Ok(())
+    }
+
+    /// Per root: the improved policy over every move, the move the search picks (-1 where it did not search),
+    /// and the value it found for the player to act.
+    fn result<'py>(&self, py: Python<'py>) -> (Bound<'py, PyArray2<f32>>, Bound<'py, PyArray1<i32>>, Bound<'py, PyArray1<f32>>) {
+        let n = self.inner.len();
+        let outcomes: Vec<search::Outcome> = (0..n).map(|r| self.inner.outcome(r)).collect();
+        let policy: Vec<f32> = outcomes.iter().flat_map(|o| o.policy).collect();
+        (
+            PyArray1::from_vec(py, policy).reshape([n, ACTIONS]).expect("sizes match"),
+            PyArray1::from_iter(py, outcomes.iter().map(|o| o.action.map_or(-1, i32::from))),
+            PyArray1::from_iter(py, outcomes.iter().map(|o| o.value)),
+        )
+    }
+}
+
+#[pyclass(module = "catan")]
 struct Game {
     seed: u64,
     state: State,
@@ -382,6 +520,28 @@ impl Game {
             return Err(PyValueError::new_err("only a player's turn can be imagined from"));
         };
         Ok(Worlds { inner: worlds::Worlds::imagine(&self.state, observer, samples, seed) })
+    }
+
+    fn answer_views<'py>(&self, py: Python<'py>, _games: Option<PyArrayLike1<'_, u64, AllowTypeChange>>) -> (Bound<'py, PyArray2<u8>>, Bound<'py, PyArray1<bool>>) {
+        let mut bytes = [0; OBSERVATION_BYTES];
+        let ok = match self.state.after_answer() {
+            Some((after, responder)) => {
+                observe(&after, responder, &mut bytes);
+                true
+            }
+            None => false,
+        };
+        (PyArray1::from_slice(py, &bytes).reshape([1, OBSERVATION_BYTES]).expect("sizes match"), PyArray1::from_slice(py, &[ok]))
+    }
+
+    #[pyo3(signature = (simulations, worlds = 4, considered = 16, seed = 0, noise = true, value_scale = 0.1, rescale = true))]
+    #[allow(clippy::too_many_arguments)]
+    fn search(&self, simulations: u32, worlds: usize, considered: usize, seed: u64, noise: bool, value_scale: f32, rescale: bool) -> PyResult<Search> {
+        if !matches!(self.state.actor(), Some(Actor::Player(_))) {
+            return Err(PyValueError::new_err("only a player's decision can be searched"));
+        }
+        let config = search::Config { simulations, worlds, considered: considered.max(1), noise, value_scale, rescale };
+        Ok(Search { inner: search::Search::new(&[self.state], config, seed) })
     }
 
     fn settle(&mut self) {
@@ -536,6 +696,7 @@ impl GameRules {
 fn catan_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Buffer>()?;
     m.add_class::<Game>()?;
+    m.add_class::<Search>()?;
     m.add_function(wrap_pyfunction!(topology, m)?)?;
     m.add_function(wrap_pyfunction!(geometry, m)?)?;
     m.add_function(wrap_pyfunction!(symmetries, m)?)?;

@@ -11,6 +11,7 @@ import numpy as np
 
 import catan
 from train.agents import Network, Random
+from train.search import Searcher
 from train.evaluate import RULE_SETS, rules_of
 from train.features import (
     ANSWERS_AT, BUDGET_LEFT, LAST_AT, LAST_TRADED, OFFERS_MADE, PROTECTED_AT, RATES_AT, TRADE_AT,
@@ -78,7 +79,8 @@ class Session:
         forbidden = np.zeros((1, MAX_PROPOSED, 5), np.int8)
         if listed:
             forbidden[0, :len(listed)] = listed
-        actions, offers = self.agent(obs[None], mask[None], forbidden, np.array([len(listed)], np.uint8))
+        state = (self.game, None) if getattr(self.agent, "uses_state", False) else ()
+        actions, offers = self.agent(obs[None], mask[None], forbidden, np.array([len(listed)], np.uint8), *state)
         self.take(int(actions[0]), [int(c) for c in offers[0]])
 
     def take(self, code, deal=None):
@@ -349,10 +351,17 @@ def main():
     parser.add_argument("--seed", type=int)
     parser.add_argument("--temperature", type=float, default=0.8, help="how freely the network samples its moves")
     parser.add_argument("--greedy", action="store_true", help="the network always plays its top move")
+    parser.add_argument("--search", type=int, default=0, metavar="SIMULATIONS",
+                        help="the network looks ahead this many simulations before each move; 0 plays its instinct")
+    parser.add_argument("--instinct", action="store_true",
+                        help="the network trades by instinct too, instead of offering, countering and accepting only what it judges good for both sides")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--no-browser", action="store_true")
     args = parser.parse_args()
-    if args.checkpoint:
+    if args.checkpoint and not args.instinct:
+        at = device()
+        agent = Searcher(load(args.checkpoint, at), at, args.search, greedy=args.greedy, temperature=args.temperature)
+    elif args.checkpoint:
         at = device()
         agent = Network(load(args.checkpoint, at), at, greedy=args.greedy, temperature=args.temperature)
     else:

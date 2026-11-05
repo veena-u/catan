@@ -66,9 +66,15 @@ class Block(nn.Module):
 
 class Model(nn.Module):
 
-    def __init__(self, width=128, depth=4, heads=4):
+    def __init__(self, width=128, depth=4, heads=4, pooled=False):
         super().__init__()
         self.width = width
+        # Optionally the kind of move also sees every group of rows pooled (mean and max), as AlphaStar's action type
+        # sees its pooled units, not the summary row alone. It starts at zero, so a network gaining it plays as before.
+        self.pooled = nn.Linear(2 * 5 * width, KIND_COUNT) if pooled else None
+        if pooled:
+            nn.init.zeros_(self.pooled.weight)
+            nn.init.zeros_(self.pooled.bias)
         self.embed_global = nn.Linear(GLOBAL_FEATURES, width)
         self.embed_hex, self.embed_vertex, self.embed_edge = (nn.Linear(n, width) for n in (HEX_FEATURES, VERTEX_FEATURES, EDGE_FEATURES))
         self.embed_player, self.embed_resource = nn.Linear(PLAYER_FEATURES, width), nn.Linear(RESOURCE_FEATURES, width)
@@ -129,7 +135,11 @@ class Model(nn.Module):
             else:
                 scores[:, start:start + count] = point(q, target)
         scores = untwist(scores, symmetry)
-        return factored(self.kind(summary), scores, masks, self.kind_of)
+        kind_logits = self.kind(summary)
+        if self.pooled is not None:
+            groups = (people, goods, hexes, corners, edges)
+            kind_logits = kind_logits + self.pooled(torch.cat([f(g, 1) for g in groups for f in (lambda g, d: g.mean(d), lambda g, d: g.amax(d))], -1))
+        return factored(kind_logits, scores, masks, self.kind_of)
 
     def deal_scores(self, summary, goods, counter, counts):
         n, d = len(summary), self.width
@@ -184,6 +194,15 @@ def device():
 def load(path, at):
     checkpoint = torch.load(path, map_location=at)
     args = checkpoint["args"]
-    model = Model(args["width"], args["depth"]).to(at)
-    model.load_state_dict(checkpoint["model"])
+    model = Model(args["width"], args["depth"], pooled=args.get("pooled_kind", False)).to(at)
+    model.load_state_dict(checkpoint["model"], strict=not args.get("pooled_kind", False))
     return model.eval()
+
+def load_critics(path, at):
+    from .selfplay import Critics
+    checkpoint = torch.load(path, map_location=at)
+    if "critics" not in checkpoint or not checkpoint["args"].get("privileged"):
+        raise ValueError(f"{path} was not trained with --privileged, so it has no critic that sees every hand")
+    critics = Critics(checkpoint["args"]["width"]).to(at)
+    critics.load_state_dict(checkpoint["critics"], strict=False)
+    return critics.eval()

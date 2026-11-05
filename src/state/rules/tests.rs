@@ -868,6 +868,36 @@ fn a_trade_can_be_imagined_without_changing_the_game() {
 }
 
 #[test]
+fn an_answer_can_be_imagined_from_the_responders_side() {
+    let mut state = scenario_of(25, 3);
+    state.hands = seats(&[[2, 0, 0, 0, 0], [0, 0, 0, 0, 1], [0, 0, 0, 0, 0]]);
+    let deal = Deal { give: [1, 0, 0, 0, 0], get: [0, 0, 0, 0, 1] };
+    state.phase = Phase::Respond { deal, responder: Player::Second, accepted: 0, counters: [None; 4], draft: None, closed: false, clicks: 0 };
+    let before = state;
+    let (after, responder) = state.after_answer().expect("the responder holds the ore");
+    assert_eq!(responder, Player::Second);
+    assert_eq!((after.hand(Player::First), after.hand(Player::Second)), ([1, 0, 0, 0, 1], [1, 0, 0, 0, 0]));
+    assert_eq!(state, before);
+    state.phase = Phase::Respond { deal, responder: Player::Third, accepted: 0, counters: [None; 4], draft: None, closed: false, clicks: 0 };
+    assert!(state.after_answer().is_none(), "the third seat has no ore");
+}
+
+#[test]
+fn a_counter_offer_can_be_imagined_as_taken() {
+    let mut state = scenario_of(25, 3);
+    state.hands = seats(&[[2, 0, 0, 0, 0], [0, 0, 0, 0, 3], [0, 0, 0, 0, 0]]);
+    let deal = Deal { give: [1, 0, 0, 0, 0], get: [0, 0, 0, 0, 1] };
+    state.phase = Phase::Respond { deal, responder: Player::Second, accepted: 0, counters: [None; 4], draft: None, closed: false, clicks: 0 };
+    let before = state;
+    assert!(state.after_counter([0, 0, 0, 0, -2]).is_none(), "a counter asking for nothing is not a deal");
+    let (after, responder) = state.after_counter([2, 0, 0, 0, -2]).expect("the responder gives 2 ore for the 2 brick the proposer holds");
+    assert_eq!(responder, Player::Second);
+    assert_eq!((after.hand(Player::First), after.hand(Player::Second)), ([0, 0, 0, 0, 2], [2, 0, 0, 0, 1]));
+    assert!(state.after_counter([3, 0, 0, 0, -1]).is_none(), "the proposer holds only 2 brick");
+    assert_eq!(state, before);
+}
+
+#[test]
 fn there_is_no_cap_on_offers_in_a_turn() {
     let mut state = scenario_of(26, 2);
     known_hands(&mut state, &[[5, 0, 0, 0, 0], [0; 5]]);

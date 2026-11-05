@@ -1,3 +1,5 @@
+import itertools
+
 import numpy as np
 import torch
 
@@ -11,6 +13,9 @@ STOP = 0
 OFFER, COUNTER = 234, 249
 BANK_CARDS = 19
 UNLIKELY = -1e9
+# Every deal of one or two cards for one or two: the candidates a searched offer always considers.
+SMALL = np.array([c for c in itertools.product(range(-2, 3), repeat=RESOURCES)
+                  if 1 <= -sum(min(x, 0) for x in c) <= 2 and 1 <= sum(max(x, 0) for x in c) <= 2], np.int8)
 
 def apply(counts, choice):
     card = (choice - 1).clamp(min=0)
@@ -63,6 +68,26 @@ def sample(logits_for, hand, counter, forbidden, listed, greedy=False, temperatu
         counts[rows] = apply(counts[rows], pick)
         open_rows[rows] = pick != STOP
     return counts, choices, masks
+
+def walk(targets, hand, forbidden, listed, counter=False):
+    n, device = len(targets), targets.device
+    counts = torch.zeros(n, RESOURCES, dtype=torch.long, device=device)
+    choices = torch.full((n, STEPS), -1, dtype=torch.long, device=device)
+    masks = torch.ones(n, STEPS, CHOICES, dtype=torch.bool, device=device)
+    open_rows = torch.ones(n, dtype=torch.bool, device=device)
+    counter = torch.full((n,), counter, dtype=torch.bool, device=device)
+    for k in range(STEPS):
+        left = targets - counts
+        give, ask = left < 0, left > 0
+        pick = torch.where(give.any(1), 1 + give.long().argmax(1),
+                           torch.where(ask.any(1), 1 + RESOURCES + ask.long().argmax(1), STOP))
+        mask = step_mask(counts, hand, counter, forbidden, listed, None)
+        choices[open_rows, k], masks[open_rows, k] = pick[open_rows], mask[open_rows]
+        counts = torch.where(open_rows[:, None], apply(counts, pick), counts)
+        open_rows &= pick != STOP
+        if not open_rows.any():
+            break
+    return choices, masks
 
 def replay(choices):
     n, steps = choices.shape

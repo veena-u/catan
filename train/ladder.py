@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 
 from .agents import Network, Random
-from .evaluate import RULE_SETS, play, rules_of
+from .evaluate import RULE_SETS, matchup, rules_of
 from .model import device, load
 
 def ratings(wins, prior=0.5):
@@ -33,7 +33,7 @@ def main():
     for run in map(Path, args.runs):
         if run.is_dir():
             saved = sorted(run.glob("iter_*.pt"))
-            picks += sorted({saved[round(i)] for i in np.linspace(0, len(saved) - 1, min(args.checkpoints, len(saved)))})
+            picks += sorted({saved[round(i)] for i in np.linspace(len(saved) - 1, 0, min(args.checkpoints, len(saved)))})
         else:
             picks.append(run)
     players = {"random": Random(0)}
@@ -44,10 +44,12 @@ def main():
 
     wins = np.zeros((len(names), len(names)))
     for (i, a), (j, b) in itertools.combinations(enumerate(names), 2):
-        result = play(players[a], players[b], games=args.games, parallel=min(args.games, 512), seed=i * 100 + j,
-                      players=args.players, rules=rules_of(args), max_decisions=args.max_decisions)
-        wins[i, j], wins[j, i] = result["wins"], result["losses"]
-        print(f"{a:>24s} vs {b:<24s} {result['win_rate']:.3f}", flush=True)
+        result = matchup(players[a], players[b], games=args.games, players=args.players, rules=rules_of(args),
+                         seed=i * 100 + j, max_decisions=args.max_decisions)
+        share = result["share"]
+        wins[i, j], wins[j, i] = share * result["decided"], (1 - share) * result["decided"]
+        alone = "" if result["alone"][1] is None else f"   alone {result['alone'][0]:.3f} / {result['alone'][1]:.3f}"
+        print(f"{a:>24s} vs {b:<24s} {share:.3f}{alone}", flush=True)
 
     elo = ratings(wins)
     rates = wins / np.maximum(wins + wins.T, 1)
