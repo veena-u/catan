@@ -33,7 +33,7 @@ TRADES="--offer-search 16 --offer-candidates 8 --answer-search --search-after 25
 # The full recipe: searched moves to learn from, a critic that sees every hand valuing the imagined worlds, final
 # points to predict in place of a points reward, past selves at a fifth of the tables; in 4p, searched trades too.
 if [ "$PLAYERS" = 2 ]; then RECIPE_TRADES="--no-trading --aux-answers 0"; else RECIPE_TRADES="$TRADES --gamma 0.9995"; fi
-CORE="--privileged --aux-points 0.1 --vp-reward 0 --league 0.2 --league-size 4 --league-every 250 --league-switch iteration $RECIPE_TRADES"
+CORE="${PRIVILEGED---privileged} --aux-points 0.1 --vp-reward 0 --league 0.2 --league-size 4 --league-every 250 --league-switch iteration $RECIPE_TRADES"
 RECIPE="$CORE $LOOKAHEAD --lookahead-privileged"
 # The long run starts without the lookahead: search has not yet beaten the plain network at play time. Once a
 # setting does (python -m train.search), restart the run with MORE="<lookahead flags>": it resumes from latest.pt.

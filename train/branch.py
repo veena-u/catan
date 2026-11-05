@@ -55,7 +55,7 @@ def main():
     for pair in args.set:
         key, value = pair.split("=", 1)
         if key.replace("-", "_") not in settings:
-            parser.error(f"{run} has no setting {key}")
+            print(f"{run} has no setting {key}, which is newer than it; adding it", flush=True)
         settings[key.replace("-", "_")] = parse(value)
     settings.update(out=str(out), checkpoint_every=10, wandb_group=args.wandb_group)
     out.mkdir(parents=True, exist_ok=True)

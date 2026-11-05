@@ -239,9 +239,9 @@ class Rollout:
     def __init__(self, model, critics, buffer, at, autocast, players, privileged=False, seed=0,
                  vp_reward=0.0, league=None, league_games=0.0, rank=False, greedy_games=0.0, explore_games=0.0,
                  offer_search=0, offer_candidates=8, answer_search=False, search_margin=0.01, lookahead=None,
-                 points_to_win=10, lone=False, symmetries=6, stubborn=0.0):
+                 points_to_win=10, lone=False, symmetries=6, stubborn=0.0, refrain=False):
         self.model, self.critics, self.buffer, self.at, self.autocast = model, critics, buffer, at, autocast
-        self.offer_search, self.offer_candidates = offer_search, offer_candidates
+        self.offer_search, self.offer_candidates, self.refrain = offer_search, offer_candidates, refrain
         self.answer_search, self.search_margin = answer_search, search_margin
         self.lookahead, self.points_to_win = lookahead, points_to_win
         self.stubborn_games = stubborn
@@ -308,6 +308,11 @@ class Rollout:
         stats["searched_offers"] += len(rows)
         best = self.judge.offers(self.buffer, rows, o, forbidden, counts, self.players, sampled, accept)
         stats["acceptable"] += len(best)
+        if self.refrain:
+            # Where no deal both sides confidently gain from exists, offering only spends the turn: push the offer down.
+            idle = np.setdiff1d(rows, list(best))
+            if len(idle):
+                self.add_targets(search, idle, o, m, np.full(len(idle), OFFER), -np.ones(len(idle)))
         if not best:
             return
         found = np.array(sorted(best))
@@ -809,6 +814,8 @@ def main():
     parser.add_argument("--offer-search", type=int, default=0,
                         help="turns per step where every small deal, with every partner, is scored with the network's own values "
                              "and the best one both sides gain from is taught as an offer; 0 is off")
+    parser.add_argument("--refrain", action="store_true",
+                        help="on searched turns where no deal both sides confidently gain from exists, teach not offering")
     parser.add_argument("--offer-candidates", type=int, default=8, help="offers the policy samples itself, scored alongside the small deals")
     parser.add_argument("--answer-search", action="store_true",
                         help="score accepting every offer with the network's own values, and teach accepting where it gains")
@@ -901,7 +908,8 @@ def main():
                                      considered=args.lookahead_considered, privileged=args.lookahead_privileged,
                                      value_scale=args.lookahead_value_scale, fixed=args.lookahead_fixed)
                       if args.lookahead else None,
-                      points_to_win=rules.points, lone=args.exploit_lone, symmetries=args.trade_symmetries, stubborn=args.stubborn)
+                      points_to_win=rules.points, lone=args.exploit_lone, symmetries=args.trade_symmetries, stubborn=args.stubborn,
+                      refrain=args.refrain)
     rollout.switch_each_iteration = args.league_switch == "iteration"
     pool = load_pool(args.anchors, at)[0] if args.anchors else None
     log = open(out / "log.txt", "a")
