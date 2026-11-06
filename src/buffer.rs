@@ -4,7 +4,6 @@ use std::sync::Mutex;
 use std::thread;
 
 use crate::board::Board;
-use crate::dice::Dice;
 use crate::observation::{observe, OBSERVATION_BYTES};
 use crate::player::Player;
 use crate::rng::Rng;
@@ -71,13 +70,21 @@ pub struct Buffer {
     max_decisions: u32,
 }
 
+/// One outcome of the luck a move leads to (a roll, a steal or a card draw): its weight in the engine's odds, its
+/// outcome code, and the game played on to the next decision or to its end.
+#[derive(Clone, Copy, Debug)]
+pub struct Branch {
+    pub weight: u16,
+    pub code: u16,
+    pub state: State,
+}
+
 struct Game {
     state: State,
     rules: Rules,
     mask: Mask,
     rng: Rng,
     dice_rng: Rng,
-    dice: Dice,
     random_starts: u8,
     randomize: bool,
     deal: Option<u64>,
@@ -87,6 +94,7 @@ struct Game {
     codes: Box<[u16]>,
     checkpoints: Box<[State]>,
     rolls: Vec<u8>,
+    luck: Option<u16>,
 }
 
 impl Buffer {
@@ -109,7 +117,6 @@ impl Buffer {
                     mask: Mask::EMPTY,
                     rng,
                     dice_rng: Rng::new(0),
-                    dice: Dice::new(config.rules.balanced_dice),
                     random_starts: config.random_starts,
                     randomize: false,
                     deal,
@@ -119,6 +126,7 @@ impl Buffer {
                     codes: vec![PAD; config.history].into_boxed_slice(),
                     checkpoints: Vec::new().into_boxed_slice(),
                     rolls: Vec::new(),
+                    luck: None,
                 };
                 game.state = game.fresh(config.players);
                 game.checkpoints = vec![game.state; config.history / CHECKPOINT_EVERY as usize].into_boxed_slice();
@@ -151,6 +159,48 @@ impl Buffer {
 
     pub fn rolls(&self, game: usize) -> &[u8] {
         &self.games[game].rolls
+    }
+
+    /// The outcome code of the first luck the last step's move met in this game, if it met any.
+    pub fn luck(&self, game: usize) -> Option<u16> {
+        self.games[game].luck
+    }
+
+    /// For each game, if `actions` would lead straight to luck, every outcome of it with its odds, each played on to
+    /// the next decision (later luck drawn from `seed`, the same for every outcome, so a branch is a fixed function of
+    /// its outcome); empty where the move leads to a decision. Training subtracts how lucky the real outcome was against
+    /// this average, which leaves the expected result unchanged and removes most of the dice from it.
+    pub fn branches(&self, actions: &[u16], seed: u64) -> Vec<Vec<Branch>> {
+        assert_eq!(actions.len(), self.games.len(), "one action per game");
+        let n = self.games.len();
+        let mut out = vec![Vec::new(); n];
+        let games = &self.games;
+        parallel(&mut out, &mut vec![(); n], |out, _, start| {
+            for (i, branches) in out.iter_mut().enumerate() {
+                let game = start + i;
+                let Some(action) = Action::from_index(actions[game]) else { continue };
+                if matches!(action, Action::Offer | Action::Counter) || !games[game].mask.contains(action) {
+                    continue;
+                }
+                let mut state = games[game].state;
+                state.apply(action);
+                if state.actor() != Some(Actor::Chance) {
+                    continue;
+                }
+                let chances = state.chances();
+                for (code, &weight) in chances.weights().iter().enumerate().filter(|&(_, &w)| w > 0) {
+                    let mut branch = state;
+                    branch.resolve(branch.outcome(code as u16).expect("an outcome of this node"));
+                    let mut rng = Rng::new(mix(seed, game as u64));
+                    while branch.actor() == Some(Actor::Chance) {
+                        let outcome = branch.sample_outcome(&mut rng);
+                        branch.resolve(outcome);
+                    }
+                    branches.push(Branch { weight, code: code as u16, state: branch });
+                }
+            }
+        });
+        out
     }
 
     pub fn step(&mut self, actions: &[u16], endings: &mut [Option<Ending>]) -> Result<(), IllegalAction> {
@@ -295,7 +345,6 @@ impl Game {
             }
         };
         self.round += 1;
-        self.dice = Dice::new(self.rules.balanced_dice);
         self.randomize = self.random_starts > 0 && self.rng.below(100) < usize::from(self.random_starts);
         State::with_rules(board, players, self.rules)
     }
@@ -306,15 +355,17 @@ impl Game {
             self.state.randomize_start(&mut self.rng);
         }
         self.rolls.clear();
+        self.luck = None;
         while let Some(Actor::Chance) = self.state.actor() {
             let outcome = if matches!(self.state.phase(), Phase::Dice) {
-                self.dice.roll(&mut self.dice_rng)
+                self.state.sample_outcome(&mut self.dice_rng)
             } else {
                 self.state.sample_outcome(&mut self.rng)
             };
             if let Outcome::Dice(sum) = outcome {
                 self.rolls.push(sum);
             }
+            self.luck = self.luck.or(Some(outcome.index()));
             self.record(outcome.index());
             self.state.resolve(outcome);
         }
@@ -340,9 +391,10 @@ impl Game {
         let ending = Ending { finish, time: self.time };
         let players = self.state.players();
         let state = self.fresh(players);
-        let rolls = std::mem::take(&mut self.rolls);
+        let (rolls, luck) = (std::mem::take(&mut self.rolls), self.luck);
         self.restart(state);
         self.rolls = rolls;
+        self.luck = luck;
         Some(ending)
     }
 

@@ -2,6 +2,7 @@ import argparse
 import json
 import random
 import threading
+import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -53,6 +54,9 @@ class Session:
         self.new(args.seed, args.seat)
 
     def new(self, seed=None, seat=None):
+        if getattr(self, "game", None) is not None and not self.logged and self.game.steps() > 0:
+            self.log()
+        self.logged = False
         self.seed = random.randrange(1 << 31) if seed is None else int(seed)
         self.human = random.randrange(self.args.players) if seat is None else int(seat)
         self.game = catan.Game(self.seed, self.args.players, rules=self.rules)
@@ -97,6 +101,23 @@ class Session:
         self.game.settle()
         self.narrate()
         self.settled()
+        if self.game.winner() is not None and not self.logged:
+            self.log()
+
+    def log(self):
+        """Every game against a person, finished or left, kept so its style can be measured (python -m train.style --log)."""
+        if not self.args.log:
+            return
+        a, n = self.args, self.args.players
+        entry = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "checkpoint": a.checkpoint, "rules": a.rules,
+                 "trading": self.rules.trading, "greedy": a.greedy, "temperature": a.temperature, "search": a.search,
+                 "seed": self.seed, "players": n, "human": self.human, "winner": self.game.winner(),
+                 "points": [int(self.game.observe_as(s)[288]) for s in range(n)], "record": self.game.record()}
+        path = Path(a.log)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a") as out:
+            out.write(json.dumps(entry) + "\n")
+        self.logged = True
 
     def say(self, seat, text):
         self.events.append({"seat": seat, "text": text})
@@ -347,6 +368,7 @@ def main():
     parser.add_argument("--checkpoint", help="a trained network to play against; without one, a random player")
     parser.add_argument("--players", type=int, default=2)
     parser.add_argument("--rules", choices=list(RULE_SETS), default="colonist-1v1")
+    parser.add_argument("--no-trading", action="store_true", help="no trades between players, as in Colonist 1v1")
     parser.add_argument("--seat", type=int, help="your seat; random if not given")
     parser.add_argument("--seed", type=int)
     parser.add_argument("--temperature", type=float, default=0.8, help="how freely the network samples its moves")
@@ -355,6 +377,7 @@ def main():
                         help="the network looks ahead this many simulations before each move; 0 plays its instinct")
     parser.add_argument("--instinct", action="store_true",
                         help="the network trades by instinct too, instead of offering, countering and accepting only what it judges good for both sides")
+    parser.add_argument("--log", default="games/played.jsonl", help="where every game against you is kept; '' keeps none")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--no-browser", action="store_true")
     args = parser.parse_args()

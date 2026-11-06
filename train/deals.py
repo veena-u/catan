@@ -25,13 +25,20 @@ def apply(counts, choice):
 
 def step_mask(counts, hand, counter, forbidden, listed, cards):
     gave, asked = (counts < 0).any(1), (counts > 0).any(1)
-    valid = torch.where(counter, gave & asked, gave | asked)
+    # As on Colonist, every deal gives something and asks for something.
+    valid = gave & asked
     same = (forbidden.long() == counts[:, None]).all(-1) & (torch.arange(forbidden.shape[1], device=counts.device)[None] < listed[:, None])
     valid &= ~same.any(1)
     gives, asks = (-counts).clamp(min=0).sum(1), counts.clamp(min=0).sum(1)
     give = (counts <= 0) & (-counts < hand) & (gives < SIDE)[:, None]
     ask = (counts >= 0) & (counts < BANK_CARDS - hand) & (asks < SIDE)[:, None]
-    mask = torch.cat([valid[:, None], give, ask], 1)
+    # Cards go in one fixed order, every give before any ask and each side by resource, so each deal is built exactly
+    # one way: its probability is that one path's, and a taught deal (walk) is the path the policy itself would take.
+    # Every deal must give something, so it cannot start asking before it has.
+    order = torch.arange(1, CHOICES, device=counts.device)
+    placed = torch.where(counts < 0, order[None, :RESOURCES], torch.where(counts > 0, order[None, RESOURCES:], 0))
+    cards = torch.cat([give, ask & gave[:, None]], 1) & (order[None] >= placed.amax(1, keepdim=True))
+    mask = torch.cat([valid[:, None], cards], 1)
     mask[~mask.any(1), STOP] = True
     return mask
 

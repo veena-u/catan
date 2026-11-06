@@ -58,7 +58,7 @@ fn every_searchable_root_spends_its_whole_budget() {
     for players in [2, 4] {
         let buffer = played(players, 24, 150, players as u64);
         let roots: Vec<State> = (0..buffer.len()).map(|g| *buffer.state(g)).collect();
-        let config = Config { simulations: 12, worlds: 3, considered: 8, noise: true, value_scale: 0.1, rescale: true };
+        let config = Config { simulations: 12, worlds: 3, considered: 8, noise: true, value_scale: 0.1, rescale: true, exact: false };
         let mut search = Search::new(&roots, config, 5);
         let rounds = run_uniform(&mut search);
         assert!(rounds <= 1 + config.simulations, "{rounds} rounds");
@@ -102,7 +102,7 @@ fn the_lookahead_finds_a_winning_move() {
             if legal.len() < 2 || !legal.iter().any(wins) || legal.iter().all(wins) {
                 continue;
             }
-            let config = Config { simulations: 2 * legal.len() as u32, worlds: 1, considered: legal.len(), noise: false, value_scale: 0.1, rescale: true };
+            let config = Config { simulations: 2 * legal.len() as u32, worlds: 1, considered: legal.len(), noise: false, value_scale: 0.1, rescale: true, exact: false };
             let mut search = Search::new(&[state], config, seed);
             run_uniform(&mut search);
             let chosen = Action::from_index(search.outcome(0).action.unwrap()).unwrap();
@@ -132,11 +132,111 @@ fn trade_answers_are_left_to_the_policy() {
         if !matches!(state.phase(), Phase::Respond { .. }) {
             continue;
         }
-        let mut search = Search::new(&[state], Config { simulations: 8, worlds: 2, considered: 4, noise: true, value_scale: 0.1, rescale: true }, 0);
+        let mut search = Search::new(&[state], Config { simulations: 8, worlds: 2, considered: 4, noise: true, value_scale: 0.1, rescale: true, exact: false }, 0);
         run_uniform(&mut search);
         assert!(search.outcome(0).action.is_none(), "an answer is not searched");
         answered += 1;
     }
     assert!(answered > 0);
     let _ = Mask::EMPTY;
+}
+
+/// Every legal move equally likely, and every position worth its last roll (all seats alike): a chance node's exact
+/// value is then the odds-weighted average of its sums.
+fn run_by_roll(search: &mut Search) {
+    loop {
+        let leaves = search.leaves();
+        if leaves.is_empty() {
+            return;
+        }
+        let log_probs: Vec<[f32; ACTIONS]> = leaves
+            .iter()
+            .map(|(_, leaf)| {
+                let legal = legal_of(leaf.mask);
+                let mut row = [-1e9; ACTIONS];
+                legal.iter().for_each(|&i| row[i] = -(legal.len() as f32).ln());
+                row
+            })
+            .collect();
+        let values: Vec<[f32; MAX_PLAYERS]> =
+            leaves.iter().map(|(_, leaf)| [f32::from(leaf.observation[crate::observation::DICE_AT + 11]) / 12.0; MAX_PLAYERS]).collect();
+        search.expand(&log_probs, &values);
+    }
+}
+
+#[test]
+fn an_exact_search_values_a_roll_by_every_outcome_and_its_odds() {
+    let rules = Rules::COLONIST_1V1;
+    let config = BufferConfig { games: 64, history: 64, max_decisions: 5_000, seed: 9, players: 2, paired: false, rules, random_starts: 0 };
+    let mut buffer = Buffer::new(config);
+    let mut rng = Rng::new(9);
+    let mut endings = vec![None; 64];
+    let mut checked = 0;
+    for _ in 0..300 {
+        for game in 0..buffer.len() {
+            let state = *buffer.state(game);
+            let legal: Vec<Action> = state.legal_actions().iter().filter(|&a| a != Action::Offer).collect();
+            if legal.len() < 2 || !matches!(state.phase(), Phase::Turn { rolled: true }) {
+                continue;
+            }
+            let config = Config { simulations: 1, worlds: 1, considered: 1, noise: false, value_scale: 0.1, rescale: true, exact: true };
+            let mut search = Search::new(&[state], config, 1);
+            run_by_roll(&mut search);
+            let outcome = search.outcome(0);
+            let Some(code) = outcome.action else { continue };
+            let mut after = state;
+            after.apply(Action::from_index(code).unwrap());
+            if after.actor() != Some(Actor::Chance) || !matches!(after.phase(), Phase::Dice) {
+                continue;
+            }
+            let chances = after.chances();
+            let (mut sum, mut mass) = (0.0, 0.0);
+            let mut direct = true;
+            for (i, &w) in chances.weights().iter().enumerate().filter(|&(_, &w)| w > 0) {
+                let mut child = after;
+                child.resolve(child.outcome(i as u16).unwrap());
+                match child.actor() {
+                    Some(Actor::Player(_)) => sum += f32::from(w) * (i as f32 + 2.0) / 12.0,
+                    _ => direct = false,
+                }
+                mass += f32::from(w);
+            }
+            if !direct {
+                continue;
+            }
+            assert!((outcome.value - sum / mass).abs() < 1e-4, "{} against the exact {}", outcome.value, sum / mass);
+            checked += 1;
+        }
+        let actions: Vec<u16> = (0..buffer.len())
+            .map(|g| {
+                let legal: Vec<Action> = buffer.mask(g).iter().filter(|a| *a != Action::Offer).collect();
+                legal[rng.below(legal.len())].index()
+            })
+            .collect();
+        buffer.step(&actions, &mut endings).unwrap();
+        if checked > 50 {
+            break;
+        }
+    }
+    assert!(checked > 10, "only {checked} moves into a roll were checked");
+}
+
+#[test]
+fn an_exact_search_spends_its_whole_budget_too() {
+    for players in [2, 4] {
+        let buffer = played(players, 24, 150, players as u64);
+        let roots: Vec<State> = (0..buffer.len()).map(|g| *buffer.state(g)).collect();
+        let config = Config { simulations: 12, worlds: 3, considered: 8, noise: true, value_scale: 0.1, rescale: true, exact: true };
+        let mut search = Search::new(&roots, config, 5);
+        run_uniform(&mut search);
+        for (root, state) in roots.iter().enumerate() {
+            let total: f32 = search.outcome(root).policy.iter().sum();
+            assert!((total - 1.0).abs() < 1e-3, "the policy sums to {total}");
+            let searchable = state.legal_actions().iter().filter(|&a| a != Action::Offer).count() >= 2
+                && !matches!(state.phase(), Phase::Draft { .. } | Phase::Respond { .. } | Phase::Confirm { .. });
+            if searchable {
+                assert_eq!(search.visits(root), config.simulations);
+            }
+        }
+    }
 }

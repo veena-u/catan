@@ -64,7 +64,8 @@ class Network:
             actions = torch.multinomial((log_probs / self.temperature).softmax(1), 1, generator=self.generator).squeeze(1).numpy()
         def logits_for(rows, counts):
             at = torch.from_numpy(rows).to(self.device)
-            return self.model.deal_scores(summary[at], goods[at], torch.from_numpy(actions[rows] == deals.COUNTER).to(self.device), counts)
+            return self.model.deal_scores(summary[at], goods[at], torch.from_numpy(actions[rows] == deals.COUNTER).to(self.device), counts,
+                                          torch.from_numpy(obs[rows, 222:227]).to(self.device))
         offers, _, _ = deals.choose(actions, obs, forbidden, counts, logits_for, self.device, greedy=self.greedy,
                                     temperature=self.temperature, generator=self.generator)
         return actions, offers

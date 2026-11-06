@@ -915,15 +915,18 @@ fn there_is_no_cap_on_offers_in_a_turn() {
 }
 
 #[test]
-fn an_open_offer_can_only_be_answered_with_a_counter() {
+fn an_offer_names_both_sides_and_a_counter_answers_it() {
     let mut state = scenario_of(26, 2);
     known_hands(&mut state, &[[0, 0, 2, 0, 0], [1, 1, 0, 0, 0]]);
-    offer(&mut state, [0, 0, 1, 0, 0], [0; 5]);
-    let options: Vec<Action> = state.legal_actions().iter().collect();
-    assert_eq!(options, [Action::Decline, Action::Counter], "one wool for anything names nothing to accept");
+    state.apply(Action::Offer);
+    act(&mut state, Action::Give(Resource::Wool));
+    assert!(!state.legal_actions().contains(Action::Send), "one wool for nothing named: no open offers, as on Colonist");
+    act(&mut state, Action::Ask(Resource::Brick));
+    act(&mut state, Action::Send);
     act(&mut state, Action::Counter);
     act(&mut state, Action::Give(Resource::Brick));
     assert!(!state.legal_actions().contains(Action::Send), "a counter names both sides");
+    act(&mut state, Action::Ask(Resource::Wool));
     act(&mut state, Action::Ask(Resource::Wool));
     state.validate().unwrap();
     act(&mut state, Action::Send);
@@ -931,7 +934,7 @@ fn an_open_offer_can_only_be_answered_with_a_counter() {
     let options: Vec<Action> = state.legal_actions().iter().collect();
     assert_eq!(options, [Action::TakeCounter(1), Action::Cancel]);
     act(&mut state, Action::TakeCounter(1));
-    assert_eq!(state.hands, seats(&[[1, 0, 1, 0, 0], [0, 1, 1, 0, 0]]));
+    assert_eq!(state.hands, seats(&[[1, 0, 0, 0, 0], [0, 1, 2, 0, 0]]));
     state.validate().unwrap();
 }
 
@@ -982,11 +985,8 @@ fn a_whole_offer_is_made_in_one_step_and_a_repeat_is_dropped() {
     state.apply(Action::Offer);
     assert_eq!(state.finish_deal([-3, 0, 0, 0, 0]).last(), Some(&Action::Abandon), "more brick than in hand stops the offer");
     state.apply(Action::Offer);
-    state.finish_deal([-2, 0, 0, 0, 0]);
-    assert!(matches!(state.phase, Phase::Respond { .. }), "an open offer: two brick for anything");
-    assert_eq!(state.forbidden_deals(), [[2, 0, 0, 0, 0]], "a counter can't simply accept");
-    act(&mut state, Action::Counter);
-    assert_eq!(state.finish_deal([2, 0, 0, 0, -1]).last(), Some(&Action::Send), "two brick for the ore");
+    assert_eq!(state.finish_deal([-2, 0, 0, 0, 0]).last(), Some(&Action::Abandon), "two brick for nothing named is no offer");
+    assert_eq!(state.phase, Phase::Turn { rolled: true });
     state.validate().unwrap();
 }
 
@@ -1062,4 +1062,74 @@ fn everyone_sees_the_offer_and_each_answer_but_no_one_sees_a_draft() {
     assert_eq!(&mine[TRADE_AT..TRADE_AT + 10], &[1, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
     let status = |seat: usize| mine[TRADE_AT + 10 + 11 * (seat - 1)];
     assert_eq!((status(1), status(2), status(3)), (2, 1, 0), "the next seat accepted, the one after is still to answer");
+}
+
+
+fn balanced_dice_game() -> State {
+    let mut state = new_game(3);
+    state.rules = Rules::COLONIST_1V1;
+    state.phase = Phase::Dice;
+    state
+}
+
+#[test]
+fn balanced_dice_deal_from_a_deck_reshuffled_when_twelve_remain() {
+    let mut state = balanced_dice_game();
+    let mut rng = Rng::new(9);
+    let mut dealt = [0u8; 11];
+    for k in 0..24 {
+        let Outcome::Dice(sum) = state.sample_outcome(&mut rng) else { unreachable!() };
+        dealt[usize::from(sum - 2)] += 1;
+        state.record_roll(sum);
+        if k < 23 {
+            assert!(state.dice.remaining().iter().sum::<u8>() > RESHUFFLE_AT);
+        }
+    }
+    assert!(dealt.iter().zip(DICE).all(|(&d, full)| d <= full), "no sum comes up more often than the deck holds");
+    assert_eq!(state.dice.remaining(), DICE, "with twelve cards left the deck is reshuffled");
+    assert_eq!(state.dice.rolls(), 24);
+}
+
+#[test]
+fn the_sum_rolled_last_is_less_likely_to_come_again() {
+    let mut state = balanced_dice_game();
+    assert_eq!(state.chances().weights()[6], 500);
+    state.record_roll(8);
+    assert_eq!(state.chances().weights()[6], 280, "four eights left, at 70%");
+    assert_eq!(state.chances().weights()[4], 500);
+}
+
+#[test]
+fn one_on_one_sevens_lean_toward_the_player_who_has_had_fewer() {
+    let mut state = balanced_dice_game();
+    state.current = Player::First;
+    state.record_roll(7);
+    state.record_roll(7);
+    assert_eq!(state.dice.streak(), Some((Player::First, 2)));
+    let first = state.chances().weights()[5];
+    state.current = Player::Second;
+    let second = state.chances().weights()[5];
+    // Four sevens left at 70% after a seven: the first player, with every seven and two in a row, is held to the
+    // floor of 20%; the second, with none, gets 150%.
+    assert_eq!((first, second), (56, 420));
+    let mut four = game_of(3, 4);
+    four.rules = Rules { balanced_dice: true, ..Rules::STANDARD };
+    four.phase = Phase::Dice;
+    four.record_roll(7);
+    assert_eq!(four.chances().weights()[5], 350, "five sevens left at 70%: only 1v1 balances the sevens");
+}
+
+#[test]
+fn the_dice_are_observed_as_counted() {
+    let mut state = balanced_dice_game();
+    state.current = Player::Second;
+    state.record_roll(7);
+    state.record_roll(8);
+    let mut out = [0; OBSERVATION_BYTES];
+    observe(&state, Player::First, &mut out);
+    let at = crate::observation::DICE_AT;
+    assert_eq!(out[at + 5..at + 7], [5, 4]);
+    assert_eq!(out[at + 11], 8);
+    assert_eq!(out[at + 12..at + 14], [0, 1], "the observer has no sevens, the next seat one");
+    assert_eq!(out[at + 16..at + 18], [2, 1], "one seven in a row, by the seat after the observer");
 }

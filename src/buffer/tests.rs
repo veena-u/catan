@@ -78,3 +78,44 @@ fn paired_games_share_their_board_and_their_rolls_whatever_is_played() {
     }
     assert_ne!(rolls[0][..10], rolls[players][..10], "another group rolls differently");
 }
+
+#[test]
+fn a_move_into_luck_branches_on_every_outcome_and_the_real_one_is_among_them() {
+    let rules = crate::state::Rules::COLONIST_1V1;
+    let mut buffer = Buffer::new(Config { games: 64, history: 64, max_decisions: 5_000, seed: 3, players: 2, paired: false, rules, random_starts: 0 });
+    let mut rng = Rng::new(4);
+    let (mut lucky, mut matched) = (0, 0);
+    let mut endings = vec![None; 64];
+    for round in 0..400 {
+        let actions: Vec<u16> = (0..64)
+            .map(|g| {
+                let legal: Vec<Action> = buffer.mask(g).iter().collect();
+                legal[rng.below(legal.len())].index()
+            })
+            .collect();
+        let branches = buffer.branches(&actions, round);
+        for (g, b) in branches.iter().enumerate() {
+            if b.is_empty() {
+                continue;
+            }
+            let mut after = *buffer.state(g);
+            after.apply(Action::from_index(actions[g]).unwrap());
+            let odds = after.chances();
+            assert_eq!(b.iter().map(|x| u32::from(x.weight)).sum::<u32>(), odds.total(), "the branches carry the whole odds");
+            assert!(b.iter().all(|x| x.state.actor() != Some(Actor::Chance)), "each branch is played on past its luck");
+        }
+        buffer.step(&actions, &mut endings).unwrap();
+        for (g, b) in branches.iter().enumerate() {
+            match (b.is_empty(), buffer.luck(g)) {
+                (true, _) => {}
+                (false, None) => panic!("game {g} branched but met no luck"),
+                (false, Some(code)) => {
+                    lucky += 1;
+                    matched += usize::from(b.iter().any(|x| x.code == code));
+                }
+            }
+        }
+    }
+    assert!(lucky > 1000, "{lucky} moves met luck");
+    assert_eq!(matched, lucky, "the outcome that happened is always one of the branches");
+}

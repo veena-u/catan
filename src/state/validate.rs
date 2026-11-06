@@ -6,7 +6,7 @@ use crate::player::{Player, MAX_PLAYERS};
 use crate::resource::{Resource, RESOURCE_CARDS};
 use crate::topology::topology;
 
-use super::rules::{award, longest_road, Deal, MAX_PROPOSED, MAX_SIDE};
+use super::rules::{award, longest_road, Deal, DICE, MAX_PROPOSED, MAX_SIDE, RESHUFFLE_AT};
 use super::{Actor, Phase, State};
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -31,7 +31,23 @@ impl State {
         self.validate_board()?;
         self.validate_cards()?;
         self.validate_knowledge()?;
+        self.validate_dice()?;
         self.validate_turn()
+    }
+
+    fn validate_dice(&self) -> Result<(), Violation> {
+        let dice = &self.dice;
+        ensure(dice.drawn.iter().zip(DICE).all(|(&d, full)| d <= full), || "more of a sum dealt than the dice deck holds".into())?;
+        ensure(self.rules.balanced_dice || dice.drawn == [0; 11], || "a dice deck in use without balanced dice".into())?;
+        ensure(dice.remaining().iter().sum::<u8>() > RESHUFFLE_AT, || "a dice deck past its reshuffle".into())?;
+        ensure(dice.last == 0 || (2..=12).contains(&dice.last), || format!("a last roll of {}", dice.last))?;
+        let sevens: u16 = dice.sevens.iter().map(|&s| u16::from(s)).sum();
+        ensure(sevens <= dice.rolls || dice.rolls == u16::MAX, || "sevens not among the rolls".into())?;
+        ensure((self.players()..MAX_PLAYERS).all(|p| dice.sevens[p] == 0), || "sevens for an empty seat".into())?;
+        match dice.streak() {
+            None => ensure(sevens == 0 && dice.streak == 0, || "sevens without a roller".into()),
+            Some((p, run)) => ensure(run >= 1 && run <= dice.sevens(p), || format!("a streak of {run} sevens")),
+        }
     }
 
     fn validate_seats(&self) -> Result<(), Violation> {

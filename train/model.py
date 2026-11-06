@@ -8,7 +8,7 @@ import catan
 
 from .deals import COUNT_OFFSET, STOP, replay, step_log_probs
 from .features import (
-    EDGE_FEATURES, EDGES, GLOBAL_FEATURES, HEX_FEATURES, HEXES, PLAYER_FEATURES, RESOURCE_FEATURES, RESOURCES, SEATS,
+    COSTS, EDGE_FEATURES, EDGES, GLOBAL_FEATURES, HEX_FEATURES, HEXES, PLAYER_FEATURES, RESOURCE_FEATURES, RESOURCES, SEATS,
     TOKEN_RELATIONS, TOKENS, VERTEX_FEATURES, VERTICES, decode, players, resources, symmetry_tables, token_relations,
 )
 
@@ -94,8 +94,9 @@ class Model(nn.Module):
         self.value = nn.Linear(width, SEATS)
         self.deal_query = nn.Linear(width, 2 * width)
         self.count_embed = nn.Parameter(torch.randn(RESOURCES, 2 * COUNT_OFFSET + 1, width) * 0.02)
-        self.stop_hidden, self.stop_out = nn.Linear(width, width), nn.Linear(width, 1)
-        self.card_hidden, self.card_out = nn.Linear(2 * width, width), nn.Linear(width, 2)
+        # Beside the deal so far, the deal's arithmetic: what it leaves in hand, and what that hand can build.
+        self.stop_hidden, self.stop_out = nn.Linear(width + DEAL_WHOLE, width), nn.Linear(width, 1)
+        self.card_hidden, self.card_out = nn.Linear(2 * width + DEAL_EACH + DEAL_WHOLE, width), nn.Linear(width, 2)
         self.register_buffer("kind_of", torch.from_numpy(KINDS), persistent=False)
 
     def forward(self, obs, masks=None, symmetry=None, with_goods=False):
@@ -141,20 +142,23 @@ class Model(nn.Module):
             kind_logits = kind_logits + self.pooled(torch.cat([f(g, 1) for g in groups for f in (lambda g, d: g.mean(d), lambda g, d: g.amax(d))], -1))
         return factored(kind_logits, scores, masks, self.kind_of)
 
-    def deal_scores(self, summary, goods, counter, counts):
+    def deal_scores(self, summary, goods, counter, counts, hand):
         n, d = len(summary), self.width
         query = self.deal_query(summary).view(n, 2, d)[torch.arange(n, device=summary.device), counter.long()]
         shape = counts.shape[:-1]
         query = query.view(n, *([1] * (len(shape) - 1)), d)
         h = query + self.count_embed[torch.arange(RESOURCES, device=counts.device), counts + COUNT_OFFSET].sum(-2)
-        stop = self.stop_out(nn.functional.gelu(self.stop_hidden(h))).squeeze(-1)
+        each, whole = deal_features(hand.view(n, *([1] * (len(shape) - 1)), RESOURCES), counts)
+        each, whole = each.to(h.dtype), whole.to(h.dtype)
+        stop = self.stop_out(nn.functional.gelu(self.stop_hidden(torch.cat([h, whole], -1)))).squeeze(-1)
         rows = goods.view(n, *([1] * (len(shape) - 1)), RESOURCES, d).expand(*shape, RESOURCES, d)
-        both = torch.cat([h.unsqueeze(-2).expand(*shape, RESOURCES, d), rows], -1)
+        both = torch.cat([h.unsqueeze(-2).expand(*shape, RESOURCES, d), rows, each,
+                          whole.unsqueeze(-2).expand(*shape, RESOURCES, DEAL_WHOLE)], -1)
         cards = self.card_out(nn.functional.gelu(self.card_hidden(both)))
         return stop, torch.cat([cards[..., 0], cards[..., 1]], -1)
 
-    def deal_log_probs(self, summary, goods, counter, choices, masks):
-        stop, cards = self.deal_scores(summary, goods, counter, replay(choices))
+    def deal_log_probs(self, summary, goods, counter, choices, masks, hand):
+        stop, cards = self.deal_scores(summary, goods, counter, replay(choices), hand)
         n, steps = choices.shape
         log_probs = step_log_probs(stop.reshape(-1), cards.reshape(n * steps, -1), masks.reshape(n * steps, -1)).view(n, steps, -1)
         taken = choices >= 0
@@ -162,6 +166,19 @@ class Model(nn.Module):
         entropy = -(log_probs.exp() * log_probs).sum(-1)
         steps_taken = taken.sum(1).clamp(min=1)
         return torch.where(taken, chosen, 0.0).sum(1), torch.where(taken, entropy, 0.0).sum(1) / steps_taken
+
+DEAL_EACH, DEAL_WHOLE = 2, 2 * len(COSTS)
+
+def deal_features(hand, counts):
+    """What a deal does to the hand (rules arithmetic, no judgement): each resource's count after it and its change,
+    and for each build (road, settlement, city, development card) the cards still missing after it, and how many fewer
+    than before it."""
+    hand, counts = hand.float(), counts.float()
+    after = (hand + counts).clamp(min=0)
+    missing = lambda held: (COSTS.to(held.device) - held.unsqueeze(-2)).clamp(min=0).sum(-1).float()
+    each = torch.stack([after / 10, counts / 4], -1)
+    whole = torch.cat([missing(after) / 5, (missing(hand.expand_as(after)) - missing(after)) / 5], -1)
+    return each, whole
 
 KIND_MEMBERS = torch.from_numpy(np.eye(KIND_COUNT, dtype=np.float32)[KINDS])
 
@@ -191,11 +208,21 @@ def device():
         return torch.device("mps")
     return torch.device("cpu")
 
+def widen(weights, model):
+    """An older network's weights for this model, with zeros for the inputs added since (always at the end of a row):
+    it plays exactly as before and can learn to use them. Also whether anything was widened."""
+    own, widened = model.state_dict(), False
+    for name, w in list(weights.items()):
+        if name in own and w.dim() == 2 and w.shape[0] == own[name].shape[0] and w.shape[1] < own[name].shape[1]:
+            weights[name] = torch.cat([w, w.new_zeros(w.shape[0], own[name].shape[1] - w.shape[1])], 1)
+            widened = True
+    return weights, widened
+
 def load(path, at):
     checkpoint = torch.load(path, map_location=at)
     args = checkpoint["args"]
     model = Model(args["width"], args["depth"], pooled=args.get("pooled_kind", False)).to(at)
-    model.load_state_dict(checkpoint["model"], strict=not args.get("pooled_kind", False))
+    model.load_state_dict(widen(checkpoint["model"], model)[0], strict=not args.get("pooled_kind", False))
     return model.eval()
 
 def load_critics(path, at):

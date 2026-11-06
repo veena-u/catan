@@ -5,10 +5,11 @@ use crate::player::{Player, MAX_PLAYERS};
 use crate::resource::Resource;
 use crate::state::{Deal, Phase, State};
 
-pub const OBSERVATION_BYTES: usize = 369;
+pub const OBSERVATION_BYTES: usize = 387;
 
 pub const TRADE_AT: usize = 302;
 pub const PHASE_AT: usize = 296;
+pub const DICE_AT: usize = 369;
 
 pub const PHASES: [&str; 16] = [
     "PlaceSettlement",
@@ -156,6 +157,14 @@ pub fn observe(state: &State, observer: Player, out: &mut [u8; OBSERVATION_BYTES
     ]);
     put(&Resource::ALL.map(|r| state.rate(observer, r)));
     put(&per_seat(&|p| u8::from(state.protected(p))));
+
+    // The dice as a player counting every roll sees them: the deck's cards left, the last sum, each seat's sevens,
+    // and whose sevens are in a row.
+    let dice = state.dice();
+    put(&dice.remaining());
+    put(&[dice.last().unwrap_or(0)]);
+    put(&per_seat(&|p| dice.sevens(p)));
+    put(&dice.streak().map_or([0, 0], |(p, run)| [1 + relative(p), run]));
     debug_assert_eq!(at, OBSERVATION_BYTES);
 }
 

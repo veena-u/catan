@@ -19,7 +19,7 @@ from .search import run
 from .trades import Judge
 from .evaluate import RULE_SETS, TURN_BUDGET, matchup, play, rules_of
 from .features import ANSWERS_AT, BUDGET_LEFT, EDGE_ENDS, HEX_VERTEX, VERTEX_VERTEX, LAST_ACCEPTED, LAST_COUNTERED, OFFERS_MADE, SEATS, SYMMETRIES
-from .model import KIND_COUNT, KIND_MEMBERS, KIND_RUNS, KINDS, Model, device, load
+from .model import KIND_COUNT, KIND_MEMBERS, KIND_RUNS, KINDS, Model, device, load, widen
 
 HIDDEN = (SEATS - 1) * 10
 TRADED = np.isin(KINDS, (22, 23))
@@ -226,7 +226,8 @@ class League:
             moves[greedy] = logits[torch.from_numpy(greedy)].argmax(1).numpy()
         def logits_for(rows, counts):
             at = torch.from_numpy(rows).to(self.at)
-            return model.deal_scores(summary[at].float(), goods[at].float(), torch.from_numpy(moves[rows] == COUNTER).to(self.at), counts)
+            return model.deal_scores(summary[at].float(), goods[at].float(), torch.from_numpy(moves[rows] == COUNTER).to(self.at), counts,
+                                     torch.from_numpy(obs[rows, 222:227]).to(self.at))
         offers, _, _ = deals.choose(moves, obs, forbidden, counts, logits_for, self.at, generator=self.generator)
         return moves, offers
 
@@ -239,9 +240,10 @@ class Rollout:
     def __init__(self, model, critics, buffer, at, autocast, players, privileged=False, seed=0,
                  vp_reward=0.0, league=None, league_games=0.0, rank=False, greedy_games=0.0, explore_games=0.0,
                  offer_search=0, offer_candidates=8, answer_search=False, search_margin=0.01, lookahead=None,
-                 points_to_win=10, lone=False, symmetries=6, stubborn=0.0, refrain=False):
+                 points_to_win=10, lone=False, symmetries=6, stubborn=0.0, refrain=False, luck=False, judged_deals=False):
         self.model, self.critics, self.buffer, self.at, self.autocast = model, critics, buffer, at, autocast
         self.offer_search, self.offer_candidates, self.refrain = offer_search, offer_candidates, refrain
+        self.luck, self.judged_deals = luck, judged_deals
         self.answer_search, self.search_margin = answer_search, search_margin
         self.lookahead, self.points_to_win = lookahead, points_to_win
         self.stubborn_games = stubborn
@@ -286,17 +288,18 @@ class Rollout:
         # partner says yes.
         if len(rows) == 0:
             return
+        stats["offer_positions"] += len(rows)
         rows = self.rng.choice(rows, min(self.offer_search, len(rows)), replace=False)
         k, at = self.offer_candidates, self.at
         sampled = None
         if k:
             repeat = lambda x: x.repeat_interleave(k, 0)
             index = self.tensor(rows)
-            s, g = repeat(summary[index]), repeat(goods[index])
+            s, g, hands = repeat(summary[index]), repeat(goods[index]), repeat(self.tensor(o[rows, 222:227]).long())
             with torch.autocast(at.type, dtype=torch.bfloat16, enabled=self.autocast):
                 chosen, _, _ = deals.sample(
-                    lambda r, c: self.model.deal_scores(s[r], g[r], torch.zeros(len(r), dtype=torch.bool, device=at), c),
-                    repeat(self.tensor(o[rows, 222:227]).long()), torch.zeros(len(rows) * k, dtype=torch.bool, device=at),
+                    lambda r, c: self.model.deal_scores(s[r], g[r], torch.zeros(len(r), dtype=torch.bool, device=at), c, hands[r]),
+                    hands, torch.zeros(len(rows) * k, dtype=torch.bool, device=at),
                     repeat(self.tensor(forbidden[rows])), repeat(self.tensor(counts[rows]).long()))
             sampled = chosen.view(len(rows), k, -1).cpu().numpy().astype(np.int8)
 
@@ -385,6 +388,38 @@ class Rollout:
             pending[game] = -1
 
     @torch.no_grad()
+    def values_of(self, obs, hidden):
+        """Every seat's value, relative to the player to act, as `evaluate` gives it."""
+        with torch.autocast(self.at.type, dtype=torch.bfloat16, enabled=self.autocast):
+            _, values, summary = self.model(obs, None)
+        if self.privileged:
+            values = self.critics.privileged(summary, hidden)
+        return values.float()
+
+    @torch.no_grad()
+    def lucky(self, branches, codes):
+        """How much better the luck each game's last move met came out than its odds-weighted average, for every
+        seat, valued as the rollout values positions: zero where the move met no luck. Its expectation is zero, so
+        taking it out of the returns leaves what is learned unbiased and removes most of the dice from it."""
+        games, branch_codes, weights, actors, winners, views, hidden = branches
+        luck = torch.zeros(self.games, SEATS, device=self.at)
+        if len(games) == 0:
+            return luck
+        value = torch.zeros(len(games), SEATS, device=self.at)
+        alive = actors >= 0
+        if alive.any():
+            v = self.values_of(self.tensor(views[alive]), self.tensor(hidden[alive]))
+            value[self.tensor(alive)] = to_absolute(v, self.tensor(actors[alive].astype(np.int64)), self.players)
+        for row in np.flatnonzero(winners >= 0):
+            value[row] = rewards(int(winners[row]), self.players).to(self.at)
+        g, w = self.tensor(games.astype(np.int64)), self.tensor(weights)
+        mean = torch.zeros(self.games, SEATS, device=self.at).index_add_(0, g, value * w[:, None])
+        mean = mean / torch.zeros(self.games, device=self.at).index_add_(0, g, w).clamp(min=1e-9)[:, None]
+        happened = branch_codes == codes[games]
+        luck[g[self.tensor(happened)]] = value[self.tensor(happened)] - mean[g[self.tensor(happened)]]
+        return luck
+
+    @torch.no_grad()
     def evaluate(self, obs, masks, hidden=None):
         with torch.autocast(self.at.type, dtype=torch.bfloat16, enabled=self.autocast):
             logits, values, summary, goods = self.model(obs, masks, with_goods=True)
@@ -437,13 +472,14 @@ class Rollout:
         offer_masks = torch.ones(rounds, n, deals.STEPS, deals.CHOICES, dtype=torch.bool, device=at)
         offer_counts = torch.zeros(rounds, n, deals.RESOURCES, dtype=torch.int8, device=at)
         points, point_ends = torch.zeros(rounds, n, SEATS, device=at), torch.zeros(rounds, n, SEATS, device=at)
+        luck = torch.zeros(rounds, n, SEATS, device=at)
         stats = {"won": 0, "truncated": 0, "first_won": 0, "trades": 0, "league": 0, "league_network_won": 0, "explored": 0,
                  "offer_cards": 0, "offers_built": 0, "looked_ahead": 0, "search_agreed": 0}
         habits = Habits()
         learn = torch.ones(rounds, n, dtype=torch.bool, device=at)
         pending, tally, trades = np.full((n, 3), -1), np.zeros(ANSWERS, np.int64), []
         search, expert = [], []
-        stats.update(searched_offers=0, offer_gain=0.0, offer_partner_gain=0.0, acceptable=0, searched_answers=0,
+        stats.update(offer_positions=0, searched_offers=0, offer_gain=0.0, offer_partner_gain=0.0, acceptable=0, searched_answers=0,
                      worth_accepting=0, worth_declining=0, searched_counters=0, good_counters=0)
         if self.league is not None and self.switch_each_iteration:
             # One past self at every league table for this iteration: a single extra forward pass per step.
@@ -479,7 +515,8 @@ class Rollout:
             mine = np.where(own, chosen, 0)
             def logits_for(rows, counts):
                 at_rows = self.tensor(rows)
-                return self.model.deal_scores(summary[at_rows], goods[at_rows], self.tensor(mine[rows] == COUNTER), counts)
+                return self.model.deal_scores(summary[at_rows], goods[at_rows], self.tensor(mine[rows] == COUNTER), counts,
+                                              self.tensor(o[rows, 222:227]))
             with torch.no_grad(), torch.autocast(at.type, dtype=torch.bfloat16, enabled=self.autocast):
                 own_offers, rows, sampled = deals.choose(mine, o, forbidden, counts, logits_for, at)
             if sampled is not None:
@@ -491,8 +528,11 @@ class Rollout:
                 stats["offers_built"] += len(rows)
                 with torch.no_grad(), torch.autocast(at.type, dtype=torch.bfloat16, enabled=self.autocast):
                     deal_lp, _ = self.model.deal_log_probs(summary[at_rows], goods[at_rows], self.tensor(mine[rows] == COUNTER),
-                                                           sampled[0], sampled[1])
-                log_probs[t, at_rows] += deal_lp.float()
+                                                           sampled[0], sampled[1], self.tensor(o[rows, 222:227]))
+                if not self.judged_deals:
+                    # With --judged-deals the cards in an offer are learned only from the judge's deals, not from how
+                    # the game went, so they carry no part in the policy gradient.
+                    log_probs[t, at_rows] += deal_lp.float()
             if self.offer_search:
                 searchable = own & (o[:, 296] == PHASE_TURN) & (o[:, 297] == 1) & m[:, OFFER]
                 self.search_offers(np.flatnonzero(searchable), o, m, forbidden, counts, summary, goods, search, stats)
@@ -515,7 +555,10 @@ class Rollout:
             for game in np.flatnonzero(TRADED[chosen]):
                 trades.append((t, game, p[game], (p[game] + (chosen[game] - TRADE_WITH) % (SEATS - 1) + 1) % self.players))
             before = self.buffer.points()
+            branches = self.buffer.branches(chosen.astype(np.uint16), int(self.rng.integers(1 << 62))) if self.luck else None
             endings = self.buffer.step(chosen, offers)
+            if branches is not None:
+                luck[t] = self.lucky(branches, self.buffer.luck())
             progress[t] = self.tensor((self.buffer.points().astype(np.float32) - before))
             for game, winner, _ in endings:
                 done[t, game] = True
@@ -549,6 +592,8 @@ class Rollout:
                      learn=learn, responses=responses, offered=offered, offer_choices=offer_choices, offer_masks=offer_masks,
                      offer_counts=offer_counts)
         batch["points_scoring"] = (points, point_ends, point_last)
+        if self.luck:
+            batch["luck"] = luck
         if search:
             batch["search"] = tuple(torch.cat(part) for part in zip(*search))
         if expert:
@@ -589,12 +634,16 @@ def relative(gains, players):
     out[..., :players] = gains - others
     return out
 
-def advantages(values, done, ends, last, shaped, lam, gamma=1.0):
+def advantages(values, done, ends, last, shaped, lam, gamma=1.0, luck=None):
+    """GAE; with `luck`, each step's luck (how much better its roll, steal or draw came out than the odds-weighted
+    average) is taken out, which keeps the expected advantage and drops the dice's share of its noise."""
     result = torch.zeros_like(values)
     following = torch.zeros_like(last)
     for t in reversed(range(values.shape[0])):
         next_values = last if t == values.shape[0] - 1 else values[t + 1]
         delta = torch.where(done[t, :, None], ends[t] - values[t], shaped[t] + gamma * next_values - values[t])
+        if luck is not None:
+            delta = delta - luck[t]
         following = torch.where(done[t, :, None], delta, delta + gamma * lam * following)
         result[t] = following
     return result
@@ -646,10 +695,10 @@ def update(model, critics, optimizer, batch, adv, returns, players, args, autoca
                 deal_lp, deal_entropy = torch.zeros(len(pick), device=obs.device), torch.zeros(len(pick), device=obs.device)
                 if len(rows):
                     lp, h = model.deal_log_probs(summary[rows], goods[rows], flat["actions"][pick][rows] == COUNTER,
-                                                 flat["offer_choices"][pick][rows], flat["offer_masks"][pick][rows])
+                                                 flat["offer_choices"][pick][rows], flat["offer_masks"][pick][rows], obs[rows, 222:227])
                     deal_lp, deal_entropy = deal_lp.index_put((rows,), lp.float()), deal_entropy.index_put((rows,), h.float())
             dist, log_probs = policy(logits, masks)
-            new = dist.log_prob(flat["actions"][pick]) + deal_lp
+            new = dist.log_prob(flat["actions"][pick]) + (0 if args.judged_deals else deal_lp)
             ratio = (new - flat["log_probs"][pick]).exp()
             target = targets[pick]
             value_loss = nn.functional.mse_loss(values.float()[:, seats], target[:, seats])
@@ -718,7 +767,7 @@ def update(model, critics, optimizer, batch, adv, returns, players, args, autoca
                     dealt = torch.nonzero((s_choices[take] >= 0).any(1)).squeeze(1)
                     if len(dealt):
                         d_lp, _ = model.deal_log_probs(s_summary[dealt], s_goods[dealt], s_actions[take][dealt] == COUNTER,
-                                                       s_choices[take][dealt], s_deal_masks[take][dealt])
+                                                       s_choices[take][dealt], s_deal_masks[take][dealt], s_obs[take][dealt][:, 222:227])
                         lp = lp.index_add(0, dealt, d_lp.float())
                 # Wanted moves are pulled up; unwanted ones are pushed down without choosing among the alternatives.
                 search_loss = torch.where(s_wants[take] > 0, -lp, -torch.log1p(-lp.exp().clamp(max=1 - 1e-6))).mean()
@@ -814,6 +863,13 @@ def main():
     parser.add_argument("--offer-search", type=int, default=0,
                         help="turns per step where every small deal, with every partner, is scored with the network's own values "
                              "and the best one both sides gain from is taught as an offer; 0 is off")
+    parser.add_argument("--luck", action="store_true",
+                        help="take each roll's, steal's and draw's luck out of the advantages: the engine values every outcome "
+                             "with its exact odds, and how much better the real one came out is subtracted (unbiased)")
+    parser.add_argument("--judged-deals", action="store_true",
+                        help="learn what to put in an offer or counter only from the judge's best deal for both sides, not from "
+                             "the policy gradient, which rewards long-shot offers that favour the proposer (whether to offer "
+                             "is still learned from results)")
     parser.add_argument("--refrain", action="store_true",
                         help="on searched turns where no deal both sides confidently gain from exists, teach not offering")
     parser.add_argument("--offer-candidates", type=int, default=8, help="offers the policy samples itself, scored alongside the small deals")
@@ -909,7 +965,7 @@ def main():
                                      value_scale=args.lookahead_value_scale, fixed=args.lookahead_fixed)
                       if args.lookahead else None,
                       points_to_win=rules.points, lone=args.exploit_lone, symmetries=args.trade_symmetries, stubborn=args.stubborn,
-                      refrain=args.refrain)
+                      refrain=args.refrain, luck=args.luck, judged_deals=args.judged_deals)
     rollout.switch_each_iteration = args.league_switch == "iteration"
     pool = load_pool(args.anchors, at)[0] if args.anchors else None
     log = open(out / "log.txt", "a")
@@ -933,9 +989,12 @@ def main():
     decisions, first, previous = 0, 1, None
     if (out / "latest.pt").exists():
         saved = torch.load(out / "latest.pt", map_location=at)
-        model.load_state_dict(saved["model"], strict=not args.pooled_kind)
+        weights, widened = widen(saved["model"], model)
+        model.load_state_dict(weights, strict=not args.pooled_kind)
         critics.load_state_dict(saved["critics"], strict=False)
-        if "optimizer" in saved:
+        if widened:
+            say("the network gained inputs since this was saved (they start at zero), so the optimizer starts afresh")
+        elif "optimizer" in saved:
             try:
                 optimizer.load_state_dict(saved["optimizer"])
             except ValueError:
@@ -994,7 +1053,7 @@ def main():
         batch, values, scoring, stats = rollout.collect(args.rounds)
         sync(at)
         collect_time, clock = time.time() - clock, time.time()
-        adv = advantages(values, *scoring, args.lam, args.gamma)
+        adv = advantages(values, *scoring, args.lam, args.gamma, luck=batch.pop("luck", None))
         returns = adv + values
         points, point_ends, point_last = batch.pop("points_scoring")
         if args.aux_points:
@@ -1047,8 +1106,10 @@ def main():
             metrics["trade/cards_per_offer"] = cards
         if stats["searched_offers"]:
             m, found = stats["searched_offers"], max(stats["acceptable"], 1)
-            line += f"  offer search: a deal both gain from in {stats['acceptable'] / m:.2f} of turns, gaining {stats['offer_gain'] / found:+.4f}"
-            metrics.update({"search/best_gain": stats["offer_gain"] / found, "search/acceptable": stats["acceptable"] / m,
+            covered = m / max(stats["offer_positions"], 1)
+            line += (f"  offer search: judged {covered:.2f} of positions able to offer; a deal both gain from in "
+                     f"{stats['acceptable'] / m:.2f} of them, gaining {stats['offer_gain'] / found:+.4f}")
+            metrics.update({"search/offer_coverage": covered, "search/best_gain": stats["offer_gain"] / found, "search/acceptable": stats["acceptable"] / m,
                             "loss/offer_search": logs["offer_search"]})
         if stats["acceptable"]:
             metrics["search/partner_gain"] = stats["offer_partner_gain"] / stats["acceptable"]

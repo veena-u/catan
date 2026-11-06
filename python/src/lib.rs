@@ -1,7 +1,6 @@
 use catan::board::Board;
 use catan::buffer::{self, CHECKPOINT_EVERY, Config, Ending, Finish};
 use catan::dev_card::DevCard;
-use catan::dice::Dice;
 use catan::ids::{Edge, Hex, Vertex};
 use catan::symmetry::{Symmetry, SYMMETRIES};
 use catan::observation::{OBSERVATION_BYTES, PHASE_AT, TRADE_AT, observe};
@@ -14,6 +13,20 @@ use catan::worlds;
 use numpy::{AllowTypeChange, PyArray1, PyArray2, PyArrayLike1, PyArrayLike2, PyArrayMethods};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+
+const HIDDEN_BYTES: usize = (MAX_PLAYERS - 1) * 10;
+
+/// Every other player's cards and development cards, as the player to act would need to see them; zeros if no one is.
+fn hidden_of(state: &State, out: &mut [u8]) {
+    let Some(Actor::Player(me)) = state.actor() else { return };
+    for (k, other) in state.others(me).enumerate() {
+        let (hand, aside) = (state.hand(other), state.set_aside(other));
+        for r in 0..5 {
+            out[k * 10 + r] = hand[r] + aside[r];
+            out[k * 10 + 5 + r] = state.dev_cards(other, DevCard::ALL[r]);
+        }
+    }
+}
 
 type Batch<'py> = (Bound<'py, PyArray2<u8>>, Bound<'py, PyArray2<bool>>, Bound<'py, PyArray1<u8>>);
 
@@ -87,22 +100,71 @@ impl Buffer {
         PyArray2::from_vec2(py, &rows).expect("rows of MAX_PLAYERS")
     }
 
+    /// The dice rolled so far in each game: one per turn.
+    fn rolls<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<u16>> {
+        PyArray1::from_vec(py, (0..self.inner.len()).map(|game| self.inner.state(game).dice().rolls()).collect())
+    }
+
     fn hidden<'py>(&self, py: Python<'py>) -> Bound<'py, numpy::PyArrayDyn<u8>> {
         let n = self.inner.len();
-        let mut out = vec![0u8; n * (MAX_PLAYERS - 1) * 10];
+        let mut out = vec![0u8; n * HIDDEN_BYTES];
         for game in 0..n {
-            let state = self.inner.state(game);
-            let Some(Actor::Player(me)) = state.actor() else { continue };
-            for (k, other) in state.others(me).enumerate() {
-                let at = (game * (MAX_PLAYERS - 1) + k) * 10;
-                let (hand, aside) = (state.hand(other), state.set_aside(other));
-                for r in 0..5 {
-                    out[at + r] = hand[r] + aside[r];
-                    out[at + 5 + r] = state.dev_cards(other, DevCard::ALL[r]);
-                }
-            }
+            hidden_of(self.inner.state(game), &mut out[game * HIDDEN_BYTES..][..HIDDEN_BYTES]);
         }
         PyArray1::from_vec(py, out).reshape(vec![n, MAX_PLAYERS - 1, 10]).expect("sizes match")
+    }
+
+    /// The outcome code of the first luck each game's last move met, or -1.
+    fn luck<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<i16>> {
+        PyArray1::from_iter(py, (0..self.inner.len()).map(|g| self.inner.luck(g).map_or(-1, |c| c as i16)))
+    }
+
+    /// Every outcome of the luck these moves would lead to, one row per outcome: its game, outcome code and weight,
+    /// and the position it leads to as the player then to act sees it (with every hand, for the critic that sees
+    /// them), or the winner where the game ends there.
+    #[allow(clippy::type_complexity)]
+    fn branches<'py>(
+        &self,
+        py: Python<'py>,
+        actions: PyArrayLike1<'_, u16, AllowTypeChange>,
+        seed: u64,
+    ) -> PyResult<(
+        Bound<'py, PyArray1<u32>>, Bound<'py, PyArray1<i16>>, Bound<'py, PyArray1<f32>>, Bound<'py, PyArray1<i8>>,
+        Bound<'py, PyArray1<i8>>, Bound<'py, PyArray2<u8>>, Bound<'py, numpy::PyArrayDyn<u8>>,
+    )> {
+        let actions = actions.as_slice()?;
+        if actions.len() != self.inner.len() {
+            return Err(PyValueError::new_err(format!("{} actions for {} games", actions.len(), self.inner.len())));
+        }
+        let all = self.inner.branches(actions, seed);
+        let m: usize = all.iter().map(Vec::len).sum();
+        let (mut games, mut codes, mut weights, mut actors, mut winners) = (Vec::with_capacity(m), Vec::with_capacity(m), Vec::with_capacity(m), Vec::with_capacity(m), Vec::with_capacity(m));
+        let (mut views, mut hidden) = (vec![0u8; m * OBSERVATION_BYTES], vec![0u8; m * HIDDEN_BYTES]);
+        let mut row = 0;
+        for (game, branches) in all.iter().enumerate() {
+            for b in branches {
+                games.push(game as u32);
+                codes.push(b.code as i16);
+                weights.push(f32::from(b.weight));
+                winners.push(b.state.winner().map_or(-1, |p| p.index() as i8));
+                match b.state.actor() {
+                    Some(Actor::Player(p)) => {
+                        actors.push(p.index() as i8);
+                        let out: &mut [u8; OBSERVATION_BYTES] = (&mut views[row * OBSERVATION_BYTES..][..OBSERVATION_BYTES]).try_into().expect("one view");
+                        observe(&b.state, p, out);
+                        hidden_of(&b.state, &mut hidden[row * HIDDEN_BYTES..][..HIDDEN_BYTES]);
+                    }
+                    _ => actors.push(-1),
+                }
+                row += 1;
+            }
+        }
+        Ok((
+            PyArray1::from_vec(py, games), PyArray1::from_vec(py, codes), PyArray1::from_vec(py, weights),
+            PyArray1::from_vec(py, actors), PyArray1::from_vec(py, winners),
+            PyArray1::from_vec(py, views).reshape([m, OBSERVATION_BYTES]).expect("sizes match"),
+            PyArray1::from_vec(py, hidden).reshape(vec![m, MAX_PLAYERS - 1, 10]).expect("sizes match"),
+        ))
     }
 
     fn times<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<u64>> {
@@ -211,15 +273,15 @@ impl Buffer {
         Ok((PyArray1::from_vec(py, bytes).reshape([m, OBSERVATION_BYTES]).expect("sizes match"), PyArray1::from_vec(py, ok)))
     }
 
-    #[pyo3(signature = (games, simulations, worlds = 4, considered = 16, seed = 0, noise = true, value_scale = 0.1, rescale = true))]
+    #[pyo3(signature = (games, simulations, worlds = 4, considered = 16, seed = 0, noise = true, value_scale = 0.1, rescale = true, exact = false))]
     #[allow(clippy::too_many_arguments)]
-    fn search(&self, py: Python<'_>, games: PyArrayLike1<'_, u64, AllowTypeChange>, simulations: u32, worlds: usize, considered: usize, seed: u64, noise: bool, value_scale: f32, rescale: bool) -> PyResult<Search> {
+    fn search(&self, py: Python<'_>, games: PyArrayLike1<'_, u64, AllowTypeChange>, simulations: u32, worlds: usize, considered: usize, seed: u64, noise: bool, value_scale: f32, rescale: bool, exact: bool) -> PyResult<Search> {
         let games = games.as_slice()?;
         if let Some(&game) = games.iter().find(|&&g| g as usize >= self.inner.len()) {
             return Err(PyValueError::new_err(format!("there is no game {game}")));
         }
         let roots: Vec<State> = games.iter().map(|&g| *self.inner.state(g as usize)).collect();
-        let config = search::Config { simulations, worlds, considered: considered.max(1), noise, value_scale, rescale };
+        let config = search::Config { simulations, worlds, considered: considered.max(1), noise, value_scale, rescale, exact };
         Ok(Search { inner: py.detach(|| search::Search::new(&roots, config, seed)) })
     }
 
@@ -411,7 +473,6 @@ struct Game {
     seed: u64,
     state: State,
     rng: Rng,
-    dice: Dice,
     codes: Vec<u16>,
     history: Vec<(i8, u8, u16)>,
 }
@@ -426,8 +487,7 @@ impl Game {
         }
         let rules = rules.map_or(Rules::STANDARD, |r| r.inner);
         let state = State::with_rules(Board::random(&mut Rng::new(seed)), players, rules);
-        let dice = Dice::new(rules.balanced_dice);
-        Ok(Game { seed, state, rng: Rng::new(seed ^ 0x9E37_79B9_7F4A_7C15), dice, codes: Vec::new(), history: Vec::new() })
+        Ok(Game { seed, state, rng: Rng::new(seed ^ 0x9E37_79B9_7F4A_7C15), codes: Vec::new(), history: Vec::new() })
     }
 
     fn players(&self) -> usize {
@@ -534,23 +594,19 @@ impl Game {
         (PyArray1::from_slice(py, &bytes).reshape([1, OBSERVATION_BYTES]).expect("sizes match"), PyArray1::from_slice(py, &[ok]))
     }
 
-    #[pyo3(signature = (simulations, worlds = 4, considered = 16, seed = 0, noise = true, value_scale = 0.1, rescale = true))]
+    #[pyo3(signature = (simulations, worlds = 4, considered = 16, seed = 0, noise = true, value_scale = 0.1, rescale = true, exact = false))]
     #[allow(clippy::too_many_arguments)]
-    fn search(&self, simulations: u32, worlds: usize, considered: usize, seed: u64, noise: bool, value_scale: f32, rescale: bool) -> PyResult<Search> {
+    fn search(&self, simulations: u32, worlds: usize, considered: usize, seed: u64, noise: bool, value_scale: f32, rescale: bool, exact: bool) -> PyResult<Search> {
         if !matches!(self.state.actor(), Some(Actor::Player(_))) {
             return Err(PyValueError::new_err("only a player's decision can be searched"));
         }
-        let config = search::Config { simulations, worlds, considered: considered.max(1), noise, value_scale, rescale };
+        let config = search::Config { simulations, worlds, considered: considered.max(1), noise, value_scale, rescale, exact };
         Ok(Search { inner: search::Search::new(&[self.state], config, seed) })
     }
 
     fn settle(&mut self) {
         while let Some(Actor::Chance) = self.state.actor() {
-            let code = if matches!(self.state.phase(), Phase::Dice) {
-                self.dice.roll(&mut self.rng).index()
-            } else {
-                self.state.sample_outcome(&mut self.rng).index()
-            };
+            let code = self.state.sample_outcome(&mut self.rng).index();
             self.step(code, None).expect("a sampled outcome can happen");
         }
     }

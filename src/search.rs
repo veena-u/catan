@@ -27,6 +27,11 @@ pub struct Config {
     /// Stretch each node's Q-values to [0, 1] (mctx), or read them on the values' own scale of [-1, 1], so that
     /// moves of nearly equal value stay nearly equal.
     pub rescale: bool,
+    /// Value a roll, steal or draw by every one of its outcomes at once, weighted by the engine's odds, instead of
+    /// by the few a simulation happens to visit: the first simulation to reach it asks the network about them all,
+    /// and on the way back up it passes on their weighted average. The luck the search sees is then its exact
+    /// average, not a sample of it.
+    pub exact: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -58,6 +63,8 @@ struct Node {
     first: u32,
     count: u32,
     expanded: bool,
+    /// A chance node whose every outcome has been valued (with `Config::exact`).
+    exact: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -70,11 +77,18 @@ struct Edge {
 enum Pending {
     Root,
     Node(u32),
+    /// Every outcome of a chance node (and of a chance node right after it) that the network has to value.
+    Outcomes(u32, Vec<u32>),
 }
+
+/// How many chance nodes in a row an exact expansion goes through (a roll, then the forced turns after it, then the
+/// next roll); deeper chance is visited one outcome at a time.
+const EXACT_DEPTH: usize = 2;
 
 struct Tree {
     value_scale: f32,
     rescale: bool,
+    exact: bool,
     simulations: u32,
     considered: usize,
     noise: bool,
@@ -135,13 +149,13 @@ impl Search {
     pub fn leaves(&mut self) -> Vec<(usize, Leaf)> {
         assert!(self.waiting.is_empty(), "the last leaves were not expanded");
         let config = self.config;
-        let mut found: Vec<Option<Leaf>> = vec![None; self.trees.len()];
+        let mut found: Vec<Vec<Leaf>> = vec![Vec::new(); self.trees.len()];
         parallel(&mut self.trees, &mut found, |trees, found, _| {
             for (tree, slot) in trees.iter_mut().zip(found) {
-                *slot = tree.next_leaf(&config);
+                *slot = tree.next_leaves(&config);
             }
         });
-        let leaves: Vec<(usize, Leaf)> = found.into_iter().enumerate().filter_map(|(i, l)| l.map(|l| (i, l))).collect();
+        let leaves: Vec<(usize, Leaf)> = found.into_iter().enumerate().flat_map(|(i, ls)| ls.into_iter().map(move |l| (i, l))).collect();
         self.waiting = leaves.iter().map(|&(i, _)| i).collect();
         leaves
     }
@@ -150,18 +164,21 @@ impl Search {
     pub fn expand(&mut self, log_probs: &[[f32; ACTIONS]], values: &[[f32; MAX_PLAYERS]]) {
         assert!(log_probs.len() == self.waiting.len() && values.len() == self.waiting.len(), "one evaluation per leaf");
         let waiting = std::mem::take(&mut self.waiting);
-        let mut chosen: Vec<&mut Tree> = Vec::with_capacity(waiting.len());
-        let mut next = waiting.iter().peekable();
+        // Each waiting tree takes its own run of rows: one for a decision, every outcome's for a chance node.
+        let mut chosen: Vec<&mut Tree> = Vec::new();
+        let mut inputs: Vec<(Vec<&[f32; ACTIONS]>, Vec<&[f32; MAX_PLAYERS]>)> = Vec::new();
+        let mut row = 0;
         for (i, tree) in self.trees.iter_mut().enumerate() {
-            if next.peek() == Some(&&i) {
+            let rows = waiting[row..].iter().take_while(|&&w| w == i).count();
+            if rows > 0 {
+                inputs.push((log_probs[row..row + rows].iter().collect(), values[row..row + rows].iter().collect()));
                 chosen.push(tree);
-                next.next();
+                row += rows;
             }
         }
-        let mut inputs: Vec<(&[f32; ACTIONS], &[f32; MAX_PLAYERS])> = log_probs.iter().zip(values).collect();
         parallel(&mut chosen, &mut inputs, |trees, inputs, _| {
             for (tree, (log_probs, values)) in trees.iter_mut().zip(inputs.iter()) {
-                tree.expand(&log_probs[..], &values[..]);
+                tree.expand(log_probs, values);
             }
         });
     }
@@ -185,6 +202,7 @@ impl Tree {
         Tree {
             value_scale: config.value_scale,
             rescale: config.rescale,
+            exact: config.exact,
             simulations: config.simulations,
             considered: config.considered,
             noise: config.noise,
@@ -214,30 +232,54 @@ impl Tree {
         }
     }
 
-    fn next_leaf(&mut self, config: &Config) -> Option<Leaf> {
+    fn next_leaves(&mut self, config: &Config) -> Vec<Leaf> {
         assert!(self.pending.is_none(), "a leaf is still waiting for the network");
         if !self.expanded {
             self.pending = Some(Pending::Root);
-            return Some(leaf(&self.root, self.observer));
+            return vec![leaf(&self.root, self.observer)];
         }
         if !self.searchable {
-            return None;
+            return Vec::new();
         }
         while self.done < config.simulations {
-            if let Some(id) = self.simulate() {
-                self.pending = Some(Pending::Node(id));
-                let node = &self.nodes[id as usize];
-                let Kind::Decision(actor) = node.kind else { unreachable!("only decisions wait for the network") };
-                return Some(leaf(&node.state, actor));
+            match self.simulate() {
+                Some(Pending::Node(id)) => {
+                    self.pending = Some(Pending::Node(id));
+                    return vec![self.decision_leaf(id)];
+                }
+                Some(Pending::Outcomes(id, children)) => {
+                    let leaves = children.iter().map(|&c| self.decision_leaf(c)).collect();
+                    self.pending = Some(Pending::Outcomes(id, children));
+                    return leaves;
+                }
+                _ => {}
             }
         }
-        None
+        Vec::new()
     }
 
-    fn expand(&mut self, log_probs: &[f32], values: &[f32]) {
+    fn decision_leaf(&self, id: u32) -> Leaf {
+        let node = &self.nodes[id as usize];
+        let Kind::Decision(actor) = node.kind else { unreachable!("only decisions wait for the network") };
+        leaf(&node.state, actor)
+    }
+
+    fn expand(&mut self, log_probs: &[&[f32; ACTIONS]], values: &[&[f32; MAX_PLAYERS]]) {
         match self.pending.take().expect("a leaf was waiting") {
-            Pending::Root => self.expand_root(log_probs, values),
-            Pending::Node(id) => self.expand_node(id, log_probs, values),
+            Pending::Root => self.expand_root(&log_probs[0][..], &values[0][..]),
+            Pending::Node(id) => {
+                self.open(id, &log_probs[0][..], &values[0][..]);
+                let raw = self.nodes[id as usize].raw;
+                self.backup(raw);
+            }
+            Pending::Outcomes(id, children) => {
+                for ((&child, lp), v) in children.iter().zip(log_probs).zip(values) {
+                    self.open(child, &lp[..], &v[..]);
+                }
+                self.settle_exact(id, 0);
+                let value = self.expected(id);
+                self.backup(value);
+            }
         }
     }
 
@@ -260,7 +302,8 @@ impl Tree {
         self.expanded = true;
     }
 
-    fn expand_node(&mut self, id: u32, log_probs: &[f32], values: &[f32]) {
+    /// A decision node's moves and the network's value of it, without counting a visit.
+    fn open(&mut self, id: u32, log_probs: &[f32], values: &[f32]) {
         let (state, kind) = {
             let node = &self.nodes[id as usize];
             (node.state, node.kind)
@@ -276,10 +319,68 @@ impl Tree {
         node.count = codes.len() as u32;
         node.raw = raw;
         node.expanded = true;
-        self.backup(raw);
     }
 
-    fn simulate(&mut self) -> Option<u32> {
+    /// Creates every outcome of a chance node (and of chance nodes right after it, `EXACT_DEPTH` deep), and lists
+    /// the decisions among them that the network still has to value.
+    fn spread(&mut self, id: u32, depth: usize, waiting: &mut Vec<u32>) {
+        let node = &self.nodes[id as usize];
+        let (first, count) = (node.first as usize, node.count as usize);
+        for e in first..first + count {
+            let child = self.child(id, e);
+            match self.nodes[child as usize].kind {
+                Kind::Decision(_) if !self.nodes[child as usize].expanded => waiting.push(child),
+                Kind::Chance if depth + 1 < EXACT_DEPTH && !self.nodes[child as usize].exact => self.spread(child, depth + 1, waiting),
+                _ => {}
+            }
+        }
+    }
+
+    /// Marks a chance node exact once every outcome has a value (deepest first).
+    fn settle_exact(&mut self, id: u32, depth: usize) {
+        let node = &self.nodes[id as usize];
+        let (first, count) = (node.first as usize, node.count as usize);
+        for e in first..first + count {
+            let child = self.edges[e].child;
+            if child != NONE && matches!(self.nodes[child as usize].kind, Kind::Chance) && depth + 1 < EXACT_DEPTH {
+                self.settle_exact(child, depth + 1);
+            }
+        }
+        // Chance past the depth limit is left out until a simulation reaches it and spreads it in turn.
+        let known = (first..first + count).all(|e| {
+            let child = self.edges[e].child;
+            child != NONE && (self.estimate(child).is_some() || matches!(self.nodes[child as usize].kind, Kind::Chance))
+        });
+        self.nodes[id as usize].exact = known;
+    }
+
+    /// A node's current value for every seat: the average of what has come back through it, the network's value
+    /// before any has, the result of a finished game, or for an exact chance node the weighted average of its outcomes.
+    fn estimate(&self, id: u32) -> Option<[f32; MAX_PLAYERS]> {
+        let node = &self.nodes[id as usize];
+        match node.kind {
+            Kind::Over(winner) => Some(terminal(winner, self.players())),
+            Kind::Chance if node.exact => Some(self.expected(id)),
+            _ if node.visits > 0 => Some(node.total.map(|t| t / node.visits as f32)),
+            Kind::Decision(_) if node.expanded => Some(node.raw),
+            _ => None,
+        }
+    }
+
+    /// The odds-weighted average over a chance node's outcomes that have a value.
+    fn expected(&self, id: u32) -> [f32; MAX_PLAYERS] {
+        let node = &self.nodes[id as usize];
+        let (mut sum, mut mass) = ([0.0; MAX_PLAYERS], 0.0);
+        for edge in &self.edges[node.first as usize..(node.first + node.count) as usize] {
+            if let Some(v) = (edge.child != NONE).then(|| self.estimate(edge.child)).flatten() {
+                (0..MAX_PLAYERS).for_each(|s| sum[s] += edge.weight * v[s]);
+                mass += edge.weight;
+            }
+        }
+        sum.map(|s| if mass > 0.0 { s / mass } else { 0.0 })
+    }
+
+    fn simulate(&mut self) -> Option<Pending> {
         let a = self.choose_root();
         let k = self.worlds.len();
         let w = (0..k).min_by_key(|&w| self.world_visits[a * k + w]).expect("at least one world");
@@ -300,10 +401,21 @@ impl Tree {
                     self.backup(terminal(winner, self.players()));
                     return None;
                 }
-                Kind::Decision(_) if !node.expanded => return Some(id),
+                Kind::Decision(_) if !node.expanded => return Some(Pending::Node(id)),
                 Kind::Decision(actor) => {
                     let e = self.interior(id, actor);
                     id = self.child(id, e);
+                }
+                Kind::Chance if self.exact && !node.exact => {
+                    let mut waiting = Vec::new();
+                    self.spread(id, 0, &mut waiting);
+                    if waiting.is_empty() {
+                        self.settle_exact(id, 0);
+                        let value = self.expected(id);
+                        self.backup(value);
+                        return None;
+                    }
+                    return Some(Pending::Outcomes(id, waiting));
                 }
                 Kind::Chance => {
                     let e = self.chance(id);
@@ -330,7 +442,7 @@ impl Tree {
             }
         }
         let expanded = !matches!(kind, Kind::Decision(_));
-        self.nodes.push(Node { state, kind, visits: 0, total: [0.0; MAX_PLAYERS], raw: [0.0; MAX_PLAYERS], first, count, expanded });
+        self.nodes.push(Node { state, kind, visits: 0, total: [0.0; MAX_PLAYERS], raw: [0.0; MAX_PLAYERS], first, count, expanded, exact: false });
         (self.nodes.len() - 1) as u32
     }
 
@@ -413,8 +525,13 @@ impl Tree {
         completed_q(raw, logits, visits, q, self.value_scale, self.rescale)
     }
 
-    fn backup(&mut self, value: [f32; MAX_PLAYERS]) {
-        for &id in &self.path {
+    fn backup(&mut self, mut value: [f32; MAX_PLAYERS]) {
+        for i in (0..self.path.len()).rev() {
+            let id = self.path[i];
+            // Above an exact chance node, what goes up is its outcomes' weighted average, not the one just visited.
+            if self.nodes[id as usize].exact {
+                value = self.expected(id);
+            }
             let node = &mut self.nodes[id as usize];
             node.visits += 1;
             (0..MAX_PLAYERS).for_each(|s| node.total[s] += value[s]);

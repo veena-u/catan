@@ -112,6 +112,44 @@ pub struct LastOffer {
 
 type PerPlayer<T> = [T; MAX_PLAYERS];
 
+/// Every roll so far, as anyone at the table could count it: what is left of the balanced dice deck since its last
+/// reshuffle, the last sum, and who has had the sevens, which Colonist's dice also lean on.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct DiceHistory {
+    drawn: [u8; 11],
+    last: u8,
+    sevens: PerPlayer<u8>,
+    seven_by: Option<Player>,
+    streak: u8,
+    rolls: u16,
+}
+
+impl DiceHistory {
+    const NEW: DiceHistory = DiceHistory { drawn: [0; 11], last: 0, sevens: [0; MAX_PLAYERS], seven_by: None, streak: 0, rolls: 0 };
+
+    /// The deck's cards still to come for each sum from 2 to 12.
+    pub fn remaining(&self) -> [u8; 11] {
+        std::array::from_fn(|i| DICE[i] - self.drawn[i])
+    }
+
+    pub fn last(&self) -> Option<u8> {
+        (self.last > 0).then_some(self.last)
+    }
+
+    pub fn sevens(&self, player: Player) -> u8 {
+        self.sevens[player.index()]
+    }
+
+    /// The player who rolled the latest sevens, and how many of the sevens in a row were theirs.
+    pub fn streak(&self) -> Option<(Player, u8)> {
+        self.seven_by.map(|p| (p, self.streak))
+    }
+
+    pub fn rolls(&self) -> u16 {
+        self.rolls
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct State {
     board: Board,
@@ -138,6 +176,7 @@ pub struct State {
     largest_army: Option<Player>,
     current: Player,
     phase: Phase,
+    dice: DiceHistory,
 }
 
 impl State {
@@ -173,11 +212,16 @@ impl State {
             largest_army: None,
             current: Player::First,
             phase: Phase::PlaceSettlement,
+            dice: DiceHistory::NEW,
         }
     }
 
     pub fn board(&self) -> &Board {
         &self.board
+    }
+
+    pub fn dice(&self) -> &DiceHistory {
+        &self.dice
     }
 
     pub fn players(&self) -> usize {

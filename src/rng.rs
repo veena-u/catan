@@ -32,14 +32,14 @@ impl Rng {
         }
     }
 
-    pub fn weighted(&mut self, weights: &[u8]) -> usize {
-        let total: usize = weights.iter().map(|&w| usize::from(w)).sum();
+    pub fn weighted<W: Copy + Into<usize>>(&mut self, weights: &[W]) -> usize {
+        let total: usize = weights.iter().map(|&w| w.into()).sum();
         let mut draw = self.below(total);
         for (index, &weight) in weights.iter().enumerate() {
-            if draw < usize::from(weight) {
+            if draw < weight.into() {
                 return index;
             }
-            draw -= usize::from(weight);
+            draw -= weight.into();
         }
         unreachable!("the draw is below the total")
     }
@@ -85,7 +85,7 @@ mod tests {
         let mut rng = Rng::new(9);
         let mut counts = [0; 3];
         for _ in 0..60_000 {
-            counts[rng.weighted(&[1, 0, 3])] += 1;
+            counts[rng.weighted(&[1u8, 0, 3])] += 1;
         }
         assert_eq!(counts[1], 0);
         assert!((14_400..=15_600).contains(&counts[0]), "{counts:?}");

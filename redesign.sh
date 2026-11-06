@@ -66,7 +66,9 @@ FLAGS="--players $PLAYERS --rules $RULES --games ${GAMES:-2048} --rounds 64 --mi
   --entropy 0.01 --entropy-floor 0.001 --max-decisions 8000 --turn-budget 15 \
   --eval-every ${EVAL_EVERY:-200} --eval-games 512 --save-every 250 --checkpoint-every 50 \
   --anneal-power 0.5 --anneal-steps 200 --entropy-anneal-steps 20 --iterations ${ITERATIONS:-100000} --seed $SEED"
-if [ -n "${ANCHORS:-}" ]; then FLAGS="$FLAGS --anchors $ANCHORS"; fi
+# Rate every evaluation against the fixed anchors when this machine has them (eval/elo); ANCHORS= turns it off.
+ANCHORS=${ANCHORS-anchors/$PREFIX}
+if [ -n "$ANCHORS" ] && [ -d "$ANCHORS" ]; then FLAGS="$FLAGS --anchors $ANCHORS"; fi
 if [ -n "${WANDB_PROJECT:-}" ]; then
   python -m pip install --quiet wandb
   FLAGS="$FLAGS --wandb $WANDB_PROJECT --wandb-group ${WANDB_GROUP:-$PREFIX-v1}"

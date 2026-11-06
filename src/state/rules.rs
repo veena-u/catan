@@ -62,6 +62,16 @@ const CITIES: u8 = 4;
 
 pub const DICE: [u8; 11] = [1, 2, 3, 4, 5, 6, 5, 4, 3, 2, 1];
 
+// Colonist's balanced dice (blog.colonist.io/designing-balanced-dice): rolls are dealt from a deck of the 36
+// combinations, reshuffled when 12 remain, and the sum rolled last is 30% less likely to come again.
+pub(super) const RESHUFFLE_AT: u8 = 12;
+const REPEAT_PERCENT: u32 = 70;
+// In 1v1 the chance of a seven also leans toward an even split (blog.colonist.io/balancing-7s-on-1v1): the gap between
+// the roller's share of the sevens and half, plus a cut for each seven in a row they have had. Colonist does not
+// publish its constants, so the cut per seven and the bounds here are our guess.
+const STREAK_PERCENT: i32 = 20;
+const SEVEN_PERCENT_BOUNDS: (i32, i32) = (20, 200);
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Action {
     Settlement(Vertex),
@@ -280,12 +290,12 @@ impl Outcome {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Chances {
-    weights: [u8; 11],
+    weights: [u16; 11],
     count: u8,
 }
 
 impl Chances {
-    pub fn weights(&self) -> &[u8] {
+    pub fn weights(&self) -> &[u16] {
         &self.weights[..usize::from(self.count)]
     }
 
@@ -357,7 +367,8 @@ impl State {
             }
             Phase::Draft { deal } => {
                 self.insert_draft(&mut mask, player, deal);
-                if deal.gives() + deal.asks() > 0 && !self.was_proposed(deal) {
+                // As on Colonist, an offer gives something and asks for something: no asking for a gift.
+                if deal.complete() && !self.was_proposed(deal) {
                     mask.insert(Action::Send);
                 }
             }
@@ -468,20 +479,61 @@ impl State {
         let mut weights = [0; 11];
         let count = match self.phase {
             Phase::Dice => {
-                weights = DICE;
+                weights = if self.rules.balanced_dice { self.balanced_dice() } else { DICE.map(u16::from) };
                 11
             }
             Phase::Steal { victim, .. } => {
-                weights[..5].copy_from_slice(&self.hands[victim.index()]);
+                weights[..5].copy_from_slice(&self.hands[victim.index()].map(u16::from));
                 5
             }
             Phase::Draw => {
-                weights[..5].copy_from_slice(&self.deck);
+                weights[..5].copy_from_slice(&self.deck.map(u16::from));
                 5
             }
             phase => panic!("{phase:?} is not a chance node"),
         };
         Chances { weights, count }
+    }
+
+    fn balanced_dice(&self) -> [u16; 11] {
+        let mut weights = self.dice.remaining().map(|left| 100 * u32::from(left));
+        if let Some(last) = self.dice.last() {
+            let i = usize::from(last - 2);
+            weights[i] = weights[i] * REPEAT_PERCENT / 100;
+        }
+        if self.players == 2 {
+            weights[5] = weights[5] * self.seven_percent() / 100;
+        }
+        weights.map(|w| w as u16)
+    }
+
+    fn seven_percent(&self) -> u32 {
+        let roller = self.current;
+        let total: u32 = self.dice.sevens.iter().map(|&s| u32::from(s)).sum();
+        let gap = if total == 0 { 0 } else { 50 - (100 * u32::from(self.dice.sevens(roller)) / total) as i32 };
+        let streak = match self.dice.streak() {
+            Some((p, run)) if p == roller => -STREAK_PERCENT * i32::from(run),
+            _ => 0,
+        };
+        (100 + gap + streak).clamp(SEVEN_PERCENT_BOUNDS.0, SEVEN_PERCENT_BOUNDS.1) as u32
+    }
+
+    fn record_roll(&mut self, sum: u8) {
+        let roller = self.current;
+        let dice = &mut self.dice;
+        dice.rolls = dice.rolls.saturating_add(1);
+        dice.last = sum;
+        if sum == 7 {
+            dice.sevens[roller.index()] = dice.sevens[roller.index()].saturating_add(1);
+            dice.streak = if dice.seven_by == Some(roller) { dice.streak.saturating_add(1) } else { 1 };
+            dice.seven_by = Some(roller);
+        }
+        if self.rules.balanced_dice {
+            dice.drawn[usize::from(sum - 2)] += 1;
+            if dice.remaining().iter().sum::<u8>() <= RESHUFFLE_AT {
+                dice.drawn = [0; 11];
+            }
+        }
     }
 
     pub fn outcome(&self, index: u16) -> Option<Outcome> {
@@ -511,6 +563,9 @@ impl State {
 
     fn happen(&mut self, outcome: Outcome) {
         let player = self.current;
+        if let (Phase::Dice, Outcome::Dice(sum)) = (self.phase, outcome) {
+            self.record_roll(sum);
+        }
         match (self.phase, outcome) {
             (Phase::Dice, Outcome::Dice(7)) => self.start_discards(),
             (Phase::Dice, Outcome::Dice(sum)) => {

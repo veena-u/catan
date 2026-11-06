@@ -1,6 +1,5 @@
 pub mod board;
 pub mod buffer;
-pub mod dice;
 pub mod dev_card;
 pub mod ids;
 pub mod observation;

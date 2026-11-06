@@ -9,6 +9,7 @@ from . import deals
 from .agents import Network
 
 ACCEPT, DECLINE, END_TURN, PHASE_AT, PHASE_RESPOND = 247, 248, 225, 296, 13
+CHUNK = 2048
 from .evaluate import RULE_SETS, matchup, rules_named
 from .model import device, load, load_critics
 from .trades import Judge
@@ -20,11 +21,16 @@ def run(search, model, at, autocast=False, critics=None):
         obs, masks, hidden, _ = search.leaves()
         if len(obs) == 0:
             return search.result()
-        with torch.autocast(at.type, dtype=torch.bfloat16, enabled=autocast):
-            log_probs, values, summary = model(torch.from_numpy(obs).to(at), torch.from_numpy(masks).to(at))
-            if critics is not None:
-                values = critics.privileged(summary, torch.from_numpy(hidden).to(at))
-        search.expand(log_probs.float().cpu().numpy(), values.float().cpu().numpy())
+        # In pieces: an exact search asks about every outcome of a roll at once, which can be many positions per root.
+        parts = []
+        for start in range(0, len(obs), CHUNK):
+            piece = slice(start, start + CHUNK)
+            with torch.autocast(at.type, dtype=torch.bfloat16, enabled=autocast):
+                log_probs, values, summary = model(torch.from_numpy(obs[piece]).to(at), torch.from_numpy(masks[piece]).to(at))
+                if critics is not None:
+                    values = critics.privileged(summary, torch.from_numpy(hidden[piece]).to(at))
+            parts.append((log_probs.float().cpu().numpy(), values.float().cpu().numpy()))
+        search.expand(np.concatenate([p[0] for p in parts]), np.concatenate([p[1] for p in parts]))
 
 class Searcher(Network):
     """The network, judging trades and looking ahead before each move. It offers or counters only with the deal the
@@ -34,10 +40,10 @@ class Searcher(Network):
     uses_state = True
 
     def __init__(self, model, device, simulations=64, worlds=4, considered=16, greedy=False, seed=0, temperature=1.0,
-                 critics=None, margin=0.01, value_scale=0.1, rescale=True, symmetries=6):
+                 critics=None, margin=0.01, value_scale=0.1, rescale=True, symmetries=6, exact=False):
         super().__init__(model, device, greedy, seed, temperature)
         self.simulations, self.worlds, self.considered, self.critics = simulations, worlds, considered, critics
-        self.scaling = dict(value_scale=value_scale, rescale=rescale)
+        self.scaling = dict(value_scale=value_scale, rescale=rescale, exact=exact)
         self.judge = Judge(model, device, margin=margin, symmetries=symmetries, seed=seed)
         self.rng = np.random.default_rng(seed)
 
@@ -108,6 +114,8 @@ def main():
     parser.add_argument("--privileged", action="store_true", help="value the imagined worlds with the critic that sees every hand")
     parser.add_argument("--value-scale", type=float, nargs="+", default=[0.1], help="how strongly better Q-values outweigh the prior")
     parser.add_argument("--fixed", action="store_true", help="read Q-values on their own scale instead of stretching each node's to [0, 1]")
+    parser.add_argument("--exact", action="store_true",
+                        help="value each roll, steal and draw by all its outcomes at their odds instead of the ones visited")
     parser.add_argument("--games", type=int, default=128)
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
@@ -122,11 +130,11 @@ def main():
     for simulations in args.simulations:
         for value_scale in args.value_scale:
             searcher = Searcher(model, at, simulations, args.worlds, args.considered, seed=args.seed, critics=critics,
-                                value_scale=value_scale, rescale=not args.fixed)
+                                value_scale=value_scale, rescale=not args.fixed, exact=args.exact)
             result = matchup(searcher, plain, games=args.games, players=args.players, rules=rules, seed=args.seed)
             alone = "" if result["alone"][1] is None else f"   alone {result['alone'][0]:.3f} / {result['alone'][1]:.3f}"
             spread = 0.5 / max(result["decided"], 1) ** 0.5
-            print(f"  {simulations:4d} simulations, value scale {value_scale:g}{' fixed' if args.fixed else ''}: "
+            print(f"  {simulations:4d} simulations, value scale {value_scale:g}{' fixed' if args.fixed else ''}{' exact' if args.exact else ''}: "
                   f"search scores {result['share']:.3f} ± {spread:.3f}{alone}", flush=True)
 
 if __name__ == "__main__":

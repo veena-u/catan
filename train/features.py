@@ -19,6 +19,8 @@ LAST_AT = TRADE_AT + 45
 LAST_ACCEPTED, LAST_COUNTERED, LAST_TRADED = TRADE_AT + 55, TRADE_AT + 56, TRADE_AT + 57
 RATES_AT = TRADE_AT + 58
 PROTECTED_AT = TRADE_AT + 63
+# The dice as counted: the deck's cards left per sum, the last sum, each seat's sevens, and whose sevens are in a row.
+DICE_AT = PROTECTED_AT + 4
 
 NONE = 255
 COSTS = torch.tensor([[1, 1, 0, 0, 0], [1, 1, 1, 1, 0], [0, 0, 0, 2, 3], [0, 0, 1, 1, 1]])
@@ -117,6 +119,9 @@ def decode(obs, symmetry=None):
         obs[:, LAST_TRADED:LAST_TRADED + 1].float(),
         obs[:, RATES_AT:RATES_AT + 5].float() / 4,
         obs[:, PROTECTED_AT:PROTECTED_AT + 4].float(),
+        obs[:, DICE_AT:DICE_AT + 11].float() / 6,
+        one_hot(obs[:, DICE_AT + 11], 13),
+        obs[:, DICE_AT + 17:DICE_AT + 18].float() / 4,
     ], -1)
     if symmetry is not None:
         hex_inverse, vertex_inverse, edge_inverse, _ = symmetry_tables(obs.device)
@@ -176,6 +181,8 @@ def players(obs):
         o[:, PROTECTED_AT:PROTECTED_AT + 4, None].float(),
         (rates(obs) - 2).float() / 2,
         (COSTS.to(obs.device)[None, None] - cards[:, :, None]).clamp(min=0).sum(-1).float() / 5,
+        o[:, DICE_AT + 12:DICE_AT + 16, None].float() / 5,
+        flag(DICE_AT + 16, seat + 1)[..., None],
     ]
     return torch.cat(rows, -1)
 

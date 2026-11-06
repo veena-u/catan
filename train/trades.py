@@ -5,6 +5,7 @@ from . import deals
 from .features import SYMMETRIES
 
 SHORTLIST = 8
+CHUNK = 4096
 HAND = slice(222, 227)
 
 class Judge:
@@ -25,9 +26,13 @@ class Judge:
         s = len(turns)
         obs = self.tensor(views).repeat_interleave(s, 0)
         symmetry = torch.tensor(turns, device=self.at).repeat(len(views))
-        with torch.autocast(self.at.type, dtype=torch.bfloat16, enabled=self.autocast):
-            _, values, _ = self.model(obs, None, symmetry)
-        return values.float()[:, 0].view(len(views), s)
+        values = []
+        # In pieces, so a turn with hundreds of candidate deals for every partner fits in memory.
+        for at in range(0, len(obs), CHUNK):
+            with torch.autocast(self.at.type, dtype=torch.bfloat16, enabled=self.autocast):
+                _, v, _ = self.model(obs[at:at + CHUNK], None, symmetry[at:at + CHUNK])
+            values.append(v.float()[:, 0])
+        return torch.cat(values).view(len(views), s) if values else torch.zeros(len(views), s, device=self.at)
 
     def turns(self):
         others = self.rng.choice(np.arange(1, SYMMETRIES), self.symmetries - 1, replace=False) if self.symmetries > 1 else []
